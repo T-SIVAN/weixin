@@ -38,6 +38,7 @@ def build_prompt(paper: PaperInput, pdf: PdfContent | None, target_chars: int) -
 作者：{authors}
 期刊：{paper.journal}
 年份：{paper.year}
+发表日期：{paper.publication_date}
 DOI：{paper.doi}
 链接：{paper.url}
 英文摘要：{paper.abstract_en or paper.abstract}
@@ -140,7 +141,7 @@ def render_markdown(paper: PaperInput, data: dict[str, Any], figures: list[Figur
     if data.get("take_home"):
         lines.append("")
         lines.append(str(data["take_home"]).strip())
-    meta = " / ".join(bit for bit in [paper.journal, paper.year, f"DOI: {paper.doi}" if paper.doi else "", paper.url] if bit)
+    meta = " / ".join(bit for bit in [paper.journal, paper.publication_date or paper.year, f"DOI: {paper.doi}" if paper.doi else "", paper.url] if bit)
     if meta:
         lines.append("")
         lines.append(f"原文信息：{meta}")

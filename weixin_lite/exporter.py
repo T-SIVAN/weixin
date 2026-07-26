@@ -45,7 +45,7 @@ def unavailable_dois_csv(papers: list[PaperInput]) -> str:
     buffer = io.StringIO()
     writer = csv.DictWriter(
         buffer,
-        fieldnames=["doi", "title", "journal", "year", "url", "access_status", "download_error"],
+        fieldnames=["doi", "title", "journal", "publication_date", "year", "url", "access_status", "download_error"],
     )
     writer.writeheader()
     for paper in papers:
@@ -55,6 +55,7 @@ def unavailable_dois_csv(papers: list[PaperInput]) -> str:
                     "doi": paper.doi,
                     "title": paper.title_en or paper.title,
                     "journal": paper.journal,
+                    "publication_date": paper.publication_date,
                     "year": paper.year,
                     "url": paper.url,
                     "access_status": paper.access_status,

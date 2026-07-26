@@ -27,6 +27,7 @@ def main() -> None:
     parser.add_argument("--output", default="data/latest_papers.json")
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--since-days", type=int, default=7)
+    parser.add_argument("--since-years", type=int, default=0)
     parser.add_argument("--email", default="")
     parser.add_argument("--provider", default=default_provider())
     parser.add_argument("--base-url", default="")
@@ -34,7 +35,8 @@ def main() -> None:
     args = parser.parse_args()
 
     keywords = load_keywords(Path(args.config))
-    run = run_keyword_search(keywords, limit=args.limit, email=args.email, since_days=args.since_days)
+    since_days = args.since_years * 365 if args.since_years else args.since_days
+    run = run_keyword_search(keywords, limit=args.limit, email=args.email, since_days=since_days)
     base_url = args.base_url or default_base_url(args.provider)
     model = args.model or default_model(args.provider)
     report = translate_records(run.records, api_key=default_api_key(), base_url=base_url, model=model, provider=args.provider)

@@ -75,6 +75,8 @@ def merge_papers(existing: list[PaperInput], incoming: list[PaperInput]) -> list
             "pmid",
             "journal",
             "year",
+            "publication_date",
+            "publication_date_source",
             "abstract",
             "abstract_en",
             "abstract_zh",
@@ -131,7 +133,7 @@ def paper_rows(papers: list[PaperInput]) -> list[dict[str, str]]:
                 "#": str(idx),
                 "标题": paper.title_zh or paper.title_en or paper.title,
                 "期刊": paper.journal,
-                "年份": paper.year,
+                "发表日期": paper.publication_date or paper.year,
                 "DOI": paper.doi,
                 "全文状态": paper.access_status,
                 "PDF": paper.pdf_name,
@@ -153,7 +155,7 @@ def show_details(papers: list[PaperInput], title: str = "查看摘要和错误")
             st.caption(" | ".join(bit for bit in bits if bit))
 
 
-def sidebar_settings() -> tuple[str, str, str, str]:
+def sidebar_settings() -> tuple[str, str, str, str, int, float]:
     st.sidebar.header("翻译/生成模型")
     provider_keys = list(PROVIDERS.keys())
     current_provider = default_provider()
@@ -167,14 +169,16 @@ def sidebar_settings() -> tuple[str, str, str, str]:
     api_key = st.sidebar.text_input("API Key", value=default_api_key(), type="password")
     base_url = st.sidebar.text_input("Base URL", value=default_base_url(provider) or defaults.base_url)
     model = st.sidebar.text_input("Model", value=default_model(provider) or defaults.default_model)
-    st.sidebar.caption("支持 OpenAI-compatible 接口。Key 只保存在当前会话，不写入导出包。")
+    batch_size = st.sidebar.slider("翻译批量", 1, 8, 3)
+    delay_seconds = st.sidebar.slider("翻译间隔（秒）", 0.0, 10.0, 1.5, step=0.5)
+    st.sidebar.caption("支持 OpenAI-compatible 接口。遇到 429 时请调小批量、调大间隔，或换额度更高的供应商。")
     if st.sidebar.button("测试翻译模型"):
         try:
             raw = test_llm_connection(api_key=api_key, base_url=base_url, model=model)
             st.sidebar.success(f"连接成功：{raw[:80]}")
         except Exception as exc:
             st.sidebar.error(f"连接失败：{type(exc).__name__}: {exc}")
-    return provider, api_key, base_url, model
+    return provider, api_key, base_url, model, batch_size, delay_seconds
 
 
 def status_bar() -> None:
@@ -189,7 +193,7 @@ def status_bar() -> None:
     col_d.metric("未下载 DOI", len(unavailable))
 
 
-def search_tab(provider: str, api_key: str, base_url: str, model: str) -> None:
+def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_size: int, delay_seconds: float) -> None:
     st.subheader("检索与翻译")
     latest = load_latest_run()
     if latest and latest.records:
@@ -204,17 +208,27 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str) -> None:
     st.session_state.keywords = keywords
     col_a, col_b, col_c = st.columns(3)
     limit = col_a.slider("检索数量", 5, 30, 20)
-    since_days = col_b.slider("时间范围（天）", 1, 365, 30)
+    since_years = col_b.slider("时间范围（年）", 1, 10, 1)
     email = col_c.text_input("OpenAlex 邮箱（可选）", value="")
     if st.button("检索并翻译", type="primary"):
         with st.spinner("正在检索 PubMed、Europe PMC、OpenAlex、Crossref，并翻译标题/摘要..."):
-            run = run_keyword_search(keywords, limit=limit, email=email, since_days=since_days)
-            report = translate_records(run.records, api_key=api_key, base_url=base_url, model=model, provider=provider)
+            run = run_keyword_search(keywords, limit=limit, email=email, since_days=since_years * 365)
+            report = translate_records(
+                run.records,
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                provider=provider,
+                batch_size=batch_size,
+                delay_seconds=delay_seconds,
+            )
         st.session_state.papers = merge_papers(st.session_state.papers, run.records)
         if run.errors:
             st.warning("部分检索源失败：" + "; ".join(f"{k}: {v}" for k, v in run.errors.items()))
         if report.errors:
             st.warning("翻译未完全成功：" + "; ".join(report.errors))
+            if any("429" in item or "Too Many Requests" in item for item in report.errors):
+                st.info("429 是模型供应商限流/额度问题。建议把侧边栏“翻译批量”调为 1，把“翻译间隔”调到 5-10 秒，或切换 DeepSeek/SiliconFlow/custom。")
         else:
             st.success(f"已翻译 {report.translated_count} 条记录。")
         st.dataframe(paper_rows(run.records), use_container_width=True, hide_index=True)
@@ -433,14 +447,14 @@ def export_and_publish_tab() -> None:
 
 def main() -> None:
     init_state()
-    provider, api_key, base_url, model = sidebar_settings()
+    provider, api_key, base_url, model, batch_size, delay_seconds = sidebar_settings()
     st.title("微信文献快读工具")
     st.caption("检索文献、解析开放全文或上传 PDF，再生成中文公众号稿。未下载到全文的论文只导出 DOI CSV。")
     status_bar()
 
     tab_search, tab_generate, tab_export = st.tabs(["检索与翻译", "全文与生成", "导出与发布"])
     with tab_search:
-        search_tab(provider, api_key, base_url, model)
+        search_tab(provider, api_key, base_url, model, batch_size, delay_seconds)
     with tab_generate:
         ingest_and_generate_tab(api_key, base_url, model)
     with tab_export:

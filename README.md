@@ -4,11 +4,11 @@
 
 ## 核心流程
 
-1. **检索与翻译**：输入关键词，检索 PubMed、Europe PMC、OpenAlex、Crossref，并把英文题名/摘要翻译为中文。
+1. **检索与翻译**：输入关键词和年份范围，检索 PubMed、Europe PMC、OpenAlex、Crossref，并把英文题名/摘要翻译为中文。
 2. **全文与生成**：自动下载合法开放全文或上传 PDF。只有已解析到 PDF 全文的论文才会生成公众号正文。
 3. **导出与发布**：导出项目包、单篇 Markdown/HTML、未生成 DOI CSV，也可以 dry-run 预览或真实创建微信公众号草稿。
 
-未下载到全文、下载失败、只拿到题录或只拿到 HTML 的论文不会生成公众号内容，会进入 `unavailable_dois.csv`，字段包括 DOI、题名、期刊、年份、链接、全文状态和错误原因。导出包里也保留兼容文件名 `paywalled_dois.csv`。
+检索结果显示正式发表日期；Crossref 只读取 `published`、`published-online`、`published-print`、`issued`、`posted` 等发表字段，不把 `created`、`indexed`、`deposited` 这类入库日期当作发表日期。未下载到全文、下载失败、只拿到题录或只拿到 HTML 的论文不会生成公众号内容，会进入 `unavailable_dois.csv`，字段包括 DOI、题名、期刊、发表日期、年份、链接、全文状态和错误原因。导出包里也保留兼容文件名 `paywalled_dois.csv`。
 
 ## 翻译/生成模型
 
@@ -36,7 +36,7 @@ $env:LLM_BASE_URL="https://api.example.com/v1"
 $env:LLM_MODEL="your-model"
 ```
 
-页面侧边栏提供“测试翻译模型”按钮。模型失败时会显示具体错误，并保留英文原文和“待翻译”标记，不阻塞后续下载和导出。
+页面侧边栏提供“测试翻译模型”按钮，并可调节翻译批量和批间间隔。遇到 `429 Too Many Requests` 时，把批量调到 1、间隔调到 5-10 秒，或切换 DeepSeek/SiliconFlow/custom 等额度更高的 OpenAI-compatible 服务。模型失败时会显示具体错误，并保留英文原文和“待翻译”标记，不阻塞后续下载和导出。
 
 ## 本地运行
 
@@ -50,8 +50,8 @@ streamlit run app.py
 ## 命令行
 
 ```powershell
-python -m weixin_lite.daily_search --config config/topics.json --output data/latest_papers.json --provider deepseek
-python -m weixin_lite.translate_results --input data/latest_papers.json --provider deepseek
+python -m weixin_lite.daily_search --config config/topics.json --output data/latest_papers.json --provider deepseek --since-years 1
+python -m weixin_lite.translate_results --input data/latest_papers.json --provider deepseek --batch-size 1 --delay-seconds 5
 python -m weixin_lite.batch_analyze --input data/latest_papers.json --limit 20
 ```
 

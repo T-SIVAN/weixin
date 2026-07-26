@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -40,7 +41,9 @@ def translate_records(
     base_url: str = "https://api.openai.com/v1",
     model: str = "gpt-4o-mini",
     provider: str = "openai",
-    batch_size: int = 8,
+    batch_size: int = 3,
+    delay_seconds: float = 1.5,
+    max_retries: int = 2,
 ) -> TranslationReport:
     errors: list[str] = []
     translated_count = 0
@@ -60,28 +63,39 @@ def translate_records(
             }
             for record in chunk
         ]
-        try:
-            raw = call_openai_compatible(
-                api_key=api_key,
-                base_url=base_url,
-                model=model,
-                system_prompt=TRANSLATE_SYSTEM,
-                user_prompt=json.dumps(payload, ensure_ascii=False),
-                temperature=0.1,
-                timeout=120,
-            )
-            translated = parse_json_array(raw)
-        except Exception as exc:
+        translated = []
+        last_error: Exception | None = None
+        for attempt in range(max(1, max_retries + 1)):
+            try:
+                raw = call_openai_compatible(
+                    api_key=api_key,
+                    base_url=base_url,
+                    model=model,
+                    system_prompt=TRANSLATE_SYSTEM,
+                    user_prompt=json.dumps(payload, ensure_ascii=False),
+                    temperature=0.1,
+                    timeout=120,
+                )
+                translated = parse_json_array(raw)
+                break
+            except Exception as exc:
+                last_error = exc
+                message = str(exc).lower()
+                if "429" not in message and "too many requests" not in message:
+                    break
+                time.sleep(min(20.0, delay_seconds * (attempt + 1) * 2))
+        if last_error and not translated:
             errors.append(
-                f"{provider} batch {start // batch_size + 1} failed at {base_url}: {type(exc).__name__}: {exc}"
+                f"{provider} batch {start // batch_size + 1} failed at {base_url}: {type(last_error).__name__}: {last_error}"
             )
-            translated = []
         for idx, record in enumerate(chunk):
             item = translated[idx] if idx < len(translated) and isinstance(translated[idx], dict) else {}
             if item.get("title_zh") or item.get("abstract_zh"):
                 translated_count += 1
             record.title_zh = str(item.get("title_zh") or record.title_zh or fallback_translation(record.title_en or record.title, "标题"))
             record.abstract_zh = str(item.get("abstract_zh") or record.abstract_zh or fallback_translation(record.abstract_en or record.abstract, "摘要"))
+        if start + batch_size < len(records) and delay_seconds > 0:
+            time.sleep(delay_seconds)
     return TranslationReport(
         records=records,
         provider=provider,
@@ -108,13 +122,23 @@ def main() -> None:
     parser.add_argument("--provider", default=default_provider())
     parser.add_argument("--base-url", default="")
     parser.add_argument("--model", default="")
+    parser.add_argument("--batch-size", type=int, default=3)
+    parser.add_argument("--delay-seconds", type=float, default=1.5)
     args = parser.parse_args()
 
     input_path = Path(args.input)
     records, original = load_records(input_path)
     base_url = args.base_url or default_base_url(args.provider)
     model = args.model or default_model(args.provider)
-    report = translate_records(records, api_key=default_api_key(), base_url=base_url, model=model, provider=args.provider)
+    report = translate_records(
+        records,
+        api_key=default_api_key(),
+        base_url=base_url,
+        model=model,
+        provider=args.provider,
+        batch_size=args.batch_size,
+        delay_seconds=args.delay_seconds,
+    )
     original["records"] = [record.to_dict() for record in records]
     original["translation"] = {
         "provider": report.provider,

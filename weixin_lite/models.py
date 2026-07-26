@@ -21,6 +21,8 @@ class PaperInput:
     authors: list[str] = field(default_factory=list)
     journal: str = ""
     year: str = ""
+    publication_date: str = ""
+    publication_date_source: str = ""
     abstract: str = ""
     url: str = ""
     oa_pdf_url: str = ""

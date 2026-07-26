@@ -8,7 +8,7 @@ from weixin_lite.generator import generate_article
 from weixin_lite.llm import default_base_url, default_model
 from weixin_lite.models import BatchProject, PaperInput, generation_ready_papers, unavailable_papers
 from weixin_lite.pdf_reader import PdfContent, extract_figure_legends, extract_numeric_evidence
-from weixin_lite.search import build_keyword_query, run_keyword_search
+from weixin_lite.search import build_keyword_query, crossref_publication_date, crossref_year, run_keyword_search, year_from
 from weixin_lite.translate import translate_records
 from weixin_lite.wechat_publish import WechatDraftConfig, publish_draft
 
@@ -18,6 +18,34 @@ def test_keyword_query_expands_simple_keywords():
 
     assert "terminal deoxynucleotidyl transferase" in query
     assert "enzymatic DNA synthesis" in query
+
+
+def test_year_parser_rejects_future_years():
+    assert year_from("published 2024") == "2024"
+    assert year_from("published 2027") == ""
+    assert year_from({"date-parts": [[2050, 1, 1]]}) == ""
+    assert crossref_year({"published-online": {"date-parts": [[2025, 6, 1]]}}) == "2025"
+
+
+def test_crossref_publication_date_ignores_record_created_date():
+    item = {
+        "created": {"date-parts": [[2026, 7, 1]]},
+        "indexed": {"date-parts": [[2026, 7, 2]]},
+    }
+
+    assert crossref_publication_date(item) == ("", "")
+    assert crossref_year(item) == ""
+
+
+def test_crossref_publication_date_prefers_published_fields():
+    item = {
+        "created": {"date-parts": [[2026, 7, 1]]},
+        "issued": {"date-parts": [[2024, 12]]},
+        "published-online": {"date-parts": [[2025, 1, 5]]},
+    }
+
+    assert crossref_publication_date(item) == ("2025-01-05", "published-online")
+    assert crossref_year(item) == "2025"
 
 
 def test_translation_fallback_populates_chinese_fields():

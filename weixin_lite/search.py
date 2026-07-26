@@ -77,9 +77,153 @@ def http_text(url: str, params: dict[str, Any] | None = None, timeout: int = 25)
         return response.read().decode(response.headers.get_content_charset() or "utf-8")
 
 
+MONTHS = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+
+
+def valid_year(value: Any) -> str:
+    try:
+        year = int(value)
+    except (TypeError, ValueError):
+        return ""
+    current_year = date.today().year
+    return str(year) if 1800 <= year <= current_year else ""
+
+
+def valid_iso_date(value: str) -> str:
+    text = str(value or "").strip()
+    if not re.match(r"^\d{4}(?:-\d{2})?(?:-\d{2})?$", text):
+        return ""
+    parts = [int(part) for part in text.split("-")]
+    try:
+        parsed = date(parts[0], parts[1] if len(parts) > 1 else 1, parts[2] if len(parts) > 2 else 1)
+    except ValueError:
+        return ""
+    return text if date(1800, 1, 1) <= parsed <= date.today() else ""
+
+
+def date_from_parts(parts: Any) -> str:
+    if not isinstance(parts, list) or not parts:
+        return ""
+    first_part = parts[0]
+    if not isinstance(first_part, list) or not first_part:
+        return ""
+    try:
+        year = int(first_part[0])
+        month = int(first_part[1]) if len(first_part) > 1 else 1
+        day = int(first_part[2]) if len(first_part) > 2 else 1
+    except (TypeError, ValueError):
+        return ""
+    try:
+        parsed = date(year, month, day)
+    except ValueError:
+        return ""
+    if not date(1800, 1, 1) <= parsed <= date.today():
+        return ""
+    if len(first_part) > 2:
+        return parsed.isoformat()
+    if len(first_part) > 1:
+        return f"{year:04d}-{month:02d}"
+    return f"{year:04d}"
+
+
+def year_from_date(value: str) -> str:
+    match = re.match(r"^(\d{4})", str(value or ""))
+    return valid_year(match.group(1)) if match else ""
+
+
 def year_from(value: Any) -> str:
-    match = re.search(r"(?:19|20|21)\d{2}", str(value or ""))
-    return match.group(0) if match else ""
+    if isinstance(value, dict):
+        date_parts = value.get("date-parts")
+        if isinstance(date_parts, list) and date_parts:
+            first_part = date_parts[0]
+            if isinstance(first_part, list) and first_part:
+                parsed = valid_year(first_part[0])
+                if parsed:
+                    return parsed
+        for key in ("date-time", "timestamp"):
+            parsed = year_from(value.get(key))
+            if parsed:
+                return parsed
+        return ""
+    if isinstance(value, list):
+        for item in value:
+            parsed = year_from(item)
+            if parsed:
+                return parsed
+        return ""
+    for match in re.finditer(r"(?:18|19|20|21)\d{2}", str(value or "")):
+        parsed = valid_year(match.group(0))
+        if parsed:
+            return parsed
+    return ""
+
+
+def crossref_year(item: dict[str, Any]) -> str:
+    return year_from_date(crossref_publication_date(item)[0])
+
+
+def crossref_publication_date(item: dict[str, Any]) -> tuple[str, str]:
+    for key in ("published", "published-online", "published-print", "issued", "posted"):
+        value = item.get(key)
+        parsed = date_from_parts(value.get("date-parts") if isinstance(value, dict) else None)
+        if parsed:
+            return parsed, key
+    return "", ""
+
+
+def pubmed_publication_date(article: ET.Element) -> tuple[str, str]:
+    pub_date = article.find(".//JournalIssue/PubDate") or article.find(".//PubDate")
+    if pub_date is None:
+        return "", ""
+    year = valid_year(pub_date.findtext("Year"))
+    if not year:
+        medline_year = year_from(pub_date.findtext("MedlineDate"))
+        return medline_year, "MedlineDate" if medline_year else ""
+    month_raw = clean_text(pub_date.findtext("Month"))
+    day_raw = clean_text(pub_date.findtext("Day"))
+    month = ""
+    if month_raw:
+        if month_raw.isdigit():
+            month = f"{int(month_raw):02d}" if 1 <= int(month_raw) <= 12 else ""
+        else:
+            month = f"{MONTHS.get(month_raw[:3].lower(), 0):02d}" if MONTHS.get(month_raw[:3].lower()) else ""
+    if month and day_raw.isdigit():
+        parsed = valid_iso_date(f"{year}-{month}-{int(day_raw):02d}")
+        return parsed, "PubDate" if parsed else (year, "PubDate")
+    if month:
+        parsed = valid_iso_date(f"{year}-{month}")
+        return parsed, "PubDate" if parsed else (year, "PubDate")
+    return year, "PubDate"
+
+
+def europe_pmc_publication_date(item: dict[str, Any]) -> tuple[str, str]:
+    for key in ("firstPublicationDate", "electronicPublicationDate", "printPublicationDate"):
+        parsed = valid_iso_date(item.get(key))
+        if parsed:
+            return parsed, key
+    year = valid_year(item.get("pubYear"))
+    return (year, "pubYear") if year else ("", "")
+
+
+def openalex_publication_date(item: dict[str, Any]) -> tuple[str, str]:
+    parsed = valid_iso_date(item.get("publication_date"))
+    if parsed:
+        return parsed, "publication_date"
+    year = valid_year(item.get("publication_year"))
+    return (year, "publication_year") if year else ("", "")
 
 
 def parse_authors(items: list[Any], *keys: str) -> list[str]:
@@ -136,7 +280,8 @@ def search_pubmed(query: str, limit: int, since_days: int | None = None) -> list
             name = clean_text(f"{author.findtext('ForeName') or ''} {author.findtext('LastName') or ''}")
             if name:
                 authors.append(name)
-        year = year_from(article.findtext(".//PubDate/Year") or article.findtext(".//PubDate/MedlineDate"))
+        publication_date, publication_date_source = pubmed_publication_date(article)
+        year = year_from_date(publication_date)
         oa_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/pdf/" if pmcid else ""
         if title:
             records.append(
@@ -148,6 +293,8 @@ def search_pubmed(query: str, limit: int, since_days: int | None = None) -> list
                     authors=authors,
                     journal=journal,
                     year=year,
+                    publication_date=publication_date,
+                    publication_date_source=publication_date_source,
                     abstract=abstract,
                     abstract_en=abstract,
                     url=f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else "",
@@ -178,6 +325,7 @@ def search_europe_pmc(query: str, limit: int, since_days: int | None = None) -> 
         authors = [clean_text(name) for name in str(item.get("authorString") or "").split(",")[:8] if name.strip()]
         pmcid = str(item.get("pmcid") or "")
         oa_url = f"https://europepmc.org/articles/{pmcid}?pdf=render" if pmcid else ""
+        publication_date, publication_date_source = europe_pmc_publication_date(item)
         records.append(
             PaperInput(
                 title=title,
@@ -186,7 +334,9 @@ def search_europe_pmc(query: str, limit: int, since_days: int | None = None) -> 
                 pmid=str(item.get("pmid") or ""),
                 authors=authors,
                 journal=clean_text(item.get("journalTitle")),
-                year=year_from(item.get("pubYear")),
+                year=year_from_date(publication_date),
+                publication_date=publication_date,
+                publication_date_source=publication_date_source,
                 abstract=clean_text(item.get("abstractText")),
                 abstract_en=clean_text(item.get("abstractText")),
                 url=f"https://europepmc.org/article/{item.get('source', 'MED')}/{item.get('id')}",
@@ -233,6 +383,7 @@ def search_openalex(query: str, limit: int, email: str = "", since_days: int | N
         ]
         pdf_url = clean_text(primary.get("pdf_url") or oa.get("oa_url"))
         is_oa = bool(oa.get("is_oa") or pdf_url)
+        publication_date, publication_date_source = openalex_publication_date(item)
         records.append(
             PaperInput(
                 title=clean_text(item.get("title")),
@@ -240,7 +391,9 @@ def search_openalex(query: str, limit: int, email: str = "", since_days: int | N
                 doi=doi,
                 authors=[name for name in authors if name],
                 journal=clean_text(source.get("display_name")),
-                year=year_from(item.get("publication_year")),
+                year=year_from_date(publication_date),
+                publication_date=publication_date,
+                publication_date_source=publication_date_source,
                 abstract=inverted_abstract(item.get("abstract_inverted_index")),
                 abstract_en=inverted_abstract(item.get("abstract_inverted_index")),
                 url=item.get("doi") or item.get("id") or "",
@@ -266,6 +419,7 @@ def search_crossref(query: str, limit: int, since_days: int | None = None) -> li
         if not title:
             continue
         journal = clean_text(" ".join(item.get("container-title") or []))
+        publication_date, publication_date_source = crossref_publication_date(item)
         records.append(
             PaperInput(
                 title=title,
@@ -273,7 +427,9 @@ def search_crossref(query: str, limit: int, since_days: int | None = None) -> li
                 doi=clean_doi(item.get("DOI")),
                 authors=parse_authors(item.get("author") or [], "given", "family"),
                 journal=journal,
-                year=year_from(item.get("published-print") or item.get("published-online") or item.get("created")),
+                year=year_from_date(publication_date),
+                publication_date=publication_date,
+                publication_date_source=publication_date_source,
                 abstract=clean_text(item.get("abstract")),
                 abstract_en=clean_text(item.get("abstract")),
                 url=clean_text(item.get("URL")),
@@ -308,6 +464,8 @@ def dedupe(records: list[PaperInput]) -> list[PaperInput]:
             "abstract_zh",
             "oa_source",
             "download_error",
+            "publication_date",
+            "publication_date_source",
         ):
             if not getattr(existing, field_name) and getattr(record, field_name):
                 setattr(existing, field_name, getattr(record, field_name))
@@ -362,7 +520,7 @@ def federated_search(
     merged = mark_paywalled(dedupe(records))
     for record in merged:
         record.keywords = parsed_keywords
-    merged.sort(key=lambda item: (item.year or "", item.is_open_access, bool(item.abstract_en), bool(item.doi)), reverse=True)
+    merged.sort(key=lambda item: (item.publication_date or item.year or "", item.is_open_access, bool(item.abstract_en), bool(item.doi)), reverse=True)
     return merged[:limit], errors
 
 
@@ -408,13 +566,16 @@ def resolve_doi(doi: str) -> PaperInput | None:
     data = http_json(f"https://api.crossref.org/works/{urllib.parse.quote(doi)}")
     item = data.get("message") or {}
     title = clean_text(" ".join(item.get("title") or []))
+    publication_date, publication_date_source = crossref_publication_date(item)
     return PaperInput(
         title=title or doi,
         title_en=title or doi,
         doi=doi,
         authors=parse_authors(item.get("author") or [], "given", "family"),
         journal=clean_text(" ".join(item.get("container-title") or [])),
-        year=year_from(item.get("published-print") or item.get("published-online") or item.get("created")),
+        year=year_from_date(publication_date),
+        publication_date=publication_date,
+        publication_date_source=publication_date_source,
         abstract=clean_text(item.get("abstract")),
         abstract_en=clean_text(item.get("abstract")),
         url=clean_text(item.get("URL") or f"https://doi.org/{doi}"),
