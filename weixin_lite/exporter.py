@@ -19,19 +19,19 @@ def safe_slug(value: str, fallback: str = "article") -> str:
 def article_html(article: QuickReadArticle) -> str:
     cover = ""
     if article.cover_image_name:
-        cover = f'<p><img src="images/{article.cover_image_name}" alt="publisher title image"></p>\n'
+        cover = f'<p style="margin:0 0 22px;"><img src="images/{article.cover_image_name}" alt="publisher title image" style="width:100%;height:auto;display:block;"></p>\n'
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <title>{article.title}</title>
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.85; max-width: 760px; margin: 32px auto; color: #1f2933; }}
-    h2 {{ font-size: 22px; margin-top: 20px; }}
-    h3 {{ font-size: 18px; margin-top: 24px; border-left: 4px solid #0f766e; padding-left: 10px; }}
-    p {{ font-size: 16px; }}
-    img {{ max-width: 100%; height: auto; display: block; margin: 16px auto; }}
-    strong {{ color: #0f766e; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; line-height: 1.95; max-width: 760px; margin: 0 auto 40px; color: #0f172a; background: #fff; }}
+    h2 {{ font-size: 24px; line-height: 1.45; margin: 18px 0 18px; font-weight: 800; }}
+    h3 {{ font-size: 20px; line-height: 1.55; margin: 26px 0 14px; font-weight: 800; }}
+    p {{ font-size: 17px; line-height: 1.95; margin: 16px 0; }}
+    img {{ max-width: 100%; height: auto; display: block; margin: 24px auto 10px; }}
+    strong {{ color: #000; font-weight: 800; }}
   </style>
 </head>
 <body>

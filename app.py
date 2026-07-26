@@ -155,6 +155,29 @@ def show_details(papers: list[PaperInput], title: str = "查看摘要和错误")
             st.caption(" | ".join(bit for bit in bits if bit))
 
 
+def render_article_preview(article: QuickReadArticle) -> None:
+    pending: list[str] = []
+
+    def flush() -> None:
+        if pending:
+            st.markdown("\n".join(pending))
+            pending.clear()
+
+    for raw in article.body_markdown.splitlines():
+        line = raw.strip()
+        if line.startswith("![") and "](" in line and line.endswith(")"):
+            flush()
+            image_name = line[line.find("(") + 1 : line.rfind(")")].replace("images/", "", 1)
+            image_bytes = st.session_state.images.get(image_name)
+            if image_bytes:
+                st.image(image_bytes, use_container_width=True)
+            else:
+                st.caption(f"图片未找到：{image_name}")
+        else:
+            pending.append(raw)
+    flush()
+
+
 def sidebar_settings() -> tuple[str, str, str, str, int, float]:
     st.sidebar.header("翻译/生成模型")
     provider_keys = list(PROVIDERS.keys())
@@ -352,9 +375,28 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
                 name = f"cover-{idx}-{cover.name}"
                 st.session_state.images[name] = cover.getvalue()
                 article.cover_image_name = name
+            if article.figures:
+                st.caption("原文截图")
+                for fig_idx, figure in enumerate(article.figures, start=1):
+                    current = figure.image_name
+                    if current and current in st.session_state.images:
+                        st.image(st.session_state.images[current], caption=f"{figure.figure_id} 自动截图", use_container_width=True)
+                    replacement = st.file_uploader(
+                        f"替换 {figure.figure_id} 截图",
+                        type=["png", "jpg", "jpeg"],
+                        key=f"figure-replace-{idx}-{fig_idx}",
+                    )
+                    if replacement:
+                        new_name = f"figure-{idx}-{fig_idx}-{replacement.name}"
+                        st.session_state.images[new_name] = replacement.getvalue()
+                        if current:
+                            article.body_markdown = article.body_markdown.replace(f"images/{current}", f"images/{new_name}")
+                            article.body_html = article.body_html.replace(f"images/{current}", f"images/{new_name}")
+                        figure.image_name = new_name
+                        figure.page_image_name = new_name
             if article.warnings:
                 st.warning("；".join(article.warnings))
-            st.markdown(article.body_markdown)
+            render_article_preview(article)
             if article.evidence:
                 st.caption("证据追踪")
                 st.dataframe([item.to_dict() for item in article.evidence[:12]], use_container_width=True, hide_index=True)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import re
 import uuid
 import urllib.parse
 import urllib.request
@@ -96,28 +97,48 @@ def upload_content_image(access_token: str, file_name: str, data: bytes) -> str:
     return url
 
 
-def duyi_wechat_html(article: QuickReadArticle) -> str:
-    body = article.body_html
+def replace_content_image_sources(html: str, access_token: str, image_assets: dict[str, bytes]) -> str:
+    def replace(match: re.Match[str]) -> str:
+        src = match.group(1)
+        if not src.startswith("images/"):
+            return match.group(0)
+        image_name = src.removeprefix("images/")
+        data = image_assets.get(image_name)
+        if not data:
+            return match.group(0)
+        uploaded_url = upload_content_image(access_token, image_name, data)
+        return match.group(0).replace(src, uploaded_url)
+
+    return re.sub(r'src="([^"]+)"', replace, html)
+
+
+def duyi_wechat_html(article: QuickReadArticle, content_html: str | None = None) -> str:
+    body = content_html or article.body_html
     return f"""
 <section style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;color:#22313f;line-height:1.85;font-size:16px;">
-  <section style="border-left:4px solid #0f766e;padding:2px 0 2px 12px;margin:0 0 18px;">
-    <h1 style="font-size:22px;line-height:1.35;margin:0;color:#0f172a;">{article.title}</h1>
-    <p style="margin:8px 0 0;color:#64748b;font-size:14px;">{article.digest}</p>
+  <section style="margin:0 0 22px;">
+    <h1 style="font-size:24px;line-height:1.45;margin:0;color:#0f172a;font-weight:800;">{article.title}</h1>
+    <p style="margin:10px 0 0;color:#64748b;font-size:15px;line-height:1.7;">{article.digest}</p>
   </section>
-  <section style="height:1px;background:#dbe7e4;margin:18px 0;"></section>
+  <section style="height:1px;background:#e5e7eb;margin:18px 0 22px;"></section>
   {body}
 </section>
 """.strip()
 
 
-def build_draft_payload(article: QuickReadArticle, config: WechatDraftConfig, thumb_media_id: str = "") -> dict[str, Any]:
+def build_draft_payload(
+    article: QuickReadArticle,
+    config: WechatDraftConfig,
+    thumb_media_id: str = "",
+    content_html: str | None = None,
+) -> dict[str, Any]:
     return {
         "articles": [
             {
                 "title": article.title[:64],
                 "author": config.author,
                 "digest": article.digest[:120],
-                "content": duyi_wechat_html(article),
+                "content": duyi_wechat_html(article, content_html=content_html),
                 "content_source_url": config.content_source_url or article.paper.url,
                 "thumb_media_id": thumb_media_id,
                 "show_cover_pic": 1 if config.show_cover_pic else 0,
@@ -158,7 +179,8 @@ def publish_draft(
         raise WechatPublishError("真实发布草稿前必须上传或选择一张封面图。")
     access_token = get_access_token(config.app_id, config.app_secret)
     thumb_media_id = upload_cover_material(access_token, cover_name, cover_bytes)
-    payload = build_draft_payload(article, config, thumb_media_id=thumb_media_id)
+    content_html = replace_content_image_sources(article.body_html, access_token, assets)
+    payload = build_draft_payload(article, config, thumb_media_id=thumb_media_id, content_html=content_html)
     result = create_draft(access_token, payload)
     return {"dry_run": False, "payload": payload, "result": result}
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -227,6 +228,7 @@ def render_key_pages(pdf_bytes: bytes, figures: list[FigureAnalysis], max_pages:
         return {}
 
     images: dict[str, bytes] = {}
+    digest = hashlib.sha1(pdf_bytes).hexdigest()[:10]
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     wanted: list[int] = []
     for figure in figures:
@@ -242,8 +244,8 @@ def render_key_pages(pdf_bytes: bytes, figures: list[FigureAnalysis], max_pages:
         wanted = selected_page_indexes(doc.page_count)[:max_pages]
     for page_index in wanted:
         page = doc.load_page(page_index)
-        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
-        name = f"page-{page_index + 1}.png"
+        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
+        name = f"{digest}-page-{page_index + 1}.png"
         images[name] = pix.tobytes("png")
     return images
 
@@ -267,7 +269,10 @@ def parse_pdf(pdf_bytes: bytes) -> PdfContent:
             page = int(figure.page)
         except (TypeError, ValueError):
             continue
-        figure.image_name = f"page-{page}.png" if f"page-{page}.png" in rendered else ""
+        image_name = f"{hashlib.sha1(pdf_bytes).hexdigest()[:10]}-page-{page}.png"
+        figure.page_image_name = image_name if image_name in rendered else ""
+        figure.image_name = figure.page_image_name
+        figure.needs_manual_crop = bool(figure.image_name)
     return PdfContent(
         text=text,
         sections=sections,

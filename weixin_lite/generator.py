@@ -14,14 +14,14 @@ TARGET_MAX = 1500
 
 
 SYSTEM_PROMPT = """你是一个严谨的中文生物技术公众号作者，专门写单篇文献快读。
-写作风格参考用户给出的微信公众号文章：中文主体、短小标题、编号要点、关键数据和关键图例穿插分析。
+写作风格参考用户给出的微信公众号文章：先放原文截图，再写短段中文说明；中文主体、短小标题、编号要点、关键数据穿插说明。
 必须遵守：
 1. 正文只写中文，不加入英文段落，不做中英对照。
 2. 每篇 500-1500 个中文字符，优先 1000-1300 字。
 3. 必须包含“文章核心要点简述”和“文章的创新意义”两个小标题。
-4. 必须分析关键数据和关键图例：图在比较什么、关键趋势或数字是什么、支持什么结论。
+4. 图相关内容只写图下短说明，不要写长篇“Fig. X 解读”，不要重复“需结合原图坐标轴、分组和图例细节确认后发布”。
 5. 所有数字必须来自摘要、正文、图注或证据候选；不得编造影响因子、数据、单位、作者机构。
-6. 如果没有全文或图注，必须明确写“图例分析需开放全文或上传 PDF 后补充”，不能假装读过图。
+6. 如果没有截图或图注，必须明确写“需上传原图截图后发布”，不能假装读过图。
 7. 标题不超过 32 个中文字符，digest 不超过 120 字。
 只返回 JSON，不要返回 Markdown 代码块。"""
 
@@ -56,8 +56,8 @@ DOI：{paper.doi}
   "digest": "不超过120字摘要",
   "intro": "约80-120字，用中文说明这篇文章解决什么问题",
   "core_points": ["2-3条核心要点，每条包含必要数据和证据边界"],
-  "figure_analyses": [
-    {{"figure_id": "Fig. 1", "interpretation": "这张图/表在比较什么、关键趋势/数据是什么、支撑什么结论"}}
+  "figure_notes": [
+    {{"figure_id": "Fig. 1", "heading": "核心策略：一句话概括", "note": "1-2句中文短说明，只说明图中可核对的信息和结论边界"}}
   ],
   "innovation": ["2-3条创新意义"],
   "take_home": "一句话总结"
@@ -92,18 +92,19 @@ def fallback_article(paper: PaperInput, pdf: PdfContent | None) -> dict[str, Any
     else:
         points.append("当前没有读取到可追踪的关键数字，因此正文不加入未经证实的性能指标。")
     if figures:
-        points.append(f"可用于图例分析的线索集中在 {', '.join(fig.figure_id for fig in figures)}。这些图适合穿插在正文中解释实验设计、性能比较或酶工程结果。")
+        points.append(f"可用于正文截图的线索集中在 {', '.join(fig.figure_id for fig in figures)}。发布稿应先放原文截图，再用短段说明图中策略、比较或关键趋势。")
     else:
-        points.append("图例分析需开放全文或上传 PDF 后补充；当前只能生成摘要级快读。")
+        points.append("当前没有可用原文截图；需上传原图截图后发布。")
     return {
         "title": short_title(paper),
         "digest": f"{paper.journal or '文献'}快读：{title[:70]}",
         "intro": f"本文聚焦 {title}，与 TdT、PUP 或酶促 DNA/RNA 合成方向的技术进展相关。",
         "core_points": points[:3],
-        "figure_analyses": [
+        "figure_notes": [
             {
                 "figure_id": fig.figure_id,
-                "interpretation": "根据图注，该图是论文中的关键结果展示；需结合原图坐标轴、分组和图例细节确认后发布。",
+                "heading": f"{fig.figure_id}：原文关键结果截图",
+                "note": "原文截图置于上方；正文只围绕图中可见流程、分组和趋势做简短说明。",
             }
             for fig in figures
         ],
@@ -125,14 +126,21 @@ def render_markdown(paper: PaperInput, data: dict[str, Any], figures: list[Figur
     for idx, point in enumerate(data.get("core_points") or [], start=1):
         lines.append(f"{idx}. {str(point).strip()}")
     figure_map = {figure.figure_id.lower(): figure for figure in figures}
-    for item in data.get("figure_analyses") or []:
+    figure_items = data.get("figure_notes") or data.get("figure_analyses") or []
+    for figure_index, item in enumerate(figure_items, start=1):
         fig_id = str(item.get("figure_id") or "").strip()
-        interpretation = str(item.get("interpretation") or "").strip()
+        heading = str(item.get("heading") or f"{figure_index}. {fig_id or '原文截图'}").strip()
+        note = str(item.get("note") or item.get("interpretation") or "").strip()
         figure = figure_map.get(fig_id.lower())
         lines.append("")
         if figure and figure.image_name:
             lines.append(f"![{fig_id}](images/{figure.image_name})")
-        lines.append(f"**{fig_id or '关键图例'} 解读：** {interpretation}")
+        elif fig_id:
+            lines.append(f"> {fig_id} 需上传原图截图后发布。")
+        lines.append(f"**{heading}**")
+        if note:
+            lines.append("")
+            lines.append(note)
     lines.append("")
     lines.append("## 文章的创新意义")
     lines.append("")
@@ -161,22 +169,24 @@ def markdown_to_wechat_html(markdown: str) -> str:
         elif line.startswith("!["):
             alt = html.escape(line[line.find("[") + 1 : line.find("]")])
             src = html.escape(line[line.find("(") + 1 : line.rfind(")")])
-            html_lines.append(f'<p><img src="{src}" alt="{alt}"></p>')
+            html_lines.append(f'<p style="margin:24px 0 10px;"><img src="{src}" alt="{alt}" style="width:100%;height:auto;display:block;margin:0 auto;"></p>')
+        elif line.startswith("> "):
+            html_lines.append(f'<p style="color:#8a8f98;font-size:15px;line-height:1.7;">{html.escape(line[2:])}</p>')
         elif re.match(r"^\d+\.\s+", line):
-            html_lines.append(f"<p>{html.escape(line)}</p>")
+            html_lines.append(f'<p style="font-size:17px;line-height:1.9;margin:16px 0;">{html.escape(line)}</p>')
         else:
             escaped = html.escape(line)
             escaped = re.sub(r"\*\*(.*?)\*\*", r"<strong>\1</strong>", escaped)
-            html_lines.append(f"<p>{escaped}</p>")
+            html_lines.append(f'<p style="font-size:17px;line-height:1.9;margin:16px 0;">{escaped}</p>')
     return "\n".join(html_lines)
 
 
 def attach_interpretations(figures: list[FigureAnalysis], data: dict[str, Any]) -> None:
     by_key = {figure.figure_id.lower(): figure for figure in figures}
-    for item in data.get("figure_analyses") or []:
+    for item in (data.get("figure_notes") or data.get("figure_analyses") or []):
         figure = by_key.get(str(item.get("figure_id") or "").lower())
         if figure:
-            figure.interpretation = str(item.get("interpretation") or "")
+            figure.interpretation = str(item.get("note") or item.get("interpretation") or "")
 
 
 def generate_article(

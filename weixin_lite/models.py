@@ -143,10 +143,12 @@ class FigureAnalysis:
     caption: str
     page: str = ""
     image_name: str = ""
+    page_image_name: str = ""
     why_selected: str = ""
     interpretation: str = ""
     evidence: list[EvidenceItem] = field(default_factory=list)
     needs_manual_check: bool = False
+    needs_manual_crop: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

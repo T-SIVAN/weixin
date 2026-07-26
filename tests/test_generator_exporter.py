@@ -6,7 +6,7 @@ from weixin_lite.downloader import download_open_access
 from weixin_lite.exporter import project_zip, unavailable_dois_csv
 from weixin_lite.generator import generate_article
 from weixin_lite.llm import default_base_url, default_model
-from weixin_lite.models import BatchProject, PaperInput, generation_ready_papers, unavailable_papers
+from weixin_lite.models import BatchProject, FigureAnalysis, PaperInput, generation_ready_papers, unavailable_papers
 from weixin_lite.pdf_reader import PdfContent, extract_figure_legends, extract_numeric_evidence
 from weixin_lite.search import build_keyword_query, crossref_publication_date, crossref_year, run_keyword_search, year_from
 from weixin_lite.translate import translate_records
@@ -92,8 +92,27 @@ def test_fallback_article_has_required_chinese_sections():
 
     assert "文章核心要点简述" in article.body_markdown
     assert "文章的创新意义" in article.body_markdown
+    assert "解读：" not in article.body_markdown
     assert "English abstract" not in article.body_markdown
     assert article.evidence
+
+
+def test_article_places_screenshot_before_short_note():
+    paper = PaperInput(title_en="A test paper", journal="Nature", year="2025")
+    figure = FigureAnalysis(
+        figure_id="Fig. 3",
+        caption="Fig. 3 Growth curve with 90% conversion.",
+        page="3",
+        image_name="paper-page-3.png",
+    )
+    pdf = PdfContent(text="Fig. 3 Growth curve with 90% conversion.", legends=[figure], parser="fixture")
+
+    article = generate_article(paper, pdf=pdf)
+
+    image_pos = article.body_markdown.find("![Fig. 3](images/paper-page-3.png)")
+    note_pos = article.body_markdown.find("**Fig. 3：原文关键结果截图**")
+    assert image_pos >= 0
+    assert note_pos > image_pos
 
 
 def test_project_zip_contains_paywalled_and_download_status():
