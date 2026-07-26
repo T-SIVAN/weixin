@@ -1,12 +1,26 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import urllib.request
 from typing import Any
 
 
 class LLMError(RuntimeError):
     pass
+
+
+def default_api_key() -> str:
+    return os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY") or ""
+
+
+def default_base_url() -> str:
+    return os.getenv("OPENAI_BASE_URL") or os.getenv("LLM_BASE_URL") or "https://api.openai.com/v1"
+
+
+def default_model() -> str:
+    return os.getenv("OPENAI_MODEL") or os.getenv("LLM_MODEL") or "gpt-4o-mini"
 
 
 def call_openai_compatible(
@@ -28,7 +42,7 @@ def call_openai_compatible(
         ],
         "temperature": temperature,
     }
-    data = json.dumps(payload).encode("utf-8")
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         f"{base_url.rstrip('/')}/chat/completions",
         data=data,
@@ -51,10 +65,9 @@ def call_openai_compatible(
 
 def strip_json_fence(text: str) -> str:
     cleaned = str(text or "").strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`")
-        cleaned = cleaned.removeprefix("json").strip()
-    return cleaned
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
@@ -69,4 +82,19 @@ def parse_json_object(text: str) -> dict[str, Any]:
         parsed = json.loads(cleaned[start : end + 1])
     if not isinstance(parsed, dict):
         raise ValueError("LLM response is not a JSON object")
+    return parsed
+
+
+def parse_json_array(text: str) -> list[Any]:
+    cleaned = strip_json_fence(text)
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("[")
+        end = cleaned.rfind("]")
+        if start < 0 or end <= start:
+            raise
+        parsed = json.loads(cleaned[start : end + 1])
+    if not isinstance(parsed, list):
+        raise ValueError("LLM response is not a JSON array")
     return parsed

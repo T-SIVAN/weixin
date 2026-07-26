@@ -5,7 +5,7 @@ import re
 from typing import Any
 
 from .llm import LLMError, call_openai_compatible, parse_json_object
-from .models import EvidenceItem, FigureAnalysis, PaperInput, QuickReadArticle
+from .models import FigureAnalysis, PaperInput, QuickReadArticle
 from .pdf_reader import PdfContent, compact_text
 
 
@@ -14,14 +14,15 @@ TARGET_MAX = 1500
 
 
 SYSTEM_PROMPT = """你是一个严谨的中文生物技术公众号作者，专门写单篇文献快读。
-你的任务不是写综述，而是像科研公众号一样，用清楚、克制、有证据边界的语言解读一篇文章。
-必须严格遵守：
-1. 只写单篇文章，中文 500-1500 字，优先 1000-1300 字。
-2. 必须有“文章核心要点简述”和“文章的创新意义”两个小标题。
-3. 必须分析关键数据和关键图例：说明图在比较什么、看到了什么趋势或数字、支持了什么结论。
-4. 所有数字必须来自提供的摘要、正文、图注或证据候选；不要编造影响因子、数据、作者单位。
-5. 如果只有摘要没有全文或图注，必须明说“图例分析需上传 PDF 后补充”，不能假装读过图。
-6. 标题不超过 32 个中文字符，digest 不超过 120 字。
+写作风格参考用户给出的微信公众号文章：中文主体、短小标题、编号要点、关键数据和关键图例穿插分析。
+必须遵守：
+1. 正文只写中文，不加入英文段落，不做中英对照。
+2. 每篇 500-1500 个中文字符，优先 1000-1300 字。
+3. 必须包含“文章核心要点简述”和“文章的创新意义”两个小标题。
+4. 必须分析关键数据和关键图例：图在比较什么、关键趋势或数字是什么、支持什么结论。
+5. 所有数字必须来自摘要、正文、图注或证据候选；不得编造影响因子、数据、单位、作者机构。
+6. 如果没有全文或图注，必须明确写“图例分析需开放全文或上传 PDF 后补充”，不能假装读过图。
+7. 标题不超过 32 个中文字符，digest 不超过 120 字。
 只返回 JSON，不要返回 Markdown 代码块。"""
 
 
@@ -32,23 +33,27 @@ def chineseish_len(text: str) -> int:
 def build_prompt(paper: PaperInput, pdf: PdfContent | None, target_chars: int) -> str:
     authors = ", ".join(paper.authors[:6])
     metadata = f"""
-题名：{paper.title}
+英文题名：{paper.title_en or paper.title}
+中文题名：{paper.title_zh}
 作者：{authors}
 期刊：{paper.journal}
 年份：{paper.year}
 DOI：{paper.doi}
 链接：{paper.url}
-摘要：{paper.abstract}
+英文摘要：{paper.abstract_en or paper.abstract}
+中文摘要：{paper.abstract_zh}
+开放全文状态：{paper.access_status}
 """.strip()
-    pdf_text = pdf.prompt_text() if pdf else "未提供 PDF 全文。只能基于题录和摘要生成摘要级快读。"
+    pdf_text = pdf.prompt_text() if pdf else "未提供 PDF 或开放全文。只能基于题录和摘要生成摘要级快读。"
     return f"""
-请按参考公众号文章的节奏，为下面这篇论文生成可直接发布到微信公众号的单篇快读。
+请为下面这篇论文生成可直接发布到微信公众号的中文单篇快读。
 目标长度：约 {target_chars} 个中文字符，硬限制 {TARGET_MIN}-{TARGET_MAX}。
 
 输出 JSON Schema：
 {{
   "title": "不超过32个中文字符的公众号标题",
   "digest": "不超过120字摘要",
+  "intro": "约80-120字，用中文说明这篇文章解决什么问题",
   "core_points": ["2-3条核心要点，每条包含必要数据和证据边界"],
   "figure_analyses": [
     {{"figure_id": "Fig. 1", "interpretation": "这张图/表在比较什么、关键趋势/数据是什么、支撑什么结论"}}
@@ -65,60 +70,64 @@ DOI：{paper.doi}
 """.strip()
 
 
+def short_title(paper: PaperInput) -> str:
+    journal = (paper.journal or "文献").split()[0][:10]
+    base = paper.title_zh or paper.title_en or paper.title or paper.doi or "单篇快读"
+    base = re.sub(r"[:：].*$", "", base)
+    base = re.sub(r"\s+", "", base)
+    return f"{journal}|{base[:20]}"[:32]
+
+
 def fallback_article(paper: PaperInput, pdf: PdfContent | None) -> dict[str, Any]:
     figures = pdf.legends[:3] if pdf else []
     evidence = pdf.evidence[:6] if pdf else []
-    points = []
-    if paper.abstract:
-        points.append(f"文章围绕 {paper.title} 展开，摘要显示研究重点在方法建立、酶学性能或应用验证。")
-    else:
-        points.append("当前题录缺少摘要，建议上传 PDF 后再生成正式发布稿。")
+    title = paper.title_zh or paper.title_en or paper.title or paper.doi
+    points = [
+        f"这篇文章围绕“{title}”展开，适合作为 {paper.journal or '相关期刊'} 的单篇快读。当前生成稿严格基于题录、摘要和可读取全文证据，不补写未出现的数据。",
+    ]
     if evidence:
         values = "、".join(item.value for item in evidence[:4])
-        points.append(f"可抽取到的关键数据包括 {values}；这些数字需要在发布前结合原文图注逐一核对。")
+        points.append(f"全文或图注中可追踪到的关键数据包括 {values}。这些数字会在证据表中保留页码、图号或图注来源，发布前可逐项核对。")
     else:
-        points.append("尚未读取到可追溯的关键数字，因此不应在正文中加入未经证实的性能指标。")
+        points.append("当前没有读取到可追踪的关键数字，因此正文不加入未经证实的性能指标。")
     if figures:
-        points.append(f"图注线索主要集中在 {', '.join(fig.figure_id for fig in figures)}，适合作为正文穿插图。")
+        points.append(f"可用于图例分析的线索集中在 {', '.join(fig.figure_id for fig in figures)}。这些图适合穿插在正文中解释实验设计、性能比较或酶工程结果。")
     else:
-        points.append("图例分析需上传 PDF 后补充；当前只能形成摘要级快读。")
+        points.append("图例分析需开放全文或上传 PDF 后补充；当前只能生成摘要级快读。")
     return {
         "title": short_title(paper),
-        "digest": f"{paper.journal or '该期刊'}论文快读：{paper.title[:70]}",
+        "digest": f"{paper.journal or '文献'}快读：{title[:70]}",
+        "intro": f"本文聚焦 {title}，与 TdT、PUP 或酶促 DNA/RNA 合成方向的技术进展相关。",
         "core_points": points[:3],
         "figure_analyses": [
             {
                 "figure_id": fig.figure_id,
-                "interpretation": "根据图注，该图是论文中的关键结果展示；需人工核对坐标轴、分组和原图细节后再发布。",
+                "interpretation": "根据图注，该图是论文中的关键结果展示；需结合原图坐标轴、分组和图例细节确认后发布。",
             }
             for fig in figures
         ],
         "innovation": [
             "把酶促核酸合成问题落到可验证的反应体系、底物选择或酶工程策略上。",
-            "为 TdT/PUP 相关酶的改造方向提供了可追溯的实验线索。",
+            "为 TdT/PUP 相关酶的改造和应用提供了可追溯的实验线索。",
         ],
-        "take_home": "这篇文章适合作为酶促 DNA/RNA 合成方向的单篇快读，但正式发布前应补齐全文图例证据。",
+        "take_home": "这篇文章可作为酶促 DNA/RNA 合成方向的中文快读；正式发布前应优先核对全文图例和关键数字。",
     }
-
-
-def short_title(paper: PaperInput) -> str:
-    journal = (paper.journal or "文献").split()[0][:10]
-    title = re.sub(r"[:：].*$", "", paper.title or paper.doi or "单篇快读")
-    title = re.sub(r"\s+", "", title)
-    return f"{journal}|{title[:20]}"[:32]
 
 
 def render_markdown(paper: PaperInput, data: dict[str, Any], figures: list[FigureAnalysis]) -> str:
     lines: list[str] = [f"# {data.get('title') or short_title(paper)}", ""]
+    intro = str(data.get("intro") or "").strip()
+    if intro:
+        lines.extend([intro, ""])
     lines.append("## 文章核心要点简述")
     lines.append("")
     for idx, point in enumerate(data.get("core_points") or [], start=1):
         lines.append(f"{idx}. {str(point).strip()}")
-    figure_map = {figure.figure_id: figure for figure in figures}
+    figure_map = {figure.figure_id.lower(): figure for figure in figures}
     for item in data.get("figure_analyses") or []:
         fig_id = str(item.get("figure_id") or "").strip()
         interpretation = str(item.get("interpretation") or "").strip()
-        figure = figure_map.get(fig_id)
+        figure = figure_map.get(fig_id.lower())
         lines.append("")
         if figure and figure.image_name:
             lines.append(f"![{fig_id}](images/{figure.image_name})")
@@ -155,10 +164,9 @@ def markdown_to_wechat_html(markdown: str) -> str:
         elif re.match(r"^\d+\.\s+", line):
             html_lines.append(f"<p>{html.escape(line)}</p>")
         else:
-            line = re.sub(r"\*\*(.*?)\*\*", lambda m: f"<strong>{html.escape(m.group(1))}</strong>", line)
-            if "<strong>" not in line:
-                line = html.escape(line)
-            html_lines.append(f"<p>{line}</p>")
+            escaped = html.escape(line)
+            escaped = re.sub(r"\*\*(.*?)\*\*", r"<strong>\1</strong>", escaped)
+            html_lines.append(f"<p>{escaped}</p>")
     return "\n".join(html_lines)
 
 
@@ -203,8 +211,8 @@ def generate_article(
     if api_key.strip() and (count < TARGET_MIN or count > TARGET_MAX):
         try:
             repair_prompt = (
-                f"请把下面公众号稿改写到 {TARGET_MIN}-{TARGET_MAX} 个中文字符，保留原有事实和图例分析，"
-                "不要新增未给出的数字。只返回正文 Markdown。\n\n"
+                f"请把下面公众号稿改写到 {TARGET_MIN}-{TARGET_MAX} 个中文字符。"
+                "只保留中文正文，不新增未给出的数字，保留两个固定小标题。\n\n"
                 f"{markdown}"
             )
             markdown = call_openai_compatible(
@@ -222,7 +230,7 @@ def generate_article(
         warnings.append(f"当前字数 {count}，超出 500-1500 发布目标，请人工微调或换更强模型重生成。")
     evidence = pdf.evidence[:30] if pdf else []
     if not pdf or not pdf.legends:
-        warnings.append("未获得可靠图注；关键图例分析应在上传 PDF 后补齐。")
+        warnings.append("未获得可靠图注；图例分析需开放全文或上传 PDF 后补充。")
     return QuickReadArticle(
         paper=paper,
         title=str(data.get("title") or short_title(paper))[:32],

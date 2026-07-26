@@ -1,11 +1,13 @@
-"""WeChat article generation toolkit for single-paper literature quick reads."""
+"""WeChat literature radar and Chinese quick-read generation toolkit."""
 
-from .models import BatchProject, EvidenceItem, FigureAnalysis, PaperInput, QuickReadArticle
+from .models import BatchProject, DownloadedPaper, EvidenceItem, FigureAnalysis, PaperInput, QuickReadArticle, SearchRun
 
 __all__ = [
     "BatchProject",
+    "DownloadedPaper",
     "EvidenceItem",
     "FigureAnalysis",
     "PaperInput",
     "QuickReadArticle",
+    "SearchRun",
 ]

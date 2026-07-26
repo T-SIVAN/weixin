@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import io
 import json
 import re
@@ -7,7 +8,7 @@ import zipfile
 from typing import Any
 from urllib import request
 
-from .models import BatchProject, QuickReadArticle
+from .models import BatchProject, DownloadedPaper, PaperInput, QuickReadArticle
 
 
 def safe_slug(value: str, fallback: str = "article") -> str:
@@ -40,11 +41,41 @@ def article_html(article: QuickReadArticle) -> str:
 """
 
 
-def project_zip(project: BatchProject, image_assets: dict[str, bytes] | None = None) -> bytes:
+def paywalled_csv(papers: list[PaperInput]) -> str:
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=["title", "doi", "journal", "year", "url", "access_status"])
+    writer.writeheader()
+    for paper in papers:
+        if paper.access_status != "open":
+            writer.writerow(
+                {
+                    "title": paper.title_en or paper.title,
+                    "doi": paper.doi,
+                    "journal": paper.journal,
+                    "year": paper.year,
+                    "url": paper.url,
+                    "access_status": paper.access_status,
+                }
+            )
+    return buffer.getvalue()
+
+
+def project_zip(
+    project: BatchProject,
+    image_assets: dict[str, bytes] | None = None,
+    downloads: list[DownloadedPaper] | None = None,
+) -> bytes:
     assets = image_assets or {}
+    download_items = downloads if downloads is not None else project.downloads
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("project.json", json.dumps(project.to_dict(), ensure_ascii=False, indent=2))
+        zf.writestr("paywalled_dois.csv", paywalled_csv(project.papers))
+        zf.writestr(
+            "download_status.json",
+            json.dumps([item.to_dict() for item in download_items], ensure_ascii=False, indent=2),
+        )
+        zf.writestr("latest_papers.json", json.dumps([paper.to_dict() for paper in project.papers], ensure_ascii=False, indent=2))
         for index, article in enumerate(project.articles, start=1):
             slug = safe_slug(article.title, f"article-{index:02d}")
             zf.writestr(f"articles/{index:02d}-{slug}.md", article.body_markdown)
