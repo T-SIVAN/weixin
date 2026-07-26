@@ -217,7 +217,7 @@ def status_bar() -> None:
 
 
 def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_size: int, delay_seconds: float) -> None:
-    st.subheader("检索与翻译")
+    st.subheader("合成生物行业检索与标题翻译")
     latest = load_latest_run()
     if latest and latest.records:
         st.info(f"已读取每日检索：{latest.finished_at or latest.started_at}；关键词：{', '.join(latest.keywords)}")
@@ -227,14 +227,20 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
             st.success(f"已加入 {len(latest.records)} 条候选。")
 
     st.divider()
-    keywords = st.text_input("关键词", value=st.session_state.keywords, placeholder="例如：TdT, PUP, 酶促 DNA 合成")
+    keywords = st.text_area(
+        "关键词（可编辑，逗号或换行分隔）",
+        value=st.session_state.keywords,
+        height=96,
+        placeholder="例如：代谢工程, 生物制造, 工程菌, biosynthesis, microbial cell factory",
+    )
     st.session_state.keywords = keywords
+    st.caption("检索会使用你填写的关键词，并自动叠加合成生物、代谢工程、生物制造、工程菌、发酵生产等行业语境过滤。")
     col_a, col_b, col_c = st.columns(3)
     limit = col_a.slider("检索数量", 5, 30, 20)
     since_years = col_b.slider("时间范围（年）", 1, 10, 1)
     email = col_c.text_input("OpenAlex 邮箱（可选）", value="")
-    if st.button("检索并翻译", type="primary"):
-        with st.spinner("正在检索 PubMed、Europe PMC、OpenAlex、Crossref，并翻译标题/摘要..."):
+    if st.button("检索并翻译标题", type="primary"):
+        with st.spinner("正在检索 PubMed、Europe PMC、OpenAlex、Crossref，并翻译标题..."):
             run = run_keyword_search(keywords, limit=limit, email=email, since_days=since_years * 365)
             report = translate_records(
                 run.records,
@@ -253,7 +259,7 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
             if any("429" in item or "Too Many Requests" in item for item in report.errors):
                 st.info("429 是模型供应商限流/额度问题。建议把侧边栏“翻译批量”调为 1，把“翻译间隔”调到 5-10 秒，或切换 DeepSeek/SiliconFlow/custom。")
         else:
-            st.success(f"已翻译 {report.translated_count} 条记录。")
+            st.success(f"已翻译 {report.translated_count} 条标题。")
         st.dataframe(paper_rows(run.records), use_container_width=True, hide_index=True)
         show_details(run.records, "查看本次检索详情")
 

@@ -8,7 +8,14 @@ from weixin_lite.generator import generate_article
 from weixin_lite.llm import default_base_url, default_model
 from weixin_lite.models import BatchProject, FigureAnalysis, PaperInput, generation_ready_papers, unavailable_papers
 from weixin_lite.pdf_reader import PdfContent, extract_figure_legends, extract_numeric_evidence
-from weixin_lite.search import build_keyword_query, crossref_publication_date, crossref_year, run_keyword_search, year_from
+from weixin_lite.search import (
+    build_keyword_query,
+    crossref_publication_date,
+    crossref_year,
+    is_synthetic_biology_relevant,
+    relevance_score,
+    year_from,
+)
 from weixin_lite.translate import translate_records
 from weixin_lite.wechat_publish import WechatDraftConfig, publish_draft
 
@@ -18,6 +25,25 @@ def test_keyword_query_expands_simple_keywords():
 
     assert "terminal deoxynucleotidyl transferase" in query
     assert "enzymatic DNA synthesis" in query
+    assert "synthetic biology" in query
+    assert " AND " in query
+
+
+def test_synthetic_biology_relevance_filters_off_topic_results():
+    relevant = PaperInput(
+        title_en="Engineered microbes for high-yield biosynthesis of terpenoids",
+        abstract_en="Synthetic biology and metabolic engineering improve microbial cell factory production.",
+        doi="10.1000/synbio",
+    )
+    off_topic = PaperInput(
+        title_en="Engineered microbes detected in patient infection diagnosis",
+        abstract_en="A clinical study reports prognosis and therapy outcomes in patients.",
+        doi="10.1000/clinical",
+    )
+
+    assert is_synthetic_biology_relevant(relevant, ["engineered microbes"])
+    assert relevance_score(relevant, ["engineered microbes"]) > relevance_score(off_topic, ["engineered microbes"])
+    assert not is_synthetic_biology_relevant(off_topic, ["engineered microbes"])
 
 
 def test_year_parser_rejects_future_years():
@@ -48,13 +74,13 @@ def test_crossref_publication_date_prefers_published_fields():
     assert crossref_year(item) == "2025"
 
 
-def test_translation_fallback_populates_chinese_fields():
+def test_translation_fallback_only_marks_title():
     paper = PaperInput(title_en="A test title", abstract_en="A test abstract.")
 
     report = translate_records([paper])
 
     assert "待翻译标题" in paper.title_zh
-    assert "待翻译摘要" in paper.abstract_zh
+    assert paper.abstract_zh == ""
     assert report.errors
 
 

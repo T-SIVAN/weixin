@@ -13,14 +13,82 @@ from typing import Any
 from .models import PaperInput, SearchRun, utc_now
 
 
-DEFAULT_KEYWORDS = ["TdT", "PUP", "酶促DNA合成", "酶促RNA合成", "enzyme engineering"]
+DEFAULT_KEYWORDS = [
+    "synthetic biology",
+    "metabolic engineering",
+    "biomanufacturing",
+    "biosynthesis",
+    "engineered microbes",
+]
 KEYWORD_EXPANSIONS = {
     "tdt": ["terminal deoxynucleotidyl transferase", "TdT"],
     "pup": ["poly(U) polymerase", "PUP", "polynucleotide phosphorylase"],
     "酶促dna合成": ["enzymatic DNA synthesis", "template-independent DNA synthesis"],
     "酶促rna合成": ["enzymatic RNA synthesis", "RNA enzymatic synthesis"],
-    "enzyme engineering": ["enzyme engineering", "directed evolution", "protein engineering"],
+    "enzyme engineering": ["enzyme engineering", "directed evolution", "protein engineering", "enzyme design"],
+    "synthetic biology": ["synthetic biology", "synthetic biology-enabled", "SynBio"],
+    "合成生物": ["synthetic biology", "SynBio"],
+    "metabolic engineering": ["metabolic engineering", "pathway engineering", "metabolic pathway engineering"],
+    "代谢工程": ["metabolic engineering", "pathway engineering"],
+    "biomanufacturing": ["biomanufacturing", "bio-manufacturing", "biofabrication", "bioproduction"],
+    "生物制造": ["biomanufacturing", "bio-manufacturing", "bioproduction"],
+    "biosynthesis": ["biosynthesis", "biosynthetic pathway", "de novo biosynthesis"],
+    "生物合成": ["biosynthesis", "biosynthetic pathway"],
+    "engineered microbes": ["engineered microbes", "engineered microorganism", "engineered strain", "microbial cell factory"],
+    "工程菌": ["engineered strain", "engineered microorganism", "microbial cell factory"],
 }
+
+SYNBIO_CONTEXT_TERMS = [
+    "synthetic biology",
+    "metabolic engineering",
+    "pathway engineering",
+    "biosynthesis",
+    "biosynthetic pathway",
+    "biomanufacturing",
+    "bio-manufacturing",
+    "bioproduction",
+    "cell factory",
+    "microbial cell factory",
+    "engineered strain",
+    "engineered microorganism",
+    "engineered microbe",
+    "fermentation",
+    "strain engineering",
+    "genome engineering",
+    "protein engineering",
+    "enzyme engineering",
+    "directed evolution",
+]
+
+SYNBIO_PRODUCTION_TERMS = [
+    "production",
+    "produce",
+    "producer",
+    "yield",
+    "titer",
+    "titre",
+    "g/l",
+    "mg/l",
+    "scale-up",
+    "fed-batch",
+    "bioreactor",
+    "industrial",
+    "commercial",
+    "manufacturing",
+]
+
+LOW_RELEVANCE_TERMS = [
+    "patient",
+    "clinical trial",
+    "diagnosis",
+    "prognosis",
+    "tumor",
+    "cancer",
+    "metastasis",
+    "therapy",
+    "vaccine",
+    "infection",
+]
 
 
 class SearchError(RuntimeError):
@@ -55,8 +123,65 @@ def build_keyword_query(keywords: str | list[str]) -> str:
         expansions = KEYWORD_EXPANSIONS.get(keyword.lower(), [keyword])
         terms = [f'"{term}"' if " " in term else term for term in expansions]
         groups.append("(" + " OR ".join(terms) + ")")
-    domain = '("enzymatic DNA synthesis" OR "enzymatic RNA synthesis" OR "nucleic acid synthesis" OR TdT OR PUP)'
-    return "(" + " OR ".join(groups) + f") AND {domain}"
+    context = (
+        '("synthetic biology" OR "metabolic engineering" OR "pathway engineering" OR '
+        '"biosynthesis" OR "biosynthetic pathway" OR "biomanufacturing" OR "bioproduction" OR '
+        '"cell factory" OR "engineered strain" OR "fermentation" OR "protein engineering" OR '
+        '"enzyme engineering" OR "directed evolution")'
+    )
+    return "(" + " OR ".join(groups) + f") AND {context}"
+
+
+def term_in_text(term: str, text: str) -> bool:
+    term_l = term.lower()
+    if re.search(r"[\u4e00-\u9fff]", term_l):
+        return term_l in text
+    return re.search(rf"(?<![a-z0-9]){re.escape(term_l)}(?![a-z0-9])", text) is not None
+
+
+def record_search_text(record: PaperInput) -> str:
+    return " ".join(
+        [
+            record.title_en,
+            record.title,
+            record.abstract_en,
+            record.abstract,
+            record.journal,
+            record.source,
+        ]
+    ).lower()
+
+
+def keyword_terms(keywords: str | list[str]) -> list[str]:
+    terms: list[str] = []
+    for keyword in parse_keywords(keywords):
+        terms.extend(KEYWORD_EXPANSIONS.get(keyword.lower(), [keyword]))
+    return list(dict.fromkeys(clean_text(term) for term in terms if clean_text(term)))
+
+
+def relevance_score(record: PaperInput, keywords: str | list[str]) -> int:
+    text = record_search_text(record)
+    score = 0
+    if any(term_in_text(term, text) for term in keyword_terms(keywords)):
+        score += 5
+    if any(term_in_text(term, text) for term in SYNBIO_CONTEXT_TERMS):
+        score += 4
+    if any(term_in_text(term, text) for term in SYNBIO_PRODUCTION_TERMS):
+        score += 2
+    if any(term in text for term in LOW_RELEVANCE_TERMS):
+        score -= 3
+    if record.abstract_en or record.abstract:
+        score += 1
+    if record.doi:
+        score += 1
+    return score
+
+
+def is_synthetic_biology_relevant(record: PaperInput, keywords: str | list[str]) -> bool:
+    text = record_search_text(record)
+    has_keyword = any(term_in_text(term, text) for term in keyword_terms(keywords))
+    has_context = any(term_in_text(term, text) for term in SYNBIO_CONTEXT_TERMS)
+    return has_keyword and has_context and relevance_score(record, keywords) >= 7
 
 
 def http_json(url: str, params: dict[str, Any] | None = None, timeout: int = 25) -> Any:
@@ -518,10 +643,20 @@ def federated_search(
             except Exception as exc:
                 errors[name] = f"{type(exc).__name__}: {exc}"
     merged = mark_paywalled(dedupe(records))
+    relevant = [record for record in merged if is_synthetic_biology_relevant(record, parsed_keywords)]
     for record in merged:
         record.keywords = parsed_keywords
-    merged.sort(key=lambda item: (item.publication_date or item.year or "", item.is_open_access, bool(item.abstract_en), bool(item.doi)), reverse=True)
-    return merged[:limit], errors
+    relevant.sort(
+        key=lambda item: (
+            relevance_score(item, parsed_keywords),
+            item.publication_date or item.year or "",
+            item.is_open_access,
+            bool(item.abstract_en),
+            bool(item.doi),
+        ),
+        reverse=True,
+    )
+    return relevant[:limit], errors
 
 
 def run_keyword_search(

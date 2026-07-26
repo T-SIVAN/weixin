@@ -1,10 +1,10 @@
 # 微信文献快读工具
 
-这是一个 Streamlit 应用，用于检索 TdT、PUP、酶促 DNA/RNA 合成和酶工程方向文献，解析开放全文或用户上传 PDF，并生成可导出的中文微信公众号快读稿。
+这是一个 Streamlit 应用，用于检索合成生物、代谢工程、生物制造、生物合成、工程菌和发酵生产方向文献，解析开放全文或用户上传 PDF，并生成可导出的中文微信公众号快读稿。
 
 ## 核心流程
 
-1. **检索与翻译**：输入关键词和年份范围，检索 PubMed、Europe PMC、OpenAlex、Crossref，并把英文题名/摘要翻译为中文。
+1. **检索与翻译**：输入可编辑关键词和年份范围，检索 PubMed、Europe PMC、OpenAlex、Crossref，并只把英文标题翻译为中文。检索会自动叠加合成生物行业语境过滤，减少不相关结果。
 2. **全文与生成**：自动下载合法开放全文或上传 PDF。只有已解析到 PDF 全文的论文才会生成公众号正文。
 3. **导出与发布**：导出项目包、单篇 Markdown/HTML、未生成 DOI CSV，也可以 dry-run 预览或真实创建微信公众号草稿。
 
@@ -38,7 +38,7 @@ $env:LLM_BASE_URL="https://api.example.com/v1"
 $env:LLM_MODEL="your-model"
 ```
 
-页面侧边栏提供“测试翻译模型”按钮，并可调节翻译批量和批间间隔。遇到 `429 Too Many Requests` 时，把批量调到 1、间隔调到 5-10 秒，或切换 DeepSeek/SiliconFlow/custom 等额度更高的 OpenAI-compatible 服务。模型失败时会显示具体错误，并保留英文原文和“待翻译”标记，不阻塞后续下载和导出。
+页面侧边栏提供“测试翻译模型”按钮，并可调节翻译批量和批间间隔。遇到 `429 Too Many Requests` 时，把批量调到 1、间隔调到 5-10 秒，或切换 DeepSeek/SiliconFlow/custom 等额度更高的 OpenAI-compatible 服务。模型失败时会显示具体错误，并保留英文标题和“待翻译”标记，不阻塞后续下载和导出。
 
 ## 本地运行
 
