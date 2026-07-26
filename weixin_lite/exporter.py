@@ -41,23 +41,31 @@ def article_html(article: QuickReadArticle) -> str:
 """
 
 
-def paywalled_csv(papers: list[PaperInput]) -> str:
+def unavailable_dois_csv(papers: list[PaperInput]) -> str:
     buffer = io.StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=["title", "doi", "journal", "year", "url", "access_status"])
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=["doi", "title", "journal", "year", "url", "access_status", "download_error"],
+    )
     writer.writeheader()
     for paper in papers:
-        if paper.access_status != "open":
+        if paper.access_status != "open" or not paper.pdf_name:
             writer.writerow(
                 {
-                    "title": paper.title_en or paper.title,
                     "doi": paper.doi,
+                    "title": paper.title_en or paper.title,
                     "journal": paper.journal,
                     "year": paper.year,
                     "url": paper.url,
                     "access_status": paper.access_status,
+                    "download_error": paper.download_error or ("未解析到 PDF 全文。" if paper.access_status == "open" else ""),
                 }
             )
     return buffer.getvalue()
+
+
+def paywalled_csv(papers: list[PaperInput]) -> str:
+    return unavailable_dois_csv(papers)
 
 
 def project_zip(
@@ -70,7 +78,9 @@ def project_zip(
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("project.json", json.dumps(project.to_dict(), ensure_ascii=False, indent=2))
-        zf.writestr("paywalled_dois.csv", paywalled_csv(project.papers))
+        unavailable_csv = unavailable_dois_csv(project.papers)
+        zf.writestr("unavailable_dois.csv", unavailable_csv)
+        zf.writestr("paywalled_dois.csv", unavailable_csv)
         zf.writestr(
             "download_status.json",
             json.dumps([item.to_dict() for item in download_items], ensure_ascii=False, indent=2),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from collections.abc import Mapping
 from typing import Any, Literal
 
 
@@ -192,3 +193,17 @@ class BatchProject:
             "articles": [article.to_dict() for article in self.articles],
             "downloads": [download.to_dict() for download in self.downloads],
         }
+
+
+def is_generation_ready(paper: PaperInput, pdfs: Mapping[str, Any] | None = None) -> bool:
+    """Return True only when a paper has a parsed full text available."""
+    pdf_cache = pdfs or {}
+    return bool(paper.access_status == "open" and paper.pdf_name and paper.pdf_name in pdf_cache)
+
+
+def generation_ready_papers(papers: list[PaperInput], pdfs: Mapping[str, Any] | None = None) -> list[PaperInput]:
+    return [paper for paper in papers if is_generation_ready(paper, pdfs)]
+
+
+def unavailable_papers(papers: list[PaperInput], pdfs: Mapping[str, Any] | None = None) -> list[PaperInput]:
+    return [paper for paper in papers if not is_generation_ready(paper, pdfs)]

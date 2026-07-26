@@ -7,15 +7,38 @@ from pathlib import Path
 import streamlit as st
 
 from weixin_lite.downloader import download_open_access
-from weixin_lite.exporter import export_article_html, export_article_markdown, post_to_bridge, project_zip
+from weixin_lite.exporter import (
+    export_article_html,
+    export_article_markdown,
+    project_zip,
+    unavailable_dois_csv,
+)
 from weixin_lite.generator import generate_article
-from weixin_lite.models import BatchProject, DownloadedPaper, PaperInput, QuickReadArticle, SearchRun
+from weixin_lite.llm import (
+    PROVIDERS,
+    default_api_key,
+    default_base_url,
+    default_model,
+    default_provider,
+    provider_defaults,
+    test_llm_connection,
+)
+from weixin_lite.models import (
+    BatchProject,
+    DownloadedPaper,
+    PaperInput,
+    QuickReadArticle,
+    SearchRun,
+    generation_ready_papers,
+    unavailable_papers,
+)
 from weixin_lite.pdf_reader import PdfContent, parse_pdf
 from weixin_lite.search import DEFAULT_KEYWORDS, parse_manual_inputs, resolve_doi, run_keyword_search
 from weixin_lite.translate import translate_records
+from weixin_lite.wechat_publish import WechatDraftConfig, export_wechat_payload, publish_draft
 
 
-st.set_page_config(page_title="微信公众号文献雷达", page_icon="🧬", layout="wide")
+st.set_page_config(page_title="微信文献快读工具", page_icon="🧬", layout="wide")
 
 
 LATEST_PATH = Path("data/latest_papers.json")
@@ -31,8 +54,7 @@ def init_state() -> None:
 
 
 def paper_key(paper: PaperInput) -> str:
-    base = paper.paper_key
-    return re.sub(r"[^a-zA-Z0-9]+", "-", base.lower()).strip("-")[:90]
+    return re.sub(r"[^a-zA-Z0-9]+", "-", paper.paper_key.lower()).strip("-")[:90]
 
 
 def merge_papers(existing: list[PaperInput], incoming: list[PaperInput]) -> list[PaperInput]:
@@ -76,8 +98,7 @@ def load_latest_run() -> SearchRun | None:
     if not LATEST_PATH.exists():
         return None
     try:
-        data = json.loads(LATEST_PATH.read_text(encoding="utf-8"))
-        return SearchRun.from_dict(data)
+        return SearchRun.from_dict(json.loads(LATEST_PATH.read_text(encoding="utf-8")))
     except Exception:
         return None
 
@@ -103,70 +124,117 @@ def infer_paper_from_pdf(name: str, pdf: PdfContent) -> PaperInput:
 
 
 def paper_rows(papers: list[PaperInput]) -> list[dict[str, str]]:
-    rows = []
+    rows: list[dict[str, str]] = []
     for idx, paper in enumerate(papers, start=1):
         rows.append(
             {
                 "#": str(idx),
-                "英文标题": paper.title_en or paper.title,
-                "中文标题": paper.title_zh,
-                "英文摘要": (paper.abstract_en or paper.abstract)[:280],
-                "中文摘要": paper.abstract_zh[:280],
+                "标题": paper.title_zh or paper.title_en or paper.title,
                 "期刊": paper.journal,
                 "年份": paper.year,
                 "DOI": paper.doi,
                 "全文状态": paper.access_status,
+                "PDF": paper.pdf_name,
                 "来源": paper.source,
             }
         )
     return rows
 
 
-def sidebar_settings() -> tuple[str, str, str]:
-    st.sidebar.header("模型设置")
-    api_key = st.sidebar.text_input("OpenAI-compatible API Key", type="password")
-    base_url = st.sidebar.text_input("Base URL", value="https://api.openai.com/v1")
-    model = st.sidebar.text_input("Model", value="gpt-4o-mini")
-    st.sidebar.caption("Key 只保存在当前浏览器会话，不写入导出包。GitHub Actions 可用仓库 Secret OPENAI_API_KEY。")
-    return api_key, base_url, model
+def show_details(papers: list[PaperInput], title: str = "查看摘要和错误") -> None:
+    if not papers:
+        return
+    with st.expander(title):
+        for idx, paper in enumerate(papers, start=1):
+            st.markdown(f"**{idx}. {paper.title_zh or paper.title_en or paper.title or paper.doi}**")
+            if paper.abstract_zh or paper.abstract_en:
+                st.write(paper.abstract_zh or paper.abstract_en)
+            bits = [f"DOI: {paper.doi}" if paper.doi else "", paper.url, paper.download_error]
+            st.caption(" | ".join(bit for bit in bits if bit))
 
 
-def radar_tab(api_key: str, base_url: str, model: str) -> None:
-    st.subheader("关键词文献雷达")
+def sidebar_settings() -> tuple[str, str, str, str]:
+    st.sidebar.header("翻译/生成模型")
+    provider_keys = list(PROVIDERS.keys())
+    current_provider = default_provider()
+    provider = st.sidebar.selectbox(
+        "供应商",
+        provider_keys,
+        index=provider_keys.index(current_provider) if current_provider in provider_keys else 0,
+        format_func=lambda key: PROVIDERS[key].label,
+    )
+    defaults = provider_defaults(provider)
+    api_key = st.sidebar.text_input("API Key", value=default_api_key(), type="password")
+    base_url = st.sidebar.text_input("Base URL", value=default_base_url(provider) or defaults.base_url)
+    model = st.sidebar.text_input("Model", value=default_model(provider) or defaults.default_model)
+    st.sidebar.caption("支持 OpenAI-compatible 接口。Key 只保存在当前会话，不写入导出包。")
+    if st.sidebar.button("测试翻译模型"):
+        try:
+            raw = test_llm_connection(api_key=api_key, base_url=base_url, model=model)
+            st.sidebar.success(f"连接成功：{raw[:80]}")
+        except Exception as exc:
+            st.sidebar.error(f"连接失败：{type(exc).__name__}: {exc}")
+    return provider, api_key, base_url, model
+
+
+def status_bar() -> None:
+    papers: list[PaperInput] = st.session_state.papers
+    pdfs: dict[str, PdfContent] = st.session_state.pdfs
+    ready = generation_ready_papers(papers, pdfs)
+    unavailable = unavailable_papers(papers, pdfs)
+    col_a, col_b, col_c, col_d = st.columns(4)
+    col_a.metric("候选文献", len(papers))
+    col_b.metric("已解析全文", len(pdfs))
+    col_c.metric("可生成", len(ready))
+    col_d.metric("未下载 DOI", len(unavailable))
+
+
+def search_tab(provider: str, api_key: str, base_url: str, model: str) -> None:
+    st.subheader("检索与翻译")
     latest = load_latest_run()
     if latest and latest.records:
-        st.info(f"已读取每日自动检索结果：{latest.finished_at or latest.started_at}，关键词：{', '.join(latest.keywords)}")
+        st.info(f"已读取每日检索：{latest.finished_at or latest.started_at}；关键词：{', '.join(latest.keywords)}")
         st.dataframe(paper_rows(latest.records), use_container_width=True, hide_index=True)
-        if st.button("加入每日最新结果到候选池"):
+        if st.button("加入每日结果"):
             st.session_state.papers = merge_papers(st.session_state.papers, latest.records)
-            st.success(f"已加入 {len(latest.records)} 条每日检索结果。")
-    else:
-        st.caption("尚未发现 data/latest_papers.json。GitHub Actions 首次运行后这里会自动显示每日结果。")
+            st.success(f"已加入 {len(latest.records)} 条候选。")
 
     st.divider()
-    keywords = st.text_input("只填关键词", value=st.session_state.keywords, placeholder="例如：TdT, PUP, 酶促DNA合成")
+    keywords = st.text_input("关键词", value=st.session_state.keywords, placeholder="例如：TdT, PUP, 酶促 DNA 合成")
     st.session_state.keywords = keywords
     col_a, col_b, col_c = st.columns(3)
-    limit = col_a.slider("检索数量", 10, 20, 20)
+    limit = col_a.slider("检索数量", 5, 30, 20)
     since_days = col_b.slider("时间范围（天）", 1, 365, 30)
     email = col_c.text_input("OpenAlex 邮箱（可选）", value="")
-    if st.button("检索并翻译标题/摘要", type="primary"):
+    if st.button("检索并翻译", type="primary"):
         with st.spinner("正在检索 PubMed、Europe PMC、OpenAlex、Crossref，并翻译标题/摘要..."):
             run = run_keyword_search(keywords, limit=limit, email=email, since_days=since_days)
-            translate_records(run.records, api_key=api_key, base_url=base_url, model=model)
+            report = translate_records(run.records, api_key=api_key, base_url=base_url, model=model, provider=provider)
         st.session_state.papers = merge_papers(st.session_state.papers, run.records)
         if run.errors:
-            st.warning("部分来源失败：" + "; ".join(f"{k}: {v}" for k, v in run.errors.items()))
-        st.success(f"已加入 {len(run.records)} 条候选。")
+            st.warning("部分检索源失败：" + "; ".join(f"{k}: {v}" for k, v in run.errors.items()))
+        if report.errors:
+            st.warning("翻译未完全成功：" + "; ".join(report.errors))
+        else:
+            st.success(f"已翻译 {report.translated_count} 条记录。")
         st.dataframe(paper_rows(run.records), use_container_width=True, hide_index=True)
+        show_details(run.records, "查看本次检索详情")
 
-
-def ingest_tab() -> None:
-    st.subheader("开放全文下载与文件上传")
     papers: list[PaperInput] = st.session_state.papers
     if papers:
+        st.divider()
         st.dataframe(paper_rows(papers), use_container_width=True, hide_index=True)
-        if st.button("自动下载合法开放全文并解析"):
+        show_details(papers, "查看候选摘要和错误")
+
+
+def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
+    st.subheader("全文与生成")
+    papers: list[PaperInput] = st.session_state.papers
+    pdfs: dict[str, PdfContent] = st.session_state.pdfs
+
+    if papers:
+        st.dataframe(paper_rows(papers), use_container_width=True, hide_index=True)
+        if st.button("下载并解析开放全文"):
             progress = st.progress(0)
             downloads: list[DownloadedPaper] = []
             for idx, paper in enumerate(papers, start=1):
@@ -176,28 +244,30 @@ def ingest_tab() -> None:
                     try:
                         pdf = parse_pdf(downloaded.content_bytes)
                         pdf_name = downloaded.file_name or f"{paper_key(paper)}.pdf"
-                        st.session_state.pdfs[pdf_name] = pdf
+                        pdfs[pdf_name] = pdf
                         st.session_state.images.update(pdf.rendered_images)
                         paper.pdf_name = pdf_name
                         paper.access_status = "open"
+                        paper.download_error = ""
                     except Exception as exc:
                         paper.download_error = f"PDF 解析失败：{exc}"
-                elif downloaded.status != "open":
+                        paper.access_status = "download_failed"
+                else:
                     paper.access_status = downloaded.status
-                    paper.download_error = downloaded.error
+                    paper.download_error = downloaded.error or "未下载到 PDF 全文。"
                 progress.progress(idx / len(papers), text=f"已处理 {idx}/{len(papers)}")
             st.session_state.downloads = downloads
-            st.success("开放全文下载/解析完成；需付费或失败文章已保留 DOI。")
+            st.success("开放全文下载和解析完成。未成功解析的论文只会进入 DOI CSV。")
     else:
-        st.info("先在“关键词文献雷达”里加入候选，或直接上传 PDF。")
+        st.info("先检索文献、粘贴 DOI，或直接上传 PDF。")
 
-    uploaded = st.file_uploader("上传 PDF 文件进入批量分析", type=["pdf"], accept_multiple_files=True)
+    uploaded = st.file_uploader("上传 PDF", type=["pdf"], accept_multiple_files=True)
     if uploaded and st.button("解析上传 PDF"):
         parsed_papers: list[PaperInput] = []
         progress = st.progress(0)
         for idx, file in enumerate(uploaded, start=1):
             pdf = parse_pdf(file.getvalue())
-            st.session_state.pdfs[file.name] = pdf
+            pdfs[file.name] = pdf
             st.session_state.images.update(pdf.rendered_images)
             parsed_papers.append(infer_paper_from_pdf(file.name, pdf))
             progress.progress(idx / len(uploaded), text=f"已解析 {idx}/{len(uploaded)}")
@@ -208,7 +278,7 @@ def ingest_tab() -> None:
     col_d, col_e = st.columns([1, 3])
     if col_d.button("解析手动列表"):
         records = parse_manual_inputs(manual)
-        resolved = []
+        resolved: list[PaperInput] = []
         for record in records:
             if record.doi:
                 try:
@@ -227,23 +297,26 @@ def ingest_tab() -> None:
         st.session_state.downloads = []
         st.info("已清空当前批次。")
 
-
-def generation_tab(api_key: str, base_url: str, model: str) -> None:
-    st.subheader("批量生成中文公众号稿")
-    papers: list[PaperInput] = st.session_state.papers
-    if not papers:
-        st.info("先加入检索结果或上传 PDF。")
+    st.divider()
+    ready = generation_ready_papers(st.session_state.papers, st.session_state.pdfs)
+    unavailable = unavailable_papers(st.session_state.papers, st.session_state.pdfs)
+    if unavailable:
+        st.warning(f"{len(unavailable)} 篇未下载或未解析到全文，已排除生成，只进入 DOI CSV。")
+        st.dataframe(paper_rows(unavailable), use_container_width=True, hide_index=True)
+    if not ready:
+        st.info("暂无可生成论文。需要先下载并解析开放 PDF，或上传 PDF。")
         return
-    labels = [f"{idx}. {paper.display_title[:90]}" for idx, paper in enumerate(papers, start=1)]
-    selected = st.multiselect("选择本次生成的论文", labels, default=labels[: min(10, len(labels))])
+
+    labels = [f"{idx}. {paper.display_title[:90]}" for idx, paper in enumerate(ready, start=1)]
+    selected = st.multiselect("选择生成论文", labels, default=labels[: min(10, len(labels))])
     target_chars = st.slider("目标字数", 700, 1400, 1200, step=50)
-    if st.button("生成所选公众号稿", type="primary"):
+    if st.button("生成公众号稿", type="primary"):
         chosen_indexes = [labels.index(label) for label in selected]
         generated: list[QuickReadArticle] = []
         progress = st.progress(0)
         for run_idx, paper_idx in enumerate(chosen_indexes, start=1):
-            paper = papers[paper_idx]
-            pdf = st.session_state.pdfs.get(paper.pdf_name)
+            paper = ready[paper_idx]
+            pdf = st.session_state.pdfs[paper.pdf_name]
             generated.append(
                 generate_article(
                     paper=paper,
@@ -258,10 +331,9 @@ def generation_tab(api_key: str, base_url: str, model: str) -> None:
         st.session_state.articles = generated
         st.success(f"已生成 {len(generated)} 篇中文公众号稿。")
 
-    articles: list[QuickReadArticle] = st.session_state.articles
-    for idx, article in enumerate(articles, start=1):
+    for idx, article in enumerate(st.session_state.articles, start=1):
         with st.expander(f"{idx}. {article.title} | {article.word_count} 字", expanded=idx == 1):
-            cover = st.file_uploader("上传该文献的期刊网页标题图/截图（可选）", type=["png", "jpg", "jpeg"], key=f"cover-{idx}")
+            cover = st.file_uploader("上传封面图（可选）", type=["png", "jpg", "jpeg"], key=f"cover-{idx}")
             if cover:
                 name = f"cover-{idx}-{cover.name}"
                 st.session_state.images[name] = cover.getvalue()
@@ -273,64 +345,106 @@ def generation_tab(api_key: str, base_url: str, model: str) -> None:
                 st.caption("证据追踪")
                 st.dataframe([item.to_dict() for item in article.evidence[:12]], use_container_width=True, hide_index=True)
             col_a, col_b = st.columns(2)
-            col_a.download_button("下载 Markdown", export_article_markdown(article), file_name=f"{idx:02d}-{article.title}.md")
-            col_b.download_button("下载 HTML", export_article_html(article), file_name=f"{idx:02d}-{article.title}.html")
+            col_a.download_button("Markdown", export_article_markdown(article), file_name=f"{idx:02d}-{article.title}.md")
+            col_b.download_button("HTML", export_article_html(article), file_name=f"{idx:02d}-{article.title}.html")
 
 
-def export_tab() -> None:
-    st.subheader("导出与公众号对接")
-    articles: list[QuickReadArticle] = st.session_state.articles
+def export_and_publish_tab() -> None:
+    st.subheader("导出与发布")
     papers: list[PaperInput] = st.session_state.papers
-    if not articles:
-        st.info("生成文章后可导出发布包。")
-        return
-    project = BatchProject(
-        topic=st.session_state.keywords,
-        papers=papers,
-        articles=articles,
-        downloads=st.session_state.downloads,
-    )
-    st.download_button(
-        "下载本批次项目包 (.weixin-project.zip)",
-        project_zip(project, st.session_state.images, st.session_state.downloads),
-        file_name="weixin-batch.weixin-project.zip",
-        mime="application/zip",
-        type="primary",
-    )
-    st.caption("项目包包含 Markdown、公众号 HTML、证据 JSON、图片、付费 DOI 列表和下载状态；不包含任何 API Key 或 PDF 缓存。")
+    articles: list[QuickReadArticle] = st.session_state.articles
+    unavailable = unavailable_papers(papers, st.session_state.pdfs)
 
-    with st.expander("同步到公众号草稿桥接服务（可选）"):
-        st.write("Streamlit Cloud 通常没有固定出口 IP，微信接口可能触发 IP 白名单限制。这里默认对接你自己的固定 IP 桥接服务，只创建草稿，不自动发布。")
-        bridge_url = st.text_input("Bridge URL", placeholder="https://your-domain.example.com/v1/drafts")
-        bridge_token = st.text_input("Bridge Token", type="password")
-        article_titles = [f"{idx}. {article.title}" for idx, article in enumerate(articles, start=1)]
-        selected = st.selectbox("选择同步文章", article_titles)
-        if st.button("发送到草稿桥接服务"):
-            if not bridge_url:
-                st.error("请先填写 Bridge URL。")
-            else:
-                article = articles[article_titles.index(selected)]
-                try:
-                    result = post_to_bridge(bridge_url, article, bridge_token)
-                    st.success("桥接服务已返回结果。")
-                    st.json(result)
-                except Exception as exc:
-                    st.error(f"同步失败：{exc}")
+    if unavailable:
+        st.download_button(
+            "下载未生成 DOI CSV",
+            unavailable_dois_csv(unavailable).encode("utf-8-sig"),
+            file_name="unavailable_dois.csv",
+            mime="text/csv",
+        )
+        st.dataframe(paper_rows(unavailable), use_container_width=True, hide_index=True)
+
+    if papers or articles:
+        project = BatchProject(
+            topic=st.session_state.keywords,
+            papers=papers,
+            articles=articles,
+            downloads=st.session_state.downloads,
+        )
+        st.download_button(
+            "下载项目包",
+            project_zip(project, st.session_state.images, st.session_state.downloads),
+            file_name="weixin-batch.weixin-project.zip",
+            mime="application/zip",
+            type="primary",
+        )
+
+    if not articles:
+        st.info("生成文章后可导出单篇文件或创建公众号草稿。")
+        return
+
+    st.divider()
+    article_titles = [f"{idx}. {article.title}" for idx, article in enumerate(articles, start=1)]
+    selected = st.selectbox("选择文章", article_titles)
+    article = articles[article_titles.index(selected)]
+
+    col_a, col_b, col_c = st.columns(3)
+    col_a.download_button("单篇 Markdown", export_article_markdown(article), file_name=f"{article.title}.md")
+    col_b.download_button("单篇 HTML", export_article_html(article), file_name=f"{article.title}.html")
+
+    st.markdown("#### 公众号草稿")
+    app_id = st.text_input("APP_ID")
+    app_secret = st.text_input("APP_SECRET", type="password")
+    author = st.text_input("作者", value="")
+    cover = st.file_uploader("草稿封面图", type=["png", "jpg", "jpeg"], key="draft-cover")
+    cover_name = ""
+    if cover:
+        cover_name = f"draft-cover-{cover.name}"
+        st.session_state.images[cover_name] = cover.getvalue()
+    show_cover_pic = st.checkbox("正文显示封面", value=False)
+    source_url = st.text_input("原文链接", value=article.paper.url)
+    need_open_comment = st.checkbox("开启留言", value=False)
+    only_fans_can_comment = st.checkbox("仅粉丝可留言", value=False)
+    dry_run = st.checkbox("只预览 payload（推荐）", value=True)
+    confirmed = st.checkbox("确认真实创建草稿", value=False, disabled=dry_run)
+
+    config = WechatDraftConfig(
+        app_id=app_id,
+        app_secret=app_secret,
+        author=author,
+        cover_image_name=cover_name or article.cover_image_name,
+        show_cover_pic=show_cover_pic,
+        content_source_url=source_url,
+        need_open_comment=need_open_comment,
+        only_fans_can_comment=only_fans_can_comment,
+    )
+    col_c.download_button("草稿 Payload", export_wechat_payload(article, config), file_name=f"{article.title}-wechat-payload.json")
+    if st.button("创建公众号草稿"):
+        if not dry_run and not confirmed:
+            st.error("真实创建草稿前请勾选确认。")
+            return
+        try:
+            result = publish_draft(article, config, st.session_state.images, dry_run=dry_run)
+            st.success("草稿 dry-run 已生成。" if dry_run else "公众号草稿已创建。")
+            st.json(result)
+        except Exception as exc:
+            st.error(f"草稿发布失败：{type(exc).__name__}: {exc}")
 
 
 def main() -> None:
     init_state()
-    api_key, base_url, model = sidebar_settings()
-    st.title("微信公众号文献雷达与中文快读生成器")
-    st.caption("一个完整流程：只填关键词检索，网站展示标题/摘要中英对照，开放全文自动下载或上传 PDF，最后批量生成中文公众号稿并导出。")
+    provider, api_key, base_url, model = sidebar_settings()
+    st.title("微信文献快读工具")
+    st.caption("检索文献、解析开放全文或上传 PDF，再生成中文公众号稿。未下载到全文的论文只导出 DOI CSV。")
+    status_bar()
 
-    radar_tab(api_key, base_url, model)
-    st.divider()
-    ingest_tab()
-    st.divider()
-    generation_tab(api_key, base_url, model)
-    st.divider()
-    export_tab()
+    tab_search, tab_generate, tab_export = st.tabs(["检索与翻译", "全文与生成", "导出与发布"])
+    with tab_search:
+        search_tab(provider, api_key, base_url, model)
+    with tab_generate:
+        ingest_and_generate_tab(api_key, base_url, model)
+    with tab_export:
+        export_and_publish_tab()
 
 
 if __name__ == "__main__":

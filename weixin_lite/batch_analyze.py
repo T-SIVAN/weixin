@@ -6,8 +6,8 @@ from pathlib import Path
 
 from .exporter import project_zip
 from .generator import generate_article
-from .llm import default_api_key, default_base_url, default_model
-from .models import BatchProject, DownloadedPaper, PaperInput, SearchRun
+from .llm import default_api_key, default_base_url, default_model, default_provider
+from .models import BatchProject, DownloadedPaper, PaperInput, SearchRun, generation_ready_papers, unavailable_papers
 
 
 def load_papers(path: Path) -> tuple[str, list[PaperInput]]:
@@ -25,17 +25,22 @@ def main() -> None:
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", default="outputs/batch_analysis.weixin-project.zip")
     parser.add_argument("--limit", type=int, default=20)
-    parser.add_argument("--base-url", default=default_base_url())
-    parser.add_argument("--model", default=default_model())
+    parser.add_argument("--provider", default=default_provider())
+    parser.add_argument("--base-url", default="")
+    parser.add_argument("--model", default="")
     args = parser.parse_args()
 
     topic, papers = load_papers(Path(args.input))
-    selected = papers[: max(1, min(args.limit, 20))]
+    base_url = args.base_url or default_base_url(args.provider)
+    model = args.model or default_model(args.provider)
+    pdfs: dict[str, object] = {}
+    selected = generation_ready_papers(papers, pdfs)[: max(1, min(args.limit, 20))]
+    skipped = unavailable_papers(papers, pdfs)
     articles = [
-        generate_article(paper, api_key=default_api_key(), base_url=args.base_url, model=args.model)
+        generate_article(paper, api_key=default_api_key(), base_url=base_url, model=model)
         for paper in selected
     ]
-    project = BatchProject(topic=topic, papers=selected, articles=articles, downloads=[])
+    project = BatchProject(topic=topic, papers=selected + skipped, articles=articles, downloads=[])
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_bytes(project_zip(project, downloads=[]))
