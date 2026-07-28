@@ -9,9 +9,11 @@ from weixin_lite.llm import default_base_url, default_model
 from weixin_lite.models import BatchProject, FigureAnalysis, PaperInput, generation_ready_papers, unavailable_papers
 from weixin_lite.pdf_reader import PdfContent, extract_figure_legends, extract_numeric_evidence
 from weixin_lite.search import (
+    build_plain_search_queries,
     build_keyword_query,
     crossref_publication_date,
     crossref_year,
+    federated_search,
     is_synthetic_biology_relevant,
     relevance_score,
     year_from,
@@ -27,6 +29,28 @@ def test_keyword_query_expands_simple_keywords():
     assert "enzymatic DNA synthesis" in query
     assert "synthetic biology" in query
     assert " AND " in query
+
+
+def test_plain_search_queries_expand_chinese_keywords_without_boolean_syntax():
+    queries = build_plain_search_queries(["酶促DNA合成", "合成生物"])
+
+    assert "enzymatic DNA synthesis" in queries
+    assert "synthetic biology" in queries
+    assert all(" AND " not in item and " OR " not in item for item in queries)
+
+
+def test_crossref_receives_plain_queries(monkeypatch):
+    seen: list[str] = []
+    def fake_crossref(query, limit, since_days=None):
+        seen.append(query)
+        return []
+
+    monkeypatch.setattr("weixin_lite.search.search_crossref", fake_crossref)
+
+    federated_search(["TdT"], limit=5, sources=["Crossref"])
+
+    assert seen
+    assert all(" AND " not in query and " OR " not in query for query in seen)
 
 
 def test_synthetic_biology_relevance_filters_off_topic_results():
@@ -82,6 +106,20 @@ def test_translation_fallback_only_marks_title():
     assert "待翻译标题" in paper.title_zh
     assert paper.abstract_zh == ""
     assert report.errors
+
+
+def test_translation_populates_title_and_abstract(monkeypatch):
+    def fake_call(**kwargs):
+        return '[{"title_zh": "中文标题", "abstract_zh": "中文摘要"}]'
+
+    monkeypatch.setattr("weixin_lite.translate.call_openai_compatible", fake_call)
+    paper = PaperInput(title_en="English title", abstract_en="English abstract.")
+
+    report = translate_records([paper], api_key="test-key", batch_size=1, delay_seconds=0)
+
+    assert report.translated_count == 1
+    assert paper.title_zh == "中文标题"
+    assert paper.abstract_zh == "中文摘要"
 
 
 def test_provider_defaults_are_configured():

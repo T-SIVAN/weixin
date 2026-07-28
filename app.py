@@ -125,13 +125,35 @@ def infer_paper_from_pdf(name: str, pdf: PdfContent) -> PaperInput:
     )
 
 
+def is_distinct_text(primary: str, secondary: str) -> bool:
+    primary_clean = re.sub(r"\s+", " ", primary or "").strip()
+    secondary_clean = re.sub(r"\s+", " ", secondary or "").strip()
+    return bool(secondary_clean and secondary_clean != primary_clean and secondary_clean not in primary_clean)
+
+
+def bilingual_title(paper: PaperInput) -> str:
+    title_zh = paper.title_zh.strip()
+    title_en = (paper.title_en or paper.title).strip()
+    if title_zh and is_distinct_text(title_zh, title_en):
+        return f"{title_zh}\n{title_en}"
+    return title_zh or title_en or paper.doi or paper.pmid or paper.pdf_name
+
+
+def bilingual_abstract(paper: PaperInput) -> str:
+    abstract_zh = paper.abstract_zh.strip()
+    abstract_en = (paper.abstract_en or paper.abstract).strip()
+    if abstract_zh and is_distinct_text(abstract_zh, abstract_en):
+        return f"{abstract_zh}\n\nEnglish abstract:\n{abstract_en}"
+    return abstract_zh or abstract_en
+
+
 def paper_rows(papers: list[PaperInput]) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for idx, paper in enumerate(papers, start=1):
         rows.append(
             {
                 "#": str(idx),
-                "标题": paper.title_zh or paper.title_en or paper.title,
+                "标题": bilingual_title(paper),
                 "期刊": paper.journal,
                 "发表日期": paper.publication_date or paper.year,
                 "DOI": paper.doi,
@@ -149,8 +171,12 @@ def show_details(papers: list[PaperInput], title: str = "查看摘要和错误")
     with st.expander(title):
         for idx, paper in enumerate(papers, start=1):
             st.markdown(f"**{idx}. {paper.title_zh or paper.title_en or paper.title or paper.doi}**")
-            if paper.abstract_zh or paper.abstract_en:
-                st.write(paper.abstract_zh or paper.abstract_en)
+            title_en = paper.title_en or paper.title
+            if is_distinct_text(paper.title_zh, title_en):
+                st.caption(title_en)
+            abstract = bilingual_abstract(paper)
+            if abstract:
+                st.write(abstract)
             bits = [f"DOI: {paper.doi}" if paper.doi else "", paper.url, paper.download_error]
             st.caption(" | ".join(bit for bit in bits if bit))
 

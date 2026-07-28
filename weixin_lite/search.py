@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -132,6 +133,17 @@ def build_keyword_query(keywords: str | list[str]) -> str:
     return "(" + " OR ".join(groups) + f") AND {context}"
 
 
+def build_plain_search_queries(keywords: str | list[str], max_queries: int = 8) -> list[str]:
+    parsed = parse_keywords(keywords)
+    if not parsed:
+        parsed = DEFAULT_KEYWORDS
+    queries: list[str] = []
+    for keyword in parsed:
+        expansions = KEYWORD_EXPANSIONS.get(keyword.lower(), [keyword])
+        queries.extend(clean_text(term) for term in expansions if clean_text(term))
+    return list(dict.fromkeys(queries))[:max_queries]
+
+
 def term_in_text(term: str, text: str) -> bool:
     term_l = term.lower()
     if re.search(r"[\u4e00-\u9fff]", term_l):
@@ -184,12 +196,29 @@ def is_synthetic_biology_relevant(record: PaperInput, keywords: str | list[str])
     return has_keyword and has_context and relevance_score(record, keywords) >= 7
 
 
+def open_url_with_retries(req: urllib.request.Request, timeout: int, attempts: int = 3) -> Any:
+    for attempt in range(attempts):
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            retryable = exc.code in {429, 500, 502, 503, 504}
+            if not retryable or attempt == attempts - 1:
+                raise
+            retry_after = exc.headers.get("Retry-After")
+            wait = float(retry_after) if retry_after and retry_after.isdigit() else 1.5 * (attempt + 1)
+            time.sleep(min(wait, 8))
+        except (TimeoutError, urllib.error.URLError, ConnectionError) as exc:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(1.0 * (attempt + 1))
+
+
 def http_json(url: str, params: dict[str, Any] | None = None, timeout: int = 25) -> Any:
     if params:
         query = urllib.parse.urlencode({k: v for k, v in params.items() if v not in (None, "")}, doseq=True)
         url = f"{url}{'&' if '?' in url else '?'}{query}"
     req = urllib.request.Request(url, headers={"User-Agent": "weixin-paper-radar/0.2"})
-    with urllib.request.urlopen(req, timeout=timeout) as response:
+    with open_url_with_retries(req, timeout=timeout) as response:
         return json.loads(response.read().decode(response.headers.get_content_charset() or "utf-8"))
 
 
@@ -198,7 +227,7 @@ def http_text(url: str, params: dict[str, Any] | None = None, timeout: int = 25)
         query = urllib.parse.urlencode({k: v for k, v in params.items() if v not in (None, "")}, doseq=True)
         url = f"{url}{'&' if '?' in url else '?'}{query}"
     req = urllib.request.Request(url, headers={"User-Agent": "weixin-paper-radar/0.2"})
-    with urllib.request.urlopen(req, timeout=timeout) as response:
+    with open_url_with_retries(req, timeout=timeout) as response:
         return response.read().decode(response.headers.get_content_charset() or "utf-8")
 
 
@@ -486,7 +515,7 @@ def inverted_abstract(index: Any) -> str:
 
 
 def search_openalex(query: str, limit: int, email: str = "", since_days: int | None = None) -> list[PaperInput]:
-    params: dict[str, Any] = {"search": query, "per-page": limit, "sort": "publication_date:desc"}
+    params: dict[str, Any] = {"search": query, "per-page": limit}
     filters = []
     if since_days:
         start, _ = since_dates(since_days)
@@ -533,7 +562,7 @@ def search_openalex(query: str, limit: int, email: str = "", since_days: int | N
 
 
 def search_crossref(query: str, limit: int, since_days: int | None = None) -> list[PaperInput]:
-    params: dict[str, Any] = {"query": query, "rows": limit, "sort": "published", "order": "desc"}
+    params: dict[str, Any] = {"query.bibliographic": query, "rows": limit}
     if since_days:
         start, _ = since_dates(since_days)
         params["filter"] = f"from-pub-date:{start}"
@@ -562,6 +591,15 @@ def search_crossref(query: str, limit: int, since_days: int | None = None) -> li
                 access_status="unknown",
             )
         )
+    return records
+
+
+def search_crossref_many(queries: list[str], limit: int, since_days: int | None = None) -> list[PaperInput]:
+    records: list[PaperInput] = []
+    per_query = max(3, min(limit, 12))
+    for query in queries:
+        records.extend(search_crossref(query, per_query, since_days=since_days))
+        time.sleep(0.15)
     return records
 
 
@@ -624,13 +662,14 @@ def federated_search(
 ) -> tuple[list[PaperInput], dict[str, str]]:
     parsed_keywords = parse_keywords(keywords or DEFAULT_KEYWORDS)
     query = build_keyword_query(parsed_keywords)
+    plain_queries = build_plain_search_queries(parsed_keywords)
     selected = sources or ["PubMed", "Europe PMC", "OpenAlex", "Crossref"]
     per_source = max(5, min(50, limit))
     functions = {
         "PubMed": lambda: search_pubmed(query, per_source, since_days=since_days),
         "Europe PMC": lambda: search_europe_pmc(query, per_source, since_days=since_days),
         "OpenAlex": lambda: search_openalex(query, per_source, email=email, since_days=since_days),
-        "Crossref": lambda: search_crossref(query, per_source, since_days=since_days),
+        "Crossref": lambda: search_crossref_many(plain_queries, per_source, since_days=since_days),
     }
     records: list[PaperInput] = []
     errors: dict[str, str] = {}
