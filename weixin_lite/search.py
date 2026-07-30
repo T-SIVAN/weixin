@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 import urllib.error
@@ -9,9 +10,10 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
-from typing import Any
+from dataclasses import asdict, dataclass, field
+from typing import Any, Callable, Literal
 
-from .models import PaperInput, SearchRun, utc_now
+from .models import PaperInput, ResolvedKeyword, SearchQueryPlan, SearchRun, utc_now
 
 
 DEFAULT_KEYWORDS = [
@@ -37,7 +39,91 @@ KEYWORD_EXPANSIONS = {
     "生物合成": ["biosynthesis", "biosynthetic pathway"],
     "engineered microbes": ["engineered microbes", "engineered microorganism", "engineered strain", "microbial cell factory"],
     "工程菌": ["engineered strain", "engineered microorganism", "microbial cell factory"],
+    "底盘细胞": ["chassis cell", "microbial chassis", "synthetic biology chassis"],
+    "细胞工厂": ["cell factory", "microbial cell factory"],
+    "微生物细胞工厂": ["microbial cell factory", "microbial production platform"],
+    "精准发酵": ["precision fermentation", "precision-fermented"],
+    "发酵工程": ["fermentation engineering", "bioprocess engineering"],
+    "酶工程": ["enzyme engineering", "enzyme design", "directed evolution"],
+    "蛋白质工程": ["protein engineering", "protein design", "directed evolution"],
+    "天然产物": ["natural product", "natural products", "natural product biosynthesis"],
+    "天然产物合成": ["natural product biosynthesis", "biosynthetic gene cluster"],
+    "聚羟基脂肪酸酯": ["polyhydroxyalkanoate", "polyhydroxyalkanoates", "PHA biopolymer"],
+    "聚羟基烷酸酯": ["polyhydroxyalkanoate", "polyhydroxyalkanoates", "PHA biopolymer"],
+    "合成生物学": ["synthetic biology", "SynBio"],
+    "基因线路": ["genetic circuit", "synthetic gene circuit"],
+    "生物传感器": ["biosensor", "whole-cell biosensor"],
+    "通路工程": ["pathway engineering", "metabolic pathway engineering"],
+    "菌株工程": ["strain engineering", "engineered strain"],
+    "基因组工程": ["genome engineering", "genome-scale engineering"],
+    "合成基因组": ["synthetic genome", "genome synthesis"],
+    "无细胞系统": ["cell-free system", "cell-free synthetic biology"],
+    "生物基材料": ["bio-based material", "biobased material", "biomaterial production"],
+    "生物铸造厂": ["biofoundry", "biofoundries", "synthetic biology foundry"],
+    "合成代谢通路": ["synthetic metabolic pathway", "engineered metabolic pathway", "pathway engineering"],
+    "代谢通量": ["metabolic flux", "flux balance analysis", "metabolic flux analysis"],
+    "动态调控": ["dynamic regulation", "dynamic pathway regulation", "dynamic metabolic control"],
+    "基因编辑": ["genome editing", "gene editing", "CRISPR engineering"],
+    "模块化克隆": ["modular cloning", "MoClo", "Golden Gate assembly"],
+    "组合生物合成": ["combinatorial biosynthesis", "combinatorial pathway engineering"],
+    "生物合成基因簇": ["biosynthetic gene cluster", "biosynthetic gene clusters", "BGC"],
+    "天然产物挖掘": ["natural product discovery", "genome mining", "biosynthetic gene cluster mining"],
+    "高通量筛选": ["high-throughput screening", "high throughput screening", "screening platform"],
+    "定向进化": ["directed evolution", "laboratory evolution", "adaptive laboratory evolution"],
+    "适应性实验室进化": ["adaptive laboratory evolution", "ALE", "laboratory evolution"],
+    "工业微生物": ["industrial microorganism", "industrial microbe", "industrial biotechnology"],
+    "生物炼制": ["biorefinery", "biorefining", "integrated biorefinery"],
+    "生物燃料": ["biofuel", "biofuels", "microbial biofuel production"],
+    "生物塑料": ["bioplastic", "bioplastics", "microbial polymer production"],
+    "单细胞蛋白": ["single-cell protein", "single cell protein", "microbial protein"],
+    "人造肉": ["cultivated meat", "cell-based meat", "cultured meat"],
+    "无细胞合成生物学": ["cell-free synthetic biology", "cell-free biosynthesis", "cell-free system"],
+    "碳固定": ["carbon fixation", "synthetic carbon fixation", "microbial carbon fixation"],
+    "二氧化碳生物转化": ["carbon dioxide bioconversion", "CO2 bioconversion", "microbial CO2 conversion"],
+    "甲醇生物转化": ["methanol bioconversion", "methylotrophic biomanufacturing", "methanol-based bioproduction"],
+    "一碳生物制造": ["one-carbon biomanufacturing", "C1 biomanufacturing", "one-carbon biotechnology"],
 }
+
+SearchMode = Literal["strict", "balanced", "broad"]
+KeywordResolver = Callable[[str], list[str]]
+SEARCH_MODE_ALIASES = {
+    "strict": "strict",
+    "precise": "strict",
+    "精准": "strict",
+    "严格": "strict",
+    "balanced": "balanced",
+    "均衡": "balanced",
+    "broad": "broad",
+    "宽松": "broad",
+}
+
+
+@dataclass
+class SearchDiagnostics:
+    source_counts: dict[str, dict[str, int]] = field(default_factory=dict)
+    raw_count: int = 0
+    deduplicated_count: int = 0
+    filtered_count: int = 0
+    warnings: list[str] = field(default_factory=list)
+    errors: dict[str, str] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SearchDiagnostics":
+        return cls(
+            source_counts={
+                str(source): {str(key): int(value) for key, value in counts.items()}
+                for source, counts in (data.get("source_counts") or {}).items()
+                if isinstance(counts, dict)
+            },
+            raw_count=int(data.get("raw_count") or 0),
+            deduplicated_count=int(data.get("deduplicated_count") or 0),
+            filtered_count=int(data.get("filtered_count") or 0),
+            warnings=[clean_text(item) for item in data.get("warnings") or [] if clean_text(item)],
+            errors={str(key): str(value) for key, value in (data.get("errors") or {}).items()},
+        )
 
 SYNBIO_CONTEXT_TERMS = [
     "synthetic biology",
@@ -115,33 +201,192 @@ def parse_keywords(value: str | list[str]) -> list[str]:
     return list(dict.fromkeys(keywords))
 
 
-def build_keyword_query(keywords: str | list[str]) -> str:
-    parsed = parse_keywords(keywords)
-    if not parsed:
-        parsed = DEFAULT_KEYWORDS
-    groups: list[str] = []
-    for keyword in parsed:
-        expansions = KEYWORD_EXPANSIONS.get(keyword.lower(), [keyword])
-        terms = [f'"{term}"' if " " in term else term for term in expansions]
-        groups.append("(" + " OR ".join(terms) + ")")
-    context = (
-        '("synthetic biology" OR "metabolic engineering" OR "pathway engineering" OR '
-        '"biosynthesis" OR "biosynthetic pathway" OR "biomanufacturing" OR "bioproduction" OR '
-        '"cell factory" OR "engineered strain" OR "fermentation" OR "protein engineering" OR '
-        '"enzyme engineering" OR "directed evolution")'
+def normalize_search_mode(value: Any) -> SearchMode:
+    return SEARCH_MODE_ALIASES.get(clean_text(value).lower(), "strict")  # type: ignore[return-value]
+
+
+def contains_chinese(value: str) -> bool:
+    return re.search(r"[\u4e00-\u9fff]", value) is not None
+
+
+def _parse_llm_terms(content: Any) -> list[str]:
+    text = str(content or "").strip()
+    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.I)
+    if fenced:
+        text = fenced.group(1).strip()
+    candidates: Any = None
+    try:
+        candidates = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\[[\s\S]*?\]", text)
+        if match:
+            try:
+                candidates = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                candidates = None
+    if isinstance(candidates, dict):
+        candidates = candidates.get("terms") or candidates.get("english_terms")
+    if not isinstance(candidates, list):
+        candidates = re.split(r"[,;\n]+", text)
+    terms = [clean_text(item).strip('"\'') for item in candidates if clean_text(item)]
+    return list(dict.fromkeys(term for term in terms if not contains_chinese(term)))[:3]
+
+
+def openai_compatible_keyword_resolver(
+    keyword: str,
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    timeout: int = 20,
+) -> list[str]:
+    endpoint = f"{base_url.rstrip('/')}/chat/completions"
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "max_tokens": 80,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Translate a Chinese synthetic-biology literature keyword into 1-3 concise English "
+                    "academic search terms. Return only a JSON array of strings."
+                ),
+            },
+            {"role": "user", "content": keyword},
+        ],
+    }
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        method="POST",
     )
-    return "(" + " OR ".join(groups) + f") AND {context}"
+    with open_url_with_retries(request, timeout=timeout, attempts=2) as response:
+        data = json.loads(response.read().decode(response.headers.get_content_charset() or "utf-8"))
+    choices = data.get("choices") or []
+    if not choices:
+        raise SearchError("LLM response contains no choices")
+    terms = _parse_llm_terms(((choices[0].get("message") or {}).get("content")))
+    if not terms:
+        raise SearchError("LLM response contains no usable English terms")
+    return terms
+
+
+def resolve_keyword_plan(
+    keywords: str | list[str] | None,
+    *,
+    search_mode: str = "strict",
+    resolver: KeywordResolver | None = None,
+    llm_api_key: str = "",
+    llm_base_url: str = "",
+    llm_model: str = "",
+) -> SearchQueryPlan:
+    parsed = parse_keywords(keywords or DEFAULT_KEYWORDS) or list(DEFAULT_KEYWORDS)
+    resolved: list[ResolvedKeyword] = []
+    warnings: list[str] = []
+    if resolver is None and llm_api_key and llm_base_url and llm_model:
+        resolver = lambda keyword: openai_compatible_keyword_resolver(
+            keyword,
+            api_key=llm_api_key,
+            base_url=llm_base_url,
+            model=llm_model,
+        )
+    for keyword in parsed:
+        dictionary_terms = KEYWORD_EXPANSIONS.get(keyword.lower())
+        if dictionary_terms:
+            resolved.append(ResolvedKeyword(keyword, list(dictionary_terms), "dictionary"))
+            continue
+        if not contains_chinese(keyword):
+            resolved.append(ResolvedKeyword(keyword, [keyword], "original"))
+            continue
+        if resolver is None:
+            warning = f"中文关键词“{keyword}”不在内置词典中，未配置模型，暂以原词检索。"
+            warnings.append(warning)
+            resolved.append(ResolvedKeyword(keyword, [keyword], "fallback", warning))
+            continue
+        try:
+            terms = list(dict.fromkeys(clean_text(term) for term in resolver(keyword) if clean_text(term)))[:3]
+            if not terms:
+                raise SearchError("模型未返回英文同义词")
+            resolved.append(ResolvedKeyword(keyword, terms, "model"))
+        except Exception as exc:
+            warning = f"中文关键词“{keyword}”扩展失败：{type(exc).__name__}: {exc}；暂以原词检索。"
+            warnings.append(warning)
+            resolved.append(ResolvedKeyword(keyword, [keyword], "fallback", warning))
+    return SearchQueryPlan(resolved, normalize_search_mode(search_mode), warnings)
+
+
+def ensure_query_plan(
+    keywords: str | list[str] | None = None,
+    query_plan: SearchQueryPlan | dict[str, Any] | None = None,
+    search_mode: str | None = None,
+) -> SearchQueryPlan:
+    if isinstance(query_plan, dict):
+        query_plan = SearchQueryPlan.from_dict(query_plan)
+    if query_plan is not None:
+        query_plan.search_mode = normalize_search_mode(search_mode or query_plan.search_mode)
+        return query_plan
+    return resolve_keyword_plan(keywords, search_mode=search_mode or "strict")
+
+
+def _quoted(term: str) -> str:
+    return f'"{term.replace(chr(34), "").strip()}"'
+
+
+def _plan_groups(plan: SearchQueryPlan) -> list[list[str]]:
+    return [item.english_terms or [item.original] for item in plan.keywords if item.original]
+
+
+def build_pubmed_query(keywords: str | list[str] | SearchQueryPlan) -> str:
+    plan = keywords if isinstance(keywords, SearchQueryPlan) else resolve_keyword_plan(keywords)
+    groups = [
+        "(" + " OR ".join(f"{_quoted(term)}[Title/Abstract]" for term in terms) + ")"
+        for terms in _plan_groups(plan)
+    ]
+    context = " OR ".join(f"{_quoted(term)}[Title/Abstract]" for term in SYNBIO_CONTEXT_TERMS)
+    return "(" + " OR ".join(groups) + f") AND ({context})"
+
+
+def build_europe_pmc_query(keywords: str | list[str] | SearchQueryPlan, since_days: int | None = None) -> str:
+    plan = keywords if isinstance(keywords, SearchQueryPlan) else resolve_keyword_plan(keywords)
+    groups = []
+    for terms in _plan_groups(plan):
+        clauses = [f"TITLE:{_quoted(term)} OR ABSTRACT:{_quoted(term)}" for term in terms]
+        groups.append("(" + " OR ".join(clauses) + ")")
+    context = " OR ".join(
+        f"TITLE:{_quoted(term)} OR ABSTRACT:{_quoted(term)}" for term in SYNBIO_CONTEXT_TERMS
+    )
+    query = "(" + " OR ".join(groups) + f") AND ({context})"
+    if since_days:
+        start, end = since_dates(since_days)
+        query += f" AND FIRST_PDATE:[{start} TO {end}]"
+    return query
+
+
+def build_openalex_query(keywords: str | list[str] | SearchQueryPlan) -> str:
+    plan = keywords if isinstance(keywords, SearchQueryPlan) else resolve_keyword_plan(keywords)
+    groups = ["(" + " OR ".join(_quoted(term) for term in terms) + ")" for terms in _plan_groups(plan)]
+    context = " OR ".join(_quoted(term) for term in SYNBIO_CONTEXT_TERMS)
+    return "(" + " OR ".join(groups) + f") AND ({context})"
+
+
+def build_crossref_queries(
+    keywords: str | list[str] | SearchQueryPlan,
+    max_queries: int = 12,
+) -> list[str]:
+    plan = keywords if isinstance(keywords, SearchQueryPlan) else resolve_keyword_plan(keywords)
+    terms = [clean_text(term) for group in _plan_groups(plan) for term in group if clean_text(term)]
+    return list(dict.fromkeys(terms))[:max_queries]
+
+
+def build_keyword_query(keywords: str | list[str]) -> str:
+    """Backward-compatible alias for the PubMed title/abstract query."""
+    return build_pubmed_query(keywords)
 
 
 def build_plain_search_queries(keywords: str | list[str], max_queries: int = 8) -> list[str]:
-    parsed = parse_keywords(keywords)
-    if not parsed:
-        parsed = DEFAULT_KEYWORDS
-    queries: list[str] = []
-    for keyword in parsed:
-        expansions = KEYWORD_EXPANSIONS.get(keyword.lower(), [keyword])
-        queries.extend(clean_text(term) for term in expansions if clean_text(term))
-    return list(dict.fromkeys(queries))[:max_queries]
+    return build_crossref_queries(keywords, max_queries=max_queries)
 
 
 def term_in_text(term: str, text: str) -> bool:
@@ -164,24 +409,42 @@ def record_search_text(record: PaperInput) -> str:
     ).lower()
 
 
-def keyword_terms(keywords: str | list[str]) -> list[str]:
+def keyword_terms(keywords: str | list[str] | SearchQueryPlan) -> list[str]:
+    if isinstance(keywords, SearchQueryPlan):
+        terms = [
+            term
+            for item in keywords.keywords
+            for term in [item.original, *(item.english_terms or [])]
+        ]
+        return list(dict.fromkeys(clean_text(term) for term in terms if clean_text(term)))
     terms: list[str] = []
     for keyword in parse_keywords(keywords):
         terms.extend(KEYWORD_EXPANSIONS.get(keyword.lower(), [keyword]))
     return list(dict.fromkeys(clean_text(term) for term in terms if clean_text(term)))
 
 
-def relevance_score(record: PaperInput, keywords: str | list[str]) -> int:
-    text = record_search_text(record)
+def relevance_score(
+    record: PaperInput,
+    keywords: str | list[str] | SearchQueryPlan,
+    search_mode: str | None = None,
+) -> int:
+    title = " ".join([record.title_en, record.title]).lower()
+    abstract = " ".join([record.abstract_en, record.abstract]).lower()
+    text = f"{title} {abstract}"
+    terms = keyword_terms(keywords)
+    title_keyword_hits = sum(term_in_text(term, title) for term in terms)
+    abstract_keyword_hits = sum(term_in_text(term, abstract) for term in terms)
+    title_context_hits = sum(term_in_text(term, title) for term in SYNBIO_CONTEXT_TERMS)
+    abstract_context_hits = sum(term_in_text(term, abstract) for term in SYNBIO_CONTEXT_TERMS)
+    production_hits = sum(term_in_text(term, text) for term in SYNBIO_PRODUCTION_TERMS)
+    clinical_hits = sum(term_in_text(term, text) for term in LOW_RELEVANCE_TERMS)
     score = 0
-    if any(term_in_text(term, text) for term in keyword_terms(keywords)):
-        score += 5
-    if any(term_in_text(term, text) for term in SYNBIO_CONTEXT_TERMS):
-        score += 4
-    if any(term_in_text(term, text) for term in SYNBIO_PRODUCTION_TERMS):
-        score += 2
-    if any(term in text for term in LOW_RELEVANCE_TERMS):
-        score -= 3
+    score += min(title_keyword_hits, 3) * 8
+    score += min(abstract_keyword_hits, 3) * 4
+    score += min(title_context_hits, 3) * 5
+    score += min(abstract_context_hits, 3) * 3
+    score += min(production_hits, 3) * 2
+    score -= min(clinical_hits, 3) * 12
     if record.abstract_en or record.abstract:
         score += 1
     if record.doi:
@@ -189,11 +452,30 @@ def relevance_score(record: PaperInput, keywords: str | list[str]) -> int:
     return score
 
 
-def is_synthetic_biology_relevant(record: PaperInput, keywords: str | list[str]) -> bool:
-    text = record_search_text(record)
-    has_keyword = any(term_in_text(term, text) for term in keyword_terms(keywords))
+def is_synthetic_biology_relevant(
+    record: PaperInput,
+    keywords: str | list[str] | SearchQueryPlan,
+    search_mode: str | None = None,
+) -> bool:
+    mode = normalize_search_mode(
+        search_mode or (keywords.search_mode if isinstance(keywords, SearchQueryPlan) else "strict")
+    )
+    title = " ".join([record.title_en, record.title]).lower()
+    abstract = " ".join([record.abstract_en, record.abstract]).lower()
+    text = f"{title} {abstract}"
+    terms = keyword_terms(keywords)
+    title_keyword = any(term_in_text(term, title) for term in terms)
+    abstract_keyword = any(term_in_text(term, abstract) for term in terms)
+    has_keyword = title_keyword or abstract_keyword
     has_context = any(term_in_text(term, text) for term in SYNBIO_CONTEXT_TERMS)
-    return has_keyword and has_context and relevance_score(record, keywords) >= 7
+    score = relevance_score(record, keywords, mode)
+
+    if mode == "broad":
+        return has_keyword
+    if mode == "balanced":
+        return ((has_keyword and has_context) or title_keyword) and score >= 0
+    strict_match = title_keyword or (abstract_keyword and has_context)
+    return strict_match and score >= 6
 
 
 def open_url_with_retries(req: urllib.request.Request, timeout: int, attempts: int = 3) -> Any:
@@ -338,16 +620,13 @@ def crossref_publication_date(item: dict[str, Any]) -> tuple[str, str]:
     return "", ""
 
 
-def pubmed_publication_date(article: ET.Element) -> tuple[str, str]:
-    pub_date = article.find(".//JournalIssue/PubDate") or article.find(".//PubDate")
-    if pub_date is None:
-        return "", ""
-    year = valid_year(pub_date.findtext("Year"))
+def _pubmed_date_element(node: ET.Element, source: str) -> tuple[str, str]:
+    year = valid_year(node.findtext("Year"))
     if not year:
-        medline_year = year_from(pub_date.findtext("MedlineDate"))
+        medline_year = year_from(node.findtext("MedlineDate"))
         return medline_year, "MedlineDate" if medline_year else ""
-    month_raw = clean_text(pub_date.findtext("Month"))
-    day_raw = clean_text(pub_date.findtext("Day"))
+    month_raw = clean_text(node.findtext("Month"))
+    day_raw = clean_text(node.findtext("Day"))
     month = ""
     if month_raw:
         if month_raw.isdigit():
@@ -356,11 +635,28 @@ def pubmed_publication_date(article: ET.Element) -> tuple[str, str]:
             month = f"{MONTHS.get(month_raw[:3].lower(), 0):02d}" if MONTHS.get(month_raw[:3].lower()) else ""
     if month and day_raw.isdigit():
         parsed = valid_iso_date(f"{year}-{month}-{int(day_raw):02d}")
-        return parsed, "PubDate" if parsed else (year, "PubDate")
+        return (parsed, source) if parsed else ("", "")
     if month:
         parsed = valid_iso_date(f"{year}-{month}")
-        return parsed, "PubDate" if parsed else (year, "PubDate")
-    return year, "PubDate"
+        return (parsed, source) if parsed else ("", "")
+    return year, source
+
+
+def pubmed_publication_date(article: ET.Element) -> tuple[str, str]:
+    electronic_dates = [
+        node
+        for node in article.findall(".//Article/ArticleDate")
+        if clean_text(node.attrib.get("DateType")).lower() == "electronic"
+    ]
+    for node in electronic_dates:
+        parsed = _pubmed_date_element(node, "ArticleDate Electronic")
+        if parsed[0]:
+            return parsed
+
+    pub_date = article.find(".//JournalIssue/PubDate")
+    if pub_date is None:
+        pub_date = article.find(".//PubDate")
+    return _pubmed_date_element(pub_date, "PubDate") if pub_date is not None else ("", "")
 
 
 def europe_pmc_publication_date(item: dict[str, Any]) -> tuple[str, str]:
@@ -400,8 +696,12 @@ def since_dates(days: int | None) -> tuple[str, str]:
     return start.isoformat(), end.isoformat()
 
 
+def element_text(node: ET.Element | None) -> str:
+    return clean_text("".join(node.itertext())) if node is not None else ""
+
+
 def search_pubmed(query: str, limit: int, since_days: int | None = None) -> list[PaperInput]:
-    params: dict[str, Any] = {"db": "pubmed", "term": query, "retmode": "json", "retmax": limit, "sort": "pub date"}
+    params: dict[str, Any] = {"db": "pubmed", "term": query, "retmode": "json", "retmax": limit, "sort": "relevance"}
     if since_days:
         start, end = since_dates(since_days)
         params.update({"datetype": "pdat", "mindate": start, "maxdate": end})
@@ -419,9 +719,9 @@ def search_pubmed(query: str, limit: int, since_days: int | None = None) -> list
     for article in root.findall(".//PubmedArticle"):
         medline = article.find("./MedlineCitation")
         pmid = clean_text(medline.findtext("./PMID") if medline is not None else "")
-        title = clean_text(article.findtext(".//ArticleTitle"))
+        title = element_text(article.find(".//ArticleTitle"))
         journal = clean_text(article.findtext(".//Journal/Title"))
-        abstract = clean_text(" ".join(node.text or "" for node in article.findall(".//AbstractText")))
+        abstract = clean_text(" ".join(element_text(node) for node in article.findall(".//AbstractText")))
         doi = ""
         pmcid = ""
         for node in article.findall(".//ArticleId"):
@@ -469,7 +769,7 @@ def search_europe_pmc(query: str, limit: int, since_days: int | None = None) -> 
         epmc_query = f"({query}) AND FIRST_PDATE:[{start} TO {end}]"
     data = http_json(
         "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
-        {"query": epmc_query, "format": "json", "pageSize": limit, "resultType": "core", "sort": "P_PDATE_D"},
+        {"query": epmc_query, "format": "json", "pageSize": limit, "resultType": "core"},
     )
     records: list[PaperInput] = []
     for item in (data.get("resultList") or {}).get("result") or []:
@@ -514,7 +814,17 @@ def inverted_abstract(index: Any) -> str:
     return clean_text(" ".join(word for _, word in sorted(pairs)))
 
 
-def search_openalex(query: str, limit: int, email: str = "", since_days: int | None = None) -> list[PaperInput]:
+def search_openalex(
+    query: str,
+    limit: int,
+    email: str = "",
+    since_days: int | None = None,
+    api_key: str = "",
+) -> list[PaperInput]:
+    del email  # Retained only for backward-compatible callers; OpenAlex no longer uses mailto.
+    api_key = clean_text(api_key or os.getenv("OPENALEX_API_KEY"))
+    if not api_key:
+        return []
     params: dict[str, Any] = {"search": query, "per-page": limit}
     filters = []
     if since_days:
@@ -522,8 +832,7 @@ def search_openalex(query: str, limit: int, email: str = "", since_days: int | N
         filters.append(f"from_publication_date:{start}")
     if filters:
         params["filter"] = ",".join(filters)
-    if email:
-        params["mailto"] = email
+    params["api_key"] = api_key
     data = http_json("https://api.openalex.org/works", params)
     records: list[PaperInput] = []
     for item in data.get("results") or []:
@@ -596,11 +905,13 @@ def search_crossref(query: str, limit: int, since_days: int | None = None) -> li
 
 def search_crossref_many(queries: list[str], limit: int, since_days: int | None = None) -> list[PaperInput]:
     records: list[PaperInput] = []
-    per_query = max(3, min(limit, 12))
+    if not queries:
+        return records
+    per_query = max(1, min(20, (limit + len(queries) - 1) // len(queries)))
     for query in queries:
         records.extend(search_crossref(query, per_query, since_days=since_days))
         time.sleep(0.15)
-    return records
+    return dedupe(records)[:limit]
 
 
 def dedupe(records: list[PaperInput]) -> list[PaperInput]:
@@ -659,35 +970,110 @@ def federated_search(
     sources: list[str] | None = None,
     email: str = "",
     since_days: int | None = None,
+    *,
+    query_plan: SearchQueryPlan | dict[str, Any] | None = None,
+    search_mode: str | None = None,
+    openalex_api_key: str = "",
+    llm_provider: str = "",
+    llm_api_key: str = "",
+    llm_base_url: str = "",
+    llm_model: str = "",
+    keyword_resolver: KeywordResolver | None = None,
+    diagnostics: SearchDiagnostics | None = None,
 ) -> tuple[list[PaperInput], dict[str, str]]:
-    parsed_keywords = parse_keywords(keywords or DEFAULT_KEYWORDS)
-    query = build_keyword_query(parsed_keywords)
-    plain_queries = build_plain_search_queries(parsed_keywords)
-    selected = sources or ["PubMed", "Europe PMC", "OpenAlex", "Crossref"]
-    per_source = max(5, min(50, limit))
+    if query_plan is None:
+        from .llm import default_api_key, default_base_url, default_model, default_provider
+
+        provider = llm_provider or default_provider()
+        plan = resolve_keyword_plan(
+            keywords,
+            search_mode=search_mode or "strict",
+            resolver=keyword_resolver,
+            llm_api_key=llm_api_key or default_api_key(),
+            llm_base_url=llm_base_url or default_base_url(provider),
+            llm_model=llm_model or default_model(provider),
+        )
+    else:
+        plan = ensure_query_plan(keywords, query_plan, search_mode)
+
+    mode = normalize_search_mode(search_mode or plan.search_mode)
+    plan.search_mode = mode
+    selected = list(dict.fromkeys(sources or ["PubMed", "Europe PMC", "OpenAlex", "Crossref"]))
+    per_source = min(100, max(5, int(limit) * 3))
+    openalex_key = clean_text(openalex_api_key or os.getenv("OPENALEX_API_KEY"))
+    diag = diagnostics if diagnostics is not None else SearchDiagnostics()
+    diag.source_counts.clear()
+    diag.raw_count = 0
+    diag.deduplicated_count = 0
+    diag.filtered_count = 0
+    diag.warnings = list(plan.warnings)
+    diag.errors.clear()
+    for source in selected:
+        diag.source_counts[source] = {"fetched": 0, "deduplicated": 0, "relevant": 0}
+
+    pubmed_query = build_pubmed_query(plan)
+    europe_pmc_query = build_europe_pmc_query(plan, since_days=since_days)
+    openalex_query = build_openalex_query(plan)
+    crossref_queries = build_crossref_queries(plan)
     functions = {
-        "PubMed": lambda: search_pubmed(query, per_source, since_days=since_days),
-        "Europe PMC": lambda: search_europe_pmc(query, per_source, since_days=since_days),
-        "OpenAlex": lambda: search_openalex(query, per_source, email=email, since_days=since_days),
-        "Crossref": lambda: search_crossref_many(plain_queries, per_source, since_days=since_days),
+        "PubMed": lambda: search_pubmed(pubmed_query, per_source, since_days=since_days),
+        "Europe PMC": lambda: search_europe_pmc(europe_pmc_query, per_source, since_days=None),
+        "Crossref": lambda: search_crossref_many(crossref_queries, per_source, since_days=since_days),
     }
-    records: list[PaperInput] = []
+    if "OpenAlex" in selected:
+        if openalex_key:
+            functions["OpenAlex"] = lambda: search_openalex(
+                openalex_query,
+                per_source,
+                email=email,
+                since_days=since_days,
+                api_key=openalex_key,
+            )
+        else:
+            diag.warnings.append("OpenAlex 未配置 OPENALEX_API_KEY，已跳过且未发起网络请求。")
+    if email:
+        diag.warnings.append("OpenAlex 邮箱/mailto 配置已弃用，请改用 OPENALEX_API_KEY。")
+    unknown_sources = [source for source in selected if source not in functions and source != "OpenAlex"]
+    if unknown_sources:
+        diag.warnings.append("未知检索源已跳过：" + ", ".join(unknown_sources))
+
+    records_by_source: dict[str, list[PaperInput]] = {}
     errors: dict[str, str] = {}
-    with ThreadPoolExecutor(max_workers=min(4, len(selected))) as pool:
-        futures = {pool.submit(functions[name]): name for name in selected if name in functions}
-        for future in as_completed(futures):
-            name = futures[future]
-            try:
-                records.extend(future.result())
-            except Exception as exc:
-                errors[name] = f"{type(exc).__name__}: {exc}"
+    runnable = {name: functions[name] for name in selected if name in functions}
+    if runnable:
+        with ThreadPoolExecutor(max_workers=min(4, len(runnable))) as pool:
+            futures = {pool.submit(function): name for name, function in runnable.items()}
+            for future in as_completed(futures):
+                name = futures[future]
+                try:
+                    records_by_source[name] = future.result()
+                except Exception as exc:
+                    errors[name] = f"{type(exc).__name__}: {exc}"
+                    records_by_source[name] = []
+
+    records: list[PaperInput] = []
+    for source in selected:
+        source_records = records_by_source.get(source, [])
+        source_deduplicated = dedupe(source_records)
+        source_relevant = [
+            record for record in source_deduplicated if is_synthetic_biology_relevant(record, plan, mode)
+        ]
+        counts = diag.source_counts[source]
+        counts["fetched"] = len(source_records)
+        counts["deduplicated"] = len(source_deduplicated)
+        counts["relevant"] = len(source_relevant)
+        records.extend(source_records)
+
+    diag.errors.update(errors)
+    diag.raw_count = len(records)
     merged = mark_paywalled(dedupe(records))
-    relevant = [record for record in merged if is_synthetic_biology_relevant(record, parsed_keywords)]
+    diag.deduplicated_count = len(merged)
+    relevant = [record for record in merged if is_synthetic_biology_relevant(record, plan, mode)]
     for record in merged:
-        record.keywords = parsed_keywords
+        record.keywords = plan.original_keywords
     relevant.sort(
         key=lambda item: (
-            relevance_score(item, parsed_keywords),
+            relevance_score(item, plan, mode),
             item.publication_date or item.year or "",
             item.is_open_access,
             bool(item.abstract_en),
@@ -695,6 +1081,11 @@ def federated_search(
         ),
         reverse=True,
     )
+    diag.filtered_count = len(relevant)
+    if diag.raw_count and not relevant:
+        diag.warnings.append(f"共抓取 {diag.raw_count} 条记录，但均未通过“{mode}”相关性过滤。")
+    elif not diag.raw_count and runnable and not errors:
+        diag.warnings.append("已完成检索，但各来源均未返回记录。")
     return relevant[:limit], errors
 
 
@@ -703,17 +1094,59 @@ def run_keyword_search(
     limit: int = 20,
     email: str = "",
     since_days: int | None = 30,
+    *,
+    query_plan: SearchQueryPlan | dict[str, Any] | None = None,
+    search_mode: str | None = None,
+    openalex_api_key: str = "",
+    llm_provider: str = "",
+    llm_api_key: str = "",
+    llm_base_url: str = "",
+    llm_model: str = "",
+    keyword_resolver: KeywordResolver | None = None,
 ) -> SearchRun:
     started = utc_now()
-    parsed = parse_keywords(keywords)
-    records, errors = federated_search(parsed, limit=limit, email=email, since_days=since_days)
+    if query_plan is None:
+        from .llm import default_api_key, default_base_url, default_model, default_provider
+
+        provider = llm_provider or default_provider()
+        plan = resolve_keyword_plan(
+            keywords,
+            search_mode=search_mode or "strict",
+            resolver=keyword_resolver,
+            llm_api_key=llm_api_key or default_api_key(),
+            llm_base_url=llm_base_url or default_base_url(provider),
+            llm_model=llm_model or default_model(provider),
+        )
+    else:
+        plan = ensure_query_plan(keywords, query_plan, search_mode)
+    diagnostics = SearchDiagnostics()
+    records, errors = federated_search(
+        keywords,
+        limit=limit,
+        email=email,
+        since_days=since_days,
+        query_plan=plan,
+        search_mode=search_mode,
+        openalex_api_key=openalex_api_key,
+        llm_provider=llm_provider,
+        llm_api_key=llm_api_key,
+        llm_base_url=llm_base_url,
+        llm_model=llm_model,
+        keyword_resolver=keyword_resolver,
+        diagnostics=diagnostics,
+    )
     return SearchRun(
         run_id=started.replace(":", "").replace("-", "").split(".")[0],
-        keywords=parsed,
+        keywords=plan.original_keywords,
         started_at=started,
         finished_at=utc_now(),
         records=records,
         errors=errors,
+        query_plan=plan,
+        source_counts=diagnostics.source_counts,
+        raw_count=diagnostics.raw_count,
+        filtered_count=diagnostics.filtered_count,
+        warnings=list(dict.fromkeys(diagnostics.warnings)),
     )
 
 

@@ -10,9 +10,9 @@ from .llm import call_openai_compatible, default_api_key, default_base_url, defa
 from .models import PaperInput, SearchRun
 
 
-TRANSLATE_SYSTEM = """你是合成生物学文献翻译助手。
-把英文标题和摘要忠实翻译为中文，不扩写、不加入评价、不改变数字和专业术语。
-返回 JSON 数组，每个对象只包含 title_zh 和 abstract_zh。输入没有摘要时，abstract_zh 返回空字符串。"""
+TRANSLATE_SYSTEM = """你是合成生物学文献标题翻译助手。
+把英文论文标题忠实翻译为中文，不扩写、不加入评价、不改变数字和专业术语。
+返回 JSON 数组，每个对象只包含 title_zh。"""
 
 
 def fallback_translation(text: str, kind: str) -> str:
@@ -47,6 +47,8 @@ def translate_records(
 ) -> TranslationReport:
     errors: list[str] = []
     translated_count = 0
+    if not records:
+        return TranslationReport(records=records, provider=provider, base_url=base_url, model=model)
     if not api_key.strip():
         for record in records:
             record.title_zh = record.title_zh or fallback_translation(record.title_en or record.title, "标题")
@@ -58,7 +60,6 @@ def translate_records(
         payload = [
             {
                 "title_en": record.title_en or record.title,
-                "abstract_en": record.abstract_en or record.abstract,
             }
             for record in chunk
         ]
@@ -92,7 +93,6 @@ def translate_records(
             if item.get("title_zh"):
                 translated_count += 1
             record.title_zh = str(item.get("title_zh") or record.title_zh or fallback_translation(record.title_en or record.title, "标题"))
-            record.abstract_zh = str(item.get("abstract_zh") or record.abstract_zh or "")
         if start + batch_size < len(records) and delay_seconds > 0:
             time.sleep(delay_seconds)
     return TranslationReport(

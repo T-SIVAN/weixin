@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 
@@ -28,12 +29,14 @@ from weixin_lite.models import (
     DownloadedPaper,
     PaperInput,
     QuickReadArticle,
+    ResolvedKeyword,
+    SearchQueryPlan,
     SearchRun,
     generation_ready_papers,
     unavailable_papers,
 )
 from weixin_lite.pdf_reader import PdfContent, parse_pdf
-from weixin_lite.search import DEFAULT_KEYWORDS, parse_manual_inputs, resolve_doi, run_keyword_search
+from weixin_lite.search import DEFAULT_KEYWORDS, parse_manual_inputs, resolve_doi, resolve_keyword_plan, run_keyword_search
 from weixin_lite.translate import translate_records
 from weixin_lite.wechat_publish import WechatDraftConfig, export_wechat_payload, publish_draft
 
@@ -51,6 +54,8 @@ def init_state() -> None:
     st.session_state.setdefault("images", {})
     st.session_state.setdefault("downloads", [])
     st.session_state.setdefault("keywords", ", ".join(DEFAULT_KEYWORDS))
+    st.session_state.setdefault("query_plan", None)
+    st.session_state.setdefault("search_append", False)
 
 
 def paper_key(paper: PaperInput) -> str:
@@ -181,6 +186,89 @@ def show_details(papers: list[PaperInput], title: str = "查看摘要和错误")
             st.caption(" | ".join(bit for bit in bits if bit))
 
 
+MODE_LABELS = {"strict": "精准", "balanced": "均衡", "broad": "宽松"}
+MODE_VALUES = {label: value for value, label in MODE_LABELS.items()}
+
+
+def plan_to_rows(plan: SearchQueryPlan) -> list[dict[str, str]]:
+    return [
+        {
+            "中文/原词": item.original,
+            "英文检索词": ", ".join(item.english_terms),
+            "来源": item.source,
+            "提示": item.warning,
+        }
+        for item in plan.keywords
+    ]
+
+
+def rows_to_plan(rows: object, search_mode: str, warnings: list[str] | None = None) -> SearchQueryPlan:
+    if hasattr(rows, "to_dict"):
+        row_items = rows.to_dict("records")  # type: ignore[call-arg]
+    else:
+        row_items = rows if isinstance(rows, list) else []
+    keywords: list[ResolvedKeyword] = []
+    for row in row_items:
+        if not isinstance(row, dict):
+            continue
+        original = str(row.get("中文/原词") or "").strip()
+        if not original:
+            continue
+        english_terms = [
+            term.strip()
+            for term in re.split(r"[,，;\n]+", str(row.get("英文检索词") or ""))
+            if term.strip()
+        ]
+        source = str(row.get("来源") or "original")
+        if source not in {"dictionary", "model", "original", "fallback"}:
+            source = "original"
+        keywords.append(
+            ResolvedKeyword(
+                original=original,
+                english_terms=english_terms or [original],
+                source=source,  # type: ignore[arg-type]
+                warning=str(row.get("提示") or ""),
+            )
+        )
+    return SearchQueryPlan(keywords=keywords, search_mode=search_mode, warnings=warnings or [])
+
+
+def show_search_run_diagnostics(run: SearchRun, *, wrapped: bool = True) -> None:
+    def render() -> None:
+        if run.query_plan:
+            st.caption("实际检索词：" + "；".join(
+                f"{item.original} -> {', '.join(item.english_terms or [item.original])}"
+                for item in run.query_plan.keywords
+            ))
+        col_a, col_b, col_c = st.columns(3)
+        col_a.metric("抓取数", run.raw_count)
+        col_b.metric("相关结果", run.filtered_count)
+        col_c.metric("来源数", len(run.source_counts))
+        if run.source_counts:
+            st.dataframe(
+                [
+                    {
+                        "来源": source,
+                        "抓取": counts.get("fetched", 0),
+                        "去重": counts.get("deduplicated", 0),
+                        "相关": counts.get("relevant", 0),
+                    }
+                    for source, counts in run.source_counts.items()
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+        for warning in run.warnings:
+            st.warning(warning)
+        for source, error in run.errors.items():
+            st.error(f"{source}: {error}")
+    if wrapped:
+        with st.expander("查看来源统计和提示"):
+            render()
+    else:
+        render()
+
+
 def render_article_preview(article: QuickReadArticle) -> None:
     pending: list[str] = []
 
@@ -246,11 +334,13 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
     st.subheader("合成生物行业检索与标题翻译")
     latest = load_latest_run()
     if latest and latest.records:
-        st.info(f"已读取每日检索：{latest.finished_at or latest.started_at}；关键词：{', '.join(latest.keywords)}")
-        st.dataframe(paper_rows(latest.records), use_container_width=True, hide_index=True)
-        if st.button("加入每日结果"):
-            st.session_state.papers = merge_papers(st.session_state.papers, latest.records)
-            st.success(f"已加入 {len(latest.records)} 条候选。")
+        with st.expander(f"每日历史结果：{latest.finished_at or latest.started_at}"):
+            st.caption("关键词：" + ", ".join(latest.keywords))
+            st.dataframe(paper_rows(latest.records), use_container_width=True, hide_index=True)
+            show_search_run_diagnostics(latest, wrapped=False)
+            if st.button("加入每日结果"):
+                st.session_state.papers = merge_papers(st.session_state.papers, latest.records)
+                st.success(f"已加入 {len(latest.records)} 条候选。")
 
     st.divider()
     keywords = st.text_area(
@@ -260,33 +350,89 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
         placeholder="例如：代谢工程, 生物制造, 工程菌, biosynthesis, microbial cell factory",
     )
     st.session_state.keywords = keywords
-    st.caption("检索会使用你填写的关键词，并自动叠加合成生物、代谢工程、生物制造、工程菌、发酵生产等行业语境过滤。")
-    col_a, col_b, col_c = st.columns(3)
+    st.caption("中文词会先用内置合成生物词典解析；未收录词会尝试用当前模型扩展为 1-3 个英文学术检索词。")
+    col_a, col_b, col_c, col_d = st.columns([1, 1, 1, 1.2])
     limit = col_a.slider("检索数量", 5, 30, 20)
     since_years = col_b.slider("时间范围（年）", 1, 10, 1)
-    email = col_c.text_input("OpenAlex 邮箱（可选）", value="")
+    mode_label = col_c.selectbox("相关性", list(MODE_VALUES.keys()), index=0)
+    search_mode = MODE_VALUES[mode_label]
+    openalex_api_key = col_d.text_input(
+        "OpenAlex API Key",
+        value=os.getenv("OPENALEX_API_KEY", ""),
+        type="password",
+        help="未填写时会跳过 OpenAlex，其他来源照常检索。",
+    )
+    append_results = st.checkbox("追加到候选", value=bool(st.session_state.search_append))
+    st.session_state.search_append = append_results
+
+    parsed_keywords = resolve_keyword_plan(keywords, search_mode=search_mode).original_keywords
+    current_plan = st.session_state.query_plan
+    if not isinstance(current_plan, SearchQueryPlan) or current_plan.original_keywords != parsed_keywords:
+        current_plan = resolve_keyword_plan(keywords, search_mode=search_mode)
+        st.session_state.query_plan = current_plan
+    current_plan.search_mode = search_mode
+
+    if st.button("解析关键词"):
+        with st.spinner("正在解析中文关键词..."):
+            current_plan = resolve_keyword_plan(
+                keywords,
+                search_mode=search_mode,
+                llm_api_key=api_key,
+                llm_base_url=base_url,
+                llm_model=model,
+            )
+            st.session_state.query_plan = current_plan
+
+    edited_rows = st.data_editor(
+        plan_to_rows(current_plan),
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic",
+        disabled=["中文/原词", "来源", "提示"],
+    )
+    query_plan = rows_to_plan(edited_rows, search_mode, current_plan.warnings)
+    st.session_state.query_plan = query_plan
+    if query_plan.warnings:
+        with st.expander("关键词解析提示"):
+            for warning in query_plan.warnings:
+                st.warning(warning)
+
     if st.button("检索并翻译标题", type="primary"):
         with st.spinner("正在检索 PubMed、Europe PMC、OpenAlex、Crossref，并翻译标题..."):
-            run = run_keyword_search(keywords, limit=limit, email=email, since_days=since_years * 365)
-            report = translate_records(
-                run.records,
-                api_key=api_key,
-                base_url=base_url,
-                model=model,
-                provider=provider,
-                batch_size=batch_size,
-                delay_seconds=delay_seconds,
+            run = run_keyword_search(
+                keywords,
+                limit=limit,
+                since_days=since_years * 365,
+                query_plan=query_plan,
+                search_mode=search_mode,
+                openalex_api_key=openalex_api_key,
             )
-        st.session_state.papers = merge_papers(st.session_state.papers, run.records)
+            report = None
+            if run.records:
+                report = translate_records(
+                    run.records,
+                    api_key=api_key,
+                    base_url=base_url,
+                    model=model,
+                    provider=provider,
+                    batch_size=batch_size,
+                    delay_seconds=delay_seconds,
+                )
+        st.session_state.papers = merge_papers(st.session_state.papers, run.records) if append_results else list(run.records)
         if run.errors:
             st.warning("部分检索源失败：" + "; ".join(f"{k}: {v}" for k, v in run.errors.items()))
-        if report.errors:
+        if run.warnings:
+            st.info("；".join(run.warnings))
+        if report and report.errors:
             st.warning("翻译未完全成功：" + "; ".join(report.errors))
             if any("429" in item or "Too Many Requests" in item for item in report.errors):
                 st.info("429 是模型供应商限流/额度问题。建议把侧边栏“翻译批量”调为 1，把“翻译间隔”调到 5-10 秒，或切换 DeepSeek/SiliconFlow/custom。")
-        else:
+        elif report:
             st.success(f"已翻译 {report.translated_count} 条标题。")
+        else:
+            st.info("本次没有相关结果，已跳过标题翻译。")
         st.dataframe(paper_rows(run.records), use_container_width=True, hide_index=True)
+        show_search_run_diagnostics(run)
         show_details(run.records, "查看本次检索详情")
 
     papers: list[PaperInput] = st.session_state.papers

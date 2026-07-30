@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 
 AccessStatus = Literal["open", "paywalled", "unknown", "download_failed"]
+KeywordSource = Literal["dictionary", "model", "original", "fallback"]
 
 
 def utc_now() -> str:
@@ -72,6 +73,65 @@ class PaperInput:
 
 
 @dataclass
+class ResolvedKeyword:
+    original: str
+    english_terms: list[str] = field(default_factory=list)
+    source: KeywordSource = "original"
+    warning: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ResolvedKeyword":
+        source = str(data.get("source") or "original")
+        if source not in {"dictionary", "model", "original", "fallback"}:
+            source = "original"
+        return cls(
+            original=str(data.get("original") or ""),
+            english_terms=[str(item) for item in data.get("english_terms") or [] if str(item).strip()],
+            source=source,  # type: ignore[arg-type]
+            warning=str(data.get("warning") or ""),
+        )
+
+
+@dataclass
+class SearchQueryPlan:
+    keywords: list[ResolvedKeyword] = field(default_factory=list)
+    search_mode: str = "strict"
+    warnings: list[str] = field(default_factory=list)
+    created_at: str = field(default_factory=utc_now)
+
+    @property
+    def original_keywords(self) -> list[str]:
+        return [item.original for item in self.keywords if item.original]
+
+    @property
+    def search_terms(self) -> list[str]:
+        terms: list[str] = []
+        for item in self.keywords:
+            terms.extend(item.english_terms or [item.original])
+        return list(dict.fromkeys(term.strip() for term in terms if term.strip()))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "keywords": [item.to_dict() for item in self.keywords],
+            "search_mode": self.search_mode,
+            "warnings": self.warnings,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SearchQueryPlan":
+        return cls(
+            keywords=[ResolvedKeyword.from_dict(item) for item in data.get("keywords") or [] if isinstance(item, dict)],
+            search_mode=str(data.get("search_mode") or "strict"),
+            warnings=[str(item) for item in data.get("warnings") or []],
+            created_at=str(data.get("created_at") or utc_now()),
+        )
+
+
+@dataclass
 class SearchRun:
     run_id: str
     keywords: list[str]
@@ -79,6 +139,11 @@ class SearchRun:
     finished_at: str = ""
     records: list[PaperInput] = field(default_factory=list)
     errors: dict[str, str] = field(default_factory=dict)
+    query_plan: SearchQueryPlan | None = None
+    source_counts: dict[str, dict[str, int]] = field(default_factory=dict)
+    raw_count: int = 0
+    filtered_count: int = 0
+    warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -88,6 +153,11 @@ class SearchRun:
             "finished_at": self.finished_at,
             "records": [record.to_dict() for record in self.records],
             "errors": self.errors,
+            "query_plan": self.query_plan.to_dict() if self.query_plan else None,
+            "source_counts": self.source_counts,
+            "raw_count": self.raw_count,
+            "filtered_count": self.filtered_count,
+            "warnings": self.warnings,
         }
 
     @classmethod
@@ -99,6 +169,19 @@ class SearchRun:
             finished_at=str(data.get("finished_at") or ""),
             records=[PaperInput.from_dict(item) for item in data.get("records") or []],
             errors={str(k): str(v) for k, v in (data.get("errors") or {}).items()},
+            query_plan=(
+                SearchQueryPlan.from_dict(data["query_plan"])
+                if isinstance(data.get("query_plan"), dict)
+                else None
+            ),
+            source_counts={
+                str(source): {str(key): int(value) for key, value in counts.items()}
+                for source, counts in (data.get("source_counts") or {}).items()
+                if isinstance(counts, dict)
+            },
+            raw_count=int(data.get("raw_count") or 0),
+            filtered_count=int(data.get("filtered_count") or len(data.get("records") or [])),
+            warnings=[str(item) for item in data.get("warnings") or []],
         )
 
 

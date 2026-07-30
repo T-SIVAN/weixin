@@ -4,7 +4,7 @@
 
 ## 核心流程
 
-1. **检索与翻译**：输入可编辑关键词和年份范围，检索 PubMed、Europe PMC、OpenAlex、Crossref，并只把英文标题翻译为中文。检索会自动叠加合成生物行业语境过滤，减少不相关结果。
+1. **检索与翻译**：输入可编辑中文或英文关键词和年份范围，先解析成实际英文检索词，再检索 PubMed、Europe PMC、OpenAlex、Crossref，并只把英文标题翻译为中文。检索会自动叠加合成生物行业语境过滤，减少不相关结果。
 2. **全文与生成**：自动下载合法开放全文或上传 PDF。只有已解析到 PDF 全文的论文才会生成公众号正文。
 3. **导出与发布**：导出项目包、单篇 Markdown/HTML、未生成 DOI CSV，也可以 dry-run 预览或真实创建微信公众号草稿。
 
@@ -40,6 +40,18 @@ $env:LLM_MODEL="your-model"
 
 页面侧边栏提供“测试翻译模型”按钮，并可调节翻译批量和批间间隔。遇到 `429 Too Many Requests` 时，把批量调到 1、间隔调到 5-10 秒，或切换 DeepSeek/SiliconFlow/custom 等额度更高的 OpenAI-compatible 服务。模型失败时会显示具体错误，并保留英文标题和“待翻译”标记，不阻塞后续下载和导出。
 
+翻译只处理标题。摘要详情保留英文原文，不会发送给模型，也不会写入 `abstract_zh`。
+
+## 中文检索
+
+页面会把中文关键词解析为可编辑的“实际检索词”。内置合成生物行业词典覆盖底盘细胞、细胞工厂、精准发酵、酶工程、天然产物、聚羟基脂肪酸酯等方向；未收录中文词会尝试用当前模型扩展为 1-3 个英文学术同义词。模型不可用时保留原词并显示提示，不阻塞检索。
+
+OpenAlex 已改用 API Key。未配置时会跳过 OpenAlex，PubMed、Europe PMC 和 Crossref 仍会继续检索。
+
+```powershell
+$env:OPENALEX_API_KEY="your-openalex-api-key"
+```
+
 ## 本地运行
 
 ```powershell
@@ -52,7 +64,7 @@ streamlit run app.py
 ## 命令行
 
 ```powershell
-python -m weixin_lite.daily_search --config config/topics.json --output data/latest_papers.json --provider deepseek --since-years 1
+python -m weixin_lite.daily_search --config config/topics.json --output data/latest_papers.json --provider deepseek --since-years 1 --search-mode strict --openalex-api-key $env:OPENALEX_API_KEY
 python -m weixin_lite.translate_results --input data/latest_papers.json --provider deepseek --batch-size 1 --delay-seconds 5
 python -m weixin_lite.batch_analyze --input data/latest_papers.json --limit 20
 ```

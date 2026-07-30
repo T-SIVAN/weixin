@@ -108,8 +108,11 @@ def test_translation_fallback_only_marks_title():
     assert report.errors
 
 
-def test_translation_populates_title_and_abstract(monkeypatch):
+def test_translation_populates_title_only(monkeypatch):
+    seen_payloads: list[str] = []
+
     def fake_call(**kwargs):
+        seen_payloads.append(kwargs["user_prompt"])
         return '[{"title_zh": "中文标题", "abstract_zh": "中文摘要"}]'
 
     monkeypatch.setattr("weixin_lite.translate.call_openai_compatible", fake_call)
@@ -119,7 +122,21 @@ def test_translation_populates_title_and_abstract(monkeypatch):
 
     assert report.translated_count == 1
     assert paper.title_zh == "中文标题"
-    assert paper.abstract_zh == "中文摘要"
+    assert paper.abstract_zh == ""
+    assert "abstract_en" not in seen_payloads[0]
+
+
+def test_translation_empty_records_does_not_call_llm(monkeypatch):
+    def fake_call(**kwargs):
+        raise AssertionError("LLM should not be called for empty records")
+
+    monkeypatch.setattr("weixin_lite.translate.call_openai_compatible", fake_call)
+
+    report = translate_records([], api_key="test-key")
+
+    assert report.ok
+    assert report.records == []
+    assert report.translated_count == 0
 
 
 def test_provider_defaults_are_configured():
