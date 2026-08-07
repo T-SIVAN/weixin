@@ -177,7 +177,10 @@ def test_daily_search_defaults_to_journal_latest_with_seven_days(monkeypatch, tm
     output = tmp_path / "latest.json"
     monkeypatch.setattr(daily_search, "load_journal_filters", fake_load)
     monkeypatch.setattr(daily_search, "run_journal_latest_search", fake_run)
-    monkeypatch.setattr(daily_search, "translate_records", lambda *args, **kwargs: None)
+    def fail_translate(*args, **kwargs):
+        raise AssertionError("translation should be opt-in")
+
+    monkeypatch.setattr(daily_search, "translate_records", fail_translate)
     monkeypatch.setattr(sys, "argv", ["daily_search", "--output", str(output)])
 
     daily_search.main()
@@ -204,3 +207,54 @@ def test_daily_search_since_days_override(monkeypatch, tmp_path):
     daily_search.main()
 
     assert seen["since_days"] == 3
+
+
+def test_daily_search_translate_is_explicit_and_uses_cache(monkeypatch, tmp_path):
+    from weixin_lite import daily_search
+
+    seen = {}
+
+    def fake_run(journals, limit=100, sources=None, since_days=7, openalex_api_key=""):
+        return SearchRun(
+            run_id="test",
+            keywords=[],
+            started_at="start",
+            records=[PaperInput(title_en="Needs translation")],
+        )
+
+    class FakeReport:
+        errors: list[str] = []
+
+    def fake_translate(records, **kwargs):
+        seen["records"] = records
+        seen["cache_path"] = kwargs.get("cache_path")
+        seen["batch_size"] = kwargs.get("batch_size")
+        records[0].title_zh = "中文"
+        return FakeReport()
+
+    cache_path = tmp_path / "cache.json"
+    output = tmp_path / "latest.json"
+    monkeypatch.setattr(daily_search, "load_journal_filters", lambda path: [JournalFilter(name="Nature")])
+    monkeypatch.setattr(daily_search, "run_journal_latest_search", fake_run)
+    monkeypatch.setattr(daily_search, "translate_records", fake_translate)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "daily_search",
+            "--translate",
+            "--translation-cache",
+            str(cache_path),
+            "--batch-size",
+            "6",
+            "--output",
+            str(output),
+        ],
+    )
+
+    daily_search.main()
+
+    data = json.loads(output.read_text(encoding="utf-8"))
+    assert seen["cache_path"] == str(cache_path)
+    assert seen["batch_size"] == 6
+    assert data["records"][0]["title_zh"] == "中文"

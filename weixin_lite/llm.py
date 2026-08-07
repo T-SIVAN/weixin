@@ -3,13 +3,27 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 
 class LLMError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after: float | None = None,
+        transient: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+        self.transient = transient
 
 
 @dataclass(frozen=True)
@@ -91,12 +105,67 @@ def call_openai_compatible(
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
             body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        retry_after = _parse_retry_after(exc.headers.get("Retry-After") if exc.headers else None)
+        detail = _read_http_error_detail(exc)
+        transient = exc.code == 429 or exc.code >= 500
+        message = f"LLM HTTP {exc.code} {exc.reason}: {detail}".strip()
+        raise LLMError(message, status_code=exc.code, retry_after=retry_after, transient=transient) from exc
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        transient = isinstance(reason, (TimeoutError, socket.timeout)) or "timed out" in str(reason).lower()
+        raise LLMError(f"LLM network error: {reason}", transient=transient) from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise LLMError(f"LLM request timed out after {timeout}s", transient=True) from exc
+    except json.JSONDecodeError as exc:
+        raise LLMError(f"LLM returned invalid JSON response: {exc}") from exc
     except Exception as exc:
         raise LLMError(f"LLM request failed: {exc}") from exc
     try:
         return body["choices"][0]["message"]["content"].strip()
     except (KeyError, IndexError, TypeError) as exc:
         raise LLMError(f"Unexpected LLM response: {body}") from exc
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    from datetime import datetime, timezone
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
+
+
+def _read_http_error_detail(exc: urllib.error.HTTPError) -> str:
+    try:
+        raw = exc.read().decode("utf-8", errors="replace")
+    except Exception:
+        raw = ""
+    if not raw:
+        return "no response body"
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw[:500]
+    if isinstance(data, dict):
+        error = data.get("error")
+        if isinstance(error, dict):
+            return str(error.get("message") or error)
+        if error:
+            return str(error)
+        if data.get("message"):
+            return str(data["message"])
+    return raw[:500]
 
 
 def test_llm_connection(api_key: str, base_url: str, model: str) -> str:

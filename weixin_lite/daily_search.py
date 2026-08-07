@@ -7,7 +7,7 @@ from pathlib import Path
 from .llm import default_api_key, default_base_url, default_model, default_provider
 from .models import SearchRun
 from .search import DEFAULT_KEYWORDS, load_journal_filters, resolve_keyword_plan, run_journal_latest_search, run_keyword_search
-from .translate import translate_records
+from .translate import DEFAULT_CACHE_PATH, translate_records
 
 
 def load_keywords(config_path: Path) -> list[str]:
@@ -36,6 +36,10 @@ def main() -> None:
     parser.add_argument("--provider", default=default_provider())
     parser.add_argument("--base-url", default="")
     parser.add_argument("--model", default="")
+    parser.add_argument("--translate", action="store_true", help="Translate titles after search. Default is search only.")
+    parser.add_argument("--translation-cache", default=str(DEFAULT_CACHE_PATH))
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--delay-seconds", type=float, default=1.0)
     args = parser.parse_args()
 
     since_days = args.since_years * 365 if args.since_years else args.since_days
@@ -66,8 +70,17 @@ def main() -> None:
             since_days=since_days,
             openalex_api_key=args.openalex_api_key,
         )
-    if run.records:
-        report = translate_records(run.records, api_key=default_api_key(), base_url=base_url, model=model, provider=args.provider)
+    if args.translate and run.records:
+        report = translate_records(
+            run.records,
+            api_key=default_api_key(),
+            base_url=base_url,
+            model=model,
+            provider=args.provider,
+            cache_path=args.translation_cache,
+            batch_size=args.batch_size,
+            delay_seconds=args.delay_seconds,
+        )
         if report.errors:
             run.errors["translation"] = "; ".join(report.errors)
     output = Path(args.output)

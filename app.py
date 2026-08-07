@@ -46,7 +46,7 @@ from weixin_lite.search import (
     resolve_keyword_plan,
     run_journal_latest_search,
 )
-from weixin_lite.translate import translate_records
+from weixin_lite.translate import DEFAULT_CACHE_PATH, TranslationReport, translate_records
 from weixin_lite.wechat_publish import WechatDraftConfig, export_wechat_payload, publish_draft
 
 
@@ -54,6 +54,7 @@ st.set_page_config(page_title="微信文献快读工具", page_icon="🧬", layo
 
 
 LATEST_PATH = Path("data/latest_papers.json")
+TRANSLATION_CACHE_PATH = DEFAULT_CACHE_PATH
 
 
 def init_state() -> None:
@@ -65,6 +66,7 @@ def init_state() -> None:
     st.session_state.setdefault("keywords", ", ".join(DEFAULT_KEYWORDS))
     st.session_state.setdefault("query_plan", None)
     st.session_state.setdefault("search_append", False)
+    st.session_state.setdefault("last_translation_report", None)
 
 
 def paper_key(paper: PaperInput) -> str:
@@ -99,9 +101,13 @@ def merge_papers(existing: list[PaperInput], incoming: list[PaperInput]) -> list
             "pdf_name",
             "oa_source",
             "download_error",
+            "article_type",
+            "translation_status",
         ):
             if not getattr(old, field) and getattr(item, field):
                 setattr(old, field, getattr(item, field))
+        if item.journal_priority < old.journal_priority:
+            old.journal_priority = item.journal_priority
         if item.is_open_access:
             old.is_open_access = True
             old.access_status = "open"
@@ -117,6 +123,26 @@ def load_latest_run() -> SearchRun | None:
         return SearchRun.from_dict(json.loads(LATEST_PATH.read_text(encoding="utf-8")))
     except Exception:
         return None
+
+
+def save_latest_translation_state(papers: list[PaperInput]) -> None:
+    latest = load_latest_run()
+    if not latest or not latest.records:
+        return
+    by_key = {paper_key(paper): paper for paper in papers if paper_key(paper)}
+    changed = False
+    for record in latest.records:
+        source = by_key.get(paper_key(record))
+        if not source:
+            continue
+        for field in ("title_zh", "translation_status"):
+            value = getattr(source, field)
+            if value and value != getattr(record, field):
+                setattr(record, field, value)
+                changed = True
+    if changed:
+        LATEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        LATEST_PATH.write_text(json.dumps(latest.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def infer_paper_from_pdf(name: str, pdf: PdfContent) -> PaperInput:
@@ -168,8 +194,11 @@ def paper_rows(papers: list[PaperInput]) -> list[dict[str, str]]:
             {
                 "#": str(idx),
                 "标题": bilingual_title(paper),
+                "翻译状态": paper_translation_status(paper),
                 "期刊": paper.journal,
                 "发表日期": paper.publication_date or paper.year,
+                "文章类型": paper.article_type or "未知",
+                "期刊优先级": str(paper.journal_priority or ""),
                 "DOI": paper.doi,
                 "全文状态": paper.access_status,
                 "PDF": paper.pdf_name,
@@ -177,6 +206,136 @@ def paper_rows(papers: list[PaperInput]) -> list[dict[str, str]]:
             }
         )
     return rows
+
+
+def paper_translation_status(paper: PaperInput) -> str:
+    labels = {
+        "translated": "已翻译",
+        "cached": "缓存命中",
+        "failed": "失败",
+        "pending": "待翻译",
+        "skipped": "跳过",
+    }
+    if paper.translation_status in labels:
+        return labels[paper.translation_status]
+    if paper.title_zh.strip() and is_distinct_text(paper.title_zh, paper.title_en or paper.title):
+        return "已翻译"
+    return "待翻译"
+
+
+def multiselect_default(key: str, options: list[str]) -> list[str]:
+    current = st.session_state.get(key)
+    if isinstance(current, tuple):
+        current = list(current)
+    if isinstance(current, list):
+        valid = [item for item in current if item in options]
+        if len(valid) != len(current):
+            st.session_state[key] = valid or list(options)
+            return st.session_state[key]
+        return valid
+    if current is not None:
+        st.session_state[key] = list(options)
+    return list(options)
+
+
+def show_paper_table(papers: list[PaperInput], key: str, *, filters: bool = True) -> None:
+    visible = list(papers)
+    if filters and papers:
+        status_options = sorted({paper_translation_status(paper) for paper in papers})
+        source_options = sorted({paper.source for paper in papers if paper.source})
+        oa_options = sorted({paper.access_status for paper in papers if paper.access_status})
+        status_key = f"{key}_status"
+        source_key = f"{key}_source"
+        oa_key = f"{key}_oa"
+        col_a, col_b, col_c = st.columns(3)
+        selected_status = col_a.multiselect(
+            "翻译状态",
+            status_options,
+            default=multiselect_default(status_key, status_options),
+            key=status_key,
+        )
+        selected_sources = col_b.multiselect(
+            "来源",
+            source_options,
+            default=multiselect_default(source_key, source_options),
+            key=source_key,
+        )
+        selected_oa = col_c.multiselect(
+            "OA/全文状态",
+            oa_options,
+            default=multiselect_default(oa_key, oa_options),
+            key=oa_key,
+        )
+        visible = [
+            paper
+            for paper in papers
+            if paper_translation_status(paper) in selected_status
+            and (not source_options or paper.source in selected_sources)
+            and (not oa_options or paper.access_status in selected_oa)
+        ]
+    st.dataframe(paper_rows(visible), use_container_width=True, hide_index=True)
+
+
+def show_translation_report(report: TranslationReport) -> None:
+    col_a, col_b, col_c, col_d, col_e = st.columns(5)
+    col_a.metric("新翻译", report.translated_count)
+    col_b.metric("缓存命中", report.cached_count)
+    col_c.metric("待翻译", report.pending_count)
+    col_d.metric("失败", report.failed_count)
+    col_e.metric("跳过", report.skipped_count)
+    if report.pending_count:
+        st.info("未配置 API Key 或本次未调用模型，英文标题已保留，可稍后配置模型后重试。")
+    if report.errors:
+        st.warning("翻译未完全成功：" + "; ".join(dict.fromkeys(report.errors[:5])))
+        if any("429" in item or "Too Many Requests" in item for item in report.errors):
+            st.info("429 表示模型供应商限流或额度不足。工具已自动退避重试；仍失败时可降低批量、调大间隔或稍后重试失败项。")
+
+
+def translate_current_papers(
+    papers: list[PaperInput],
+    *,
+    provider: str,
+    api_key: str,
+    base_url: str,
+    model: str,
+    batch_size: int,
+    delay_seconds: float,
+    retry_failed_only: bool = False,
+) -> TranslationReport:
+    progress = st.progress(0)
+    status = st.empty()
+
+    def progress_callback(event: dict[str, object]) -> None:
+        total = int(event.get("total") or 0)
+        completed = int(event.get("completed") or 0)
+        if total:
+            progress.progress(min(1.0, completed / total))
+        report = event.get("report")
+        if isinstance(report, TranslationReport):
+            status.write(
+                f"翻译进度：{completed}/{total}；新翻译 {report.translated_count}，"
+                f"缓存 {report.cached_count}，失败 {report.failed_count}，待翻译 {report.pending_count}"
+            )
+
+    report = translate_records(
+        papers,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        provider=provider,
+        batch_size=batch_size,
+        delay_seconds=delay_seconds,
+        cache_path=TRANSLATION_CACHE_PATH,
+        progress_callback=progress_callback,
+        retry_failed_only=retry_failed_only,
+    )
+    progress.progress(1.0)
+    status.write(
+        f"翻译完成：新翻译 {report.translated_count}，缓存 {report.cached_count}，"
+        f"失败 {report.failed_count}，待翻译 {report.pending_count}"
+    )
+    save_latest_translation_state(papers)
+    return report
 
 
 def show_details(papers: list[PaperInput], title: str = "查看摘要和错误") -> None:
@@ -249,9 +408,10 @@ def show_search_run_diagnostics(run: SearchRun, *, wrapped: bool = True) -> None
                 f"{item.original} -> {', '.join(item.english_terms or [item.original])}"
                 for item in run.query_plan.keywords
             ))
+        kept_label = "保留结果" if run.search_kind == "journal_latest" else "相关结果"
         col_a, col_b, col_c = st.columns(3)
         col_a.metric("抓取数", run.raw_count)
-        col_b.metric("相关结果", run.filtered_count)
+        col_b.metric(kept_label, run.filtered_count)
         col_c.metric("来源数", len(run.source_counts))
         if run.source_counts:
             st.dataframe(
@@ -260,7 +420,7 @@ def show_search_run_diagnostics(run: SearchRun, *, wrapped: bool = True) -> None
                         "来源": source,
                         "抓取": counts.get("fetched", 0),
                         "去重": counts.get("deduplicated", 0),
-                        "相关": counts.get("relevant", 0),
+                        kept_label: counts.get("relevant", 0),
                     }
                     for source, counts in run.source_counts.items()
                 ],
@@ -356,9 +516,9 @@ def sidebar_settings() -> tuple[str, str, str, str, int, float]:
     api_key = st.sidebar.text_input("API Key", value=default_api_key(), type="password")
     base_url = st.sidebar.text_input("Base URL", value=default_base_url(provider) or defaults.base_url)
     model = st.sidebar.text_input("Model", value=default_model(provider) or defaults.default_model)
-    batch_size = st.sidebar.slider("翻译批量", 1, 8, 3)
-    delay_seconds = st.sidebar.slider("翻译间隔（秒）", 0.0, 10.0, 1.5, step=0.5)
-    st.sidebar.caption("支持 OpenAI-compatible 接口。遇到 429 时请调小批量、调大间隔，或换额度更高的供应商。")
+    batch_size = st.sidebar.slider("翻译批量", 1, 20, 8)
+    delay_seconds = st.sidebar.slider("翻译间隔（秒）", 0.0, 10.0, 1.0, step=0.5)
+    st.sidebar.caption("支持 OpenAI-compatible 接口。标题翻译会优先使用本地缓存；遇到 429 会自动退避重试。")
     if st.sidebar.button("测试翻译模型"):
         try:
             raw = test_llm_connection(api_key=api_key, base_url=base_url, model=model)
@@ -381,13 +541,13 @@ def status_bar() -> None:
 
 
 def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_size: int, delay_seconds: float) -> None:
-    st.subheader("每日顶刊最新文章检索与标题翻译")
+    st.subheader("每日顶刊最新文章检索")
     latest = load_latest_run()
     if latest and latest.records:
         with st.expander(f"每日历史结果：{latest.finished_at or latest.started_at}"):
             label = "期刊：" if latest.search_kind == "journal_latest" else "关键词："
             st.caption(label + ", ".join(latest.keywords[:12]) + (" ..." if len(latest.keywords) > 12 else ""))
-            st.dataframe(paper_rows(latest.records), use_container_width=True, hide_index=True)
+            show_paper_table(latest.records, "latest_history", filters=True)
             show_search_run_diagnostics(latest, wrapped=False)
             if st.button("加入每日结果"):
                 st.session_state.papers = merge_papers(st.session_state.papers, latest.records)
@@ -431,8 +591,8 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
     enabled_count = len([journal for journal in journals if journal.enabled])
     st.caption(f"已启用 {enabled_count} 本期刊；默认抓取最近 {since_days} 天，按期刊优先级和发表日期排序。")
 
-    if st.button("抓取最新文章并翻译标题", type="primary"):
-        with st.spinner("正在按期刊检索 PubMed、Europe PMC、OpenAlex、Crossref，并翻译标题..."):
+    if st.button("抓取最新文章", type="primary"):
+        with st.spinner("正在按期刊检索 PubMed、Europe PMC、OpenAlex、Crossref..."):
             run = run_journal_latest_search(
                 journals,
                 limit=limit,
@@ -440,38 +600,50 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
                 since_days=since_days,
                 openalex_api_key=openalex_api_key,
             )
-            report = None
-            if run.records:
-                report = translate_records(
-                    run.records,
-                    api_key=api_key,
-                    base_url=base_url,
-                    model=model,
-                    provider=provider,
-                    batch_size=batch_size,
-                    delay_seconds=delay_seconds,
-                )
         st.session_state.papers = merge_papers(st.session_state.papers, run.records) if append_results else list(run.records)
         if run.errors:
             st.warning("部分检索源失败：" + "; ".join(f"{k}: {v}" for k, v in run.errors.items()))
         if run.warnings:
             st.info("；".join(run.warnings))
-        if report and report.errors:
-            st.warning("翻译未完全成功：" + "; ".join(report.errors))
-            if any("429" in item or "Too Many Requests" in item for item in report.errors):
-                st.info("429 是模型供应商限流/额度问题。建议把侧边栏“翻译批量”调为 1，把“翻译间隔”调到 5-10 秒，或切换 DeepSeek/SiliconFlow/custom。")
-        elif report:
-            st.success(f"已翻译 {report.translated_count} 条标题。")
+        if run.records:
+            st.success(f"已抓取 {len(run.records)} 条文章。可继续点击下方按钮翻译标题。")
         else:
-            st.info("本次没有符合条件的最新文章，已跳过标题翻译。")
-        st.dataframe(paper_rows(run.records), use_container_width=True, hide_index=True)
+            st.info("本次没有符合条件的最新文章。")
+        show_paper_table(run.records, "last_search", filters=True)
         show_search_run_diagnostics(run)
         show_details(run.records, "查看本次检索详情")
 
     papers: list[PaperInput] = st.session_state.papers
     if papers:
         st.divider()
-        st.dataframe(paper_rows(papers), use_container_width=True, hide_index=True)
+        col_translate, col_retry = st.columns(2)
+        if col_translate.button("翻译全部未翻译标题"):
+            report = translate_current_papers(
+                papers,
+                provider=provider,
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                batch_size=batch_size,
+                delay_seconds=delay_seconds,
+            )
+            st.session_state.last_translation_report = report
+        if col_retry.button("重试失败翻译"):
+            report = translate_current_papers(
+                papers,
+                provider=provider,
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                batch_size=batch_size,
+                delay_seconds=delay_seconds,
+                retry_failed_only=True,
+            )
+            st.session_state.last_translation_report = report
+        last_report = st.session_state.get("last_translation_report")
+        if isinstance(last_report, TranslationReport):
+            show_translation_report(last_report)
+        show_paper_table(papers, "current_candidates", filters=True)
         show_details(papers, "查看候选摘要和错误")
 
 

@@ -35,6 +35,7 @@ class PaperInput:
     abstract_zh: str = ""
     keywords: list[str] = field(default_factory=list)
     discovered_at: str = ""
+    translation_status: str = ""
     is_open_access: bool = False
     access_status: AccessStatus = "unknown"
     oa_source: str = ""

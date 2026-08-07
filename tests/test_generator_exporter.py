@@ -5,7 +5,7 @@ from io import BytesIO
 from weixin_lite.downloader import download_open_access
 from weixin_lite.exporter import project_zip, unavailable_dois_csv
 from weixin_lite.generator import generate_article
-from weixin_lite.llm import default_base_url, default_model
+from weixin_lite.llm import _parse_retry_after, default_base_url, default_model
 from weixin_lite.models import BatchProject, FigureAnalysis, PaperInput, generation_ready_papers, unavailable_papers
 from weixin_lite.pdf_reader import PdfContent, extract_figure_legends, extract_numeric_evidence
 from weixin_lite.search import (
@@ -18,6 +18,7 @@ from weixin_lite.search import (
     relevance_score,
     year_from,
 )
+from weixin_lite.llm import LLMError
 from weixin_lite.translate import translate_records
 from weixin_lite.wechat_publish import WechatDraftConfig, publish_draft
 
@@ -98,17 +99,19 @@ def test_crossref_publication_date_prefers_published_fields():
     assert crossref_year(item) == "2025"
 
 
-def test_translation_fallback_only_marks_title():
+def test_translation_without_key_marks_pending():
     paper = PaperInput(title_en="A test title", abstract_en="A test abstract.")
 
     report = translate_records([paper])
 
-    assert "待翻译标题" in paper.title_zh
+    assert paper.title_zh == ""
+    assert paper.translation_status == "pending"
     assert paper.abstract_zh == ""
+    assert report.pending_count == 1
     assert report.errors
 
 
-def test_translation_populates_title_only(monkeypatch):
+def test_translation_populates_title_only(monkeypatch, tmp_path):
     seen_payloads: list[str] = []
 
     def fake_call(**kwargs):
@@ -118,10 +121,11 @@ def test_translation_populates_title_only(monkeypatch):
     monkeypatch.setattr("weixin_lite.translate.call_openai_compatible", fake_call)
     paper = PaperInput(title_en="English title", abstract_en="English abstract.")
 
-    report = translate_records([paper], api_key="test-key", batch_size=1, delay_seconds=0)
+    report = translate_records([paper], api_key="test-key", batch_size=1, delay_seconds=0, cache_path=tmp_path / "cache.json")
 
     assert report.translated_count == 1
     assert paper.title_zh == "中文标题"
+    assert paper.translation_status == "translated"
     assert paper.abstract_zh == ""
     assert "abstract_en" not in seen_payloads[0]
 
@@ -137,6 +141,149 @@ def test_translation_empty_records_does_not_call_llm(monkeypatch):
     assert report.ok
     assert report.records == []
     assert report.translated_count == 0
+
+
+def test_translation_uses_cache_without_calling_llm(monkeypatch, tmp_path):
+    cache_path = tmp_path / "translation_cache.json"
+    cache_path.write_text(
+        json.dumps(
+            {
+                "doi:10.1000/cache": {
+                    "title_en": "Cached title",
+                    "title_zh": "缓存标题",
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_call(**kwargs):
+        raise AssertionError("LLM should not be called for cached records")
+
+    monkeypatch.setattr("weixin_lite.translate.call_openai_compatible", fake_call)
+    paper = PaperInput(title_en="Cached title", doi="10.1000/cache")
+
+    report = translate_records([paper], api_key="test-key", cache_path=cache_path)
+
+    assert paper.title_zh == "缓存标题"
+    assert paper.translation_status == "cached"
+    assert report.cached_count == 1
+
+
+def test_translation_existing_title_normalizes_failed_status(monkeypatch, tmp_path):
+    def fake_call(**kwargs):
+        raise AssertionError("LLM should not be called for already translated records")
+
+    monkeypatch.setattr("weixin_lite.translate.call_openai_compatible", fake_call)
+    paper = PaperInput(title_en="English title", title_zh="中文标题", translation_status="failed")
+
+    report = translate_records([paper], api_key="test-key", cache_path=tmp_path / "cache.json")
+
+    assert paper.translation_status == "translated"
+    assert report.skipped_count == 1
+
+
+def test_translation_cache_save_merges_existing_entries(monkeypatch, tmp_path):
+    cache_path = tmp_path / "translation_cache.json"
+    cache_path.write_text(
+        json.dumps({"doi:10.1000/old": {"title_zh": "旧缓存"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "weixin_lite.translate.call_openai_compatible",
+        lambda **kwargs: '[{"title_zh": "新标题"}]',
+    )
+    paper = PaperInput(title_en="New title", doi="10.1000/new")
+
+    report = translate_records([paper], api_key="test-key", cache_path=cache_path, delay_seconds=0)
+    data = json.loads(cache_path.read_text(encoding="utf-8"))
+
+    assert report.translated_count == 1
+    assert data["doi:10.1000/old"]["title_zh"] == "旧缓存"
+    assert data["doi:10.1000/new"]["title_zh"] == "新标题"
+
+
+def test_translation_cache_save_failure_does_not_discard_translation(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "weixin_lite.translate.call_openai_compatible",
+        lambda **kwargs: '[{"title_zh": "中文标题"}]',
+    )
+
+    def fail_save(*args, **kwargs):
+        raise OSError("disk is busy")
+
+    monkeypatch.setattr("weixin_lite.translate.save_translation_cache", fail_save)
+    paper = PaperInput(title_en="English title")
+
+    report = translate_records([paper], api_key="test-key", cache_path=tmp_path / "cache.json", delay_seconds=0)
+
+    assert paper.title_zh == "中文标题"
+    assert report.translated_count == 1
+    assert any("Translation cache save failed" in error for error in report.errors)
+
+
+def test_translation_retries_429(monkeypatch, tmp_path):
+    calls = {"count": 0}
+    monkeypatch.setattr("weixin_lite.translate.time.sleep", lambda seconds: None)
+
+    def fake_call(**kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise LLMError("rate limited", status_code=429, retry_after=0, transient=True)
+        return '[{"title_zh": "重试后成功"}]'
+
+    monkeypatch.setattr("weixin_lite.translate.call_openai_compatible", fake_call)
+    paper = PaperInput(title_en="Retry title")
+
+    report = translate_records([paper], api_key="test-key", delay_seconds=0, cache_path=tmp_path / "cache.json")
+
+    assert calls["count"] == 2
+    assert paper.title_zh == "重试后成功"
+    assert report.translated_count == 1
+
+
+def test_translation_splits_failed_batch(monkeypatch, tmp_path):
+    seen_batch_sizes: list[int] = []
+
+    def fake_call(**kwargs):
+        payload = json.loads(kwargs["user_prompt"])
+        seen_batch_sizes.append(len(payload))
+        if len(payload) > 1:
+            raise LLMError("server overloaded", status_code=500, transient=True)
+        return '[{"title_zh": "单篇成功"}]'
+
+    monkeypatch.setattr("weixin_lite.translate.call_openai_compatible", fake_call)
+    papers = [PaperInput(title_en="First"), PaperInput(title_en="Second")]
+
+    report = translate_records(papers, api_key="test-key", batch_size=2, delay_seconds=0, max_retries=0, cache_path=tmp_path / "cache.json")
+
+    assert seen_batch_sizes == [2, 1, 1]
+    assert [paper.title_zh for paper in papers] == ["单篇成功", "单篇成功"]
+    assert report.failed_count == 0
+
+
+def test_translation_mismatched_json_marks_missing_failed(monkeypatch, tmp_path):
+    def fake_call(**kwargs):
+        return '[{"title_zh": "第一篇"}]'
+
+    monkeypatch.setattr("weixin_lite.translate.call_openai_compatible", fake_call)
+    papers = [PaperInput(title_en="First"), PaperInput(title_en="Second")]
+
+    report = translate_records(papers, api_key="test-key", batch_size=2, delay_seconds=0, cache_path=tmp_path / "cache.json")
+
+    assert papers[0].title_zh == "第一篇"
+    assert papers[0].translation_status == "translated"
+    assert papers[1].title_zh == ""
+    assert papers[1].translation_status == "failed"
+    assert report.translated_count == 1
+    assert report.failed_count == 1
+    assert report.failed_items
+
+
+def test_retry_after_naive_http_date_does_not_raise():
+    assert _parse_retry_after("Wed, 21 Oct 2015 07:28:00") == 0
 
 
 def test_provider_defaults_are_configured():
