@@ -7,7 +7,7 @@ from pathlib import Path
 from .exporter import project_zip
 from .generator import generate_article
 from .llm import default_api_key, default_base_url, default_model, default_provider
-from .models import BatchProject, DownloadedPaper, PaperInput, SearchRun, generation_ready_papers, unavailable_papers
+from .models import BatchProject, DownloadedPaper, PaperInput, SearchRun, generation_candidate_papers, unavailable_papers
 
 
 def load_papers(path: Path) -> tuple[str, list[PaperInput]]:
@@ -34,8 +34,9 @@ def main() -> None:
     base_url = args.base_url or default_base_url(args.provider)
     model = args.model or default_model(args.provider)
     pdfs: dict[str, object] = {}
-    selected = generation_ready_papers(papers, pdfs)[: max(1, min(args.limit, 20))]
-    skipped = unavailable_papers(papers, pdfs)
+    selected = generation_candidate_papers(papers, pdfs)[: max(1, min(args.limit, 20))]
+    selected_keys = {paper.paper_key for paper in selected}
+    skipped = [paper for paper in unavailable_papers(papers, pdfs) if paper.paper_key not in selected_keys]
     articles = [
         generate_article(paper, api_key=default_api_key(), base_url=base_url, model=model)
         for paper in selected

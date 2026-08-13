@@ -32,7 +32,7 @@ from weixin_lite.models import (
     ResolvedKeyword,
     SearchQueryPlan,
     SearchRun,
-    generation_ready_papers,
+    generation_candidate_papers,
     unavailable_papers,
 )
 from weixin_lite.pdf_reader import PdfContent, parse_pdf
@@ -221,6 +221,20 @@ def paper_translation_status(paper: PaperInput) -> str:
     if paper.title_zh.strip() and is_distinct_text(paper.title_zh, paper.title_en or paper.title):
         return "已翻译"
     return "待翻译"
+
+
+def generation_source_label(paper: PaperInput, pdfs: dict[str, PdfContent], manual_text: str = "") -> str:
+    has_pdf = bool(paper.pdf_name and paper.pdf_name in pdfs)
+    has_manual = bool(manual_text.strip())
+    if has_pdf and has_manual:
+        return "混合来源"
+    if has_pdf:
+        return "全文 PDF"
+    if has_manual and paper.source != "manual text":
+        return "混合来源"
+    if has_manual:
+        return "手动文本"
+    return "摘要/题录"
 
 
 def multiselect_default(key: str, options: list[str]) -> list[str]:
@@ -531,13 +545,13 @@ def sidebar_settings() -> tuple[str, str, str, str, int, float]:
 def status_bar() -> None:
     papers: list[PaperInput] = st.session_state.papers
     pdfs: dict[str, PdfContent] = st.session_state.pdfs
-    ready = generation_ready_papers(papers, pdfs)
+    candidates = generation_candidate_papers(papers, pdfs)
     unavailable = unavailable_papers(papers, pdfs)
     col_a, col_b, col_c, col_d = st.columns(4)
     col_a.metric("候选文献", len(papers))
     col_b.metric("已解析全文", len(pdfs))
-    col_c.metric("可生成", len(ready))
-    col_d.metric("未下载 DOI", len(unavailable))
+    col_c.metric("可生成", len(candidates))
+    col_d.metric("待全文增强", len(unavailable))
 
 
 def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_size: int, delay_seconds: float) -> None:
@@ -648,7 +662,7 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
 
 
 def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
-    st.subheader("全文与生成")
+    st.subheader("内容与生成")
     papers: list[PaperInput] = st.session_state.papers
     pdfs: dict[str, PdfContent] = st.session_state.pdfs
 
@@ -677,11 +691,11 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
                     paper.download_error = downloaded.error or "未下载到 PDF 全文。"
                 progress.progress(idx / len(papers), text=f"已处理 {idx}/{len(papers)}")
             st.session_state.downloads = downloads
-            st.success("开放全文下载和解析完成。未成功解析的论文只会进入 DOI CSV。")
+            st.success("开放全文下载和解析完成。未成功解析的文章仍可基于题录、摘要或手动材料生成。")
     else:
-        st.info("先检索文献、粘贴 DOI，或直接上传 PDF。")
+        st.info("可以先检索文章、粘贴 DOI/标题、上传 PDF，或直接粘贴正文材料生成。")
 
-    uploaded = st.file_uploader("上传 PDF", type=["pdf"], accept_multiple_files=True)
+    uploaded = st.file_uploader("上传 PDF（可选，用于增强全文和图注证据）", type=["pdf"], accept_multiple_files=True)
     if uploaded and st.button("解析上传 PDF"):
         parsed_papers: list[PaperInput] = []
         progress = st.progress(0)
@@ -695,6 +709,11 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
         st.success(f"已解析 {len(parsed_papers)} 个 PDF。")
 
     manual = st.text_area("手动粘贴 DOI / PMID / 标题（每行一篇，可选）", height=90)
+    manual_content = st.text_area(
+        "粘贴文章内容 / 摘要 / 正文（可选）",
+        height=180,
+        help="可作为选中文章的补充材料；如果没有候选文章，会自动创建一条手动文章用于生成。",
+    )
     col_d, col_e = st.columns([1, 3])
     if col_d.button("解析手动列表"):
         records = parse_manual_inputs(manual)
@@ -718,25 +737,55 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
         st.info("已清空当前批次。")
 
     st.divider()
-    ready = generation_ready_papers(st.session_state.papers, st.session_state.pdfs)
+    candidates = generation_candidate_papers(st.session_state.papers, st.session_state.pdfs)
     unavailable = unavailable_papers(st.session_state.papers, st.session_state.pdfs)
     if unavailable:
-        st.warning(f"{len(unavailable)} 篇未下载或未解析到全文，已排除生成，只进入 DOI CSV。")
+        st.info(f"{len(unavailable)} 篇当前没有可解析 PDF，可继续作为摘要/题录稿生成，也可导出 DOI 状态后补全文。")
         st.dataframe(paper_rows(unavailable), use_container_width=True, hide_index=True)
-    if not ready:
-        st.info("暂无可生成论文。需要先下载并解析开放 PDF，或上传 PDF。")
+
+    if not candidates and manual_content.strip():
+        manual_paper = PaperInput(
+            title="手动粘贴文章",
+            title_en="Manual pasted article",
+            abstract=manual_content[:1000],
+            abstract_en=manual_content[:1000],
+            source="manual text",
+            access_status="unknown",
+        )
+        candidates = [manual_paper]
+
+    if not candidates:
+        st.info("暂无可生成内容。请检索文章、粘贴 DOI/标题、上传 PDF，或在上方粘贴文章内容。")
         return
 
-    labels = [f"{idx}. {paper.display_title[:90]}" for idx, paper in enumerate(ready, start=1)]
-    selected = st.multiselect("选择生成论文", labels, default=labels[: min(10, len(labels))])
-    target_chars = st.slider("目标字数", 700, 1400, 1200, step=50)
+    source_rows = [
+        {
+            "#": str(idx),
+            "标题": paper.display_title,
+            "内容来源": generation_source_label(paper, st.session_state.pdfs, manual_content),
+            "全文状态": paper.access_status,
+            "PDF": paper.pdf_name,
+            "DOI": paper.doi,
+        }
+        for idx, paper in enumerate(candidates, start=1)
+    ]
+    st.dataframe(source_rows, use_container_width=True, hide_index=True)
+
+    labels = [
+        f"{idx}. {generation_source_label(paper, st.session_state.pdfs, manual_content)} | {paper.display_title[:80]}"
+        for idx, paper in enumerate(candidates, start=1)
+    ]
+    selected = st.multiselect("选择生成文章", labels, default=labels[: min(10, len(labels))])
+    target_chars = st.slider("目标字数", 500, 1500, 1200, step=50)
+    if not api_key.strip():
+        st.warning("未填写 LLM API Key 时只能生成通用占位级模板稿；配置模型后可生成真正的深度解读。")
     if st.button("生成公众号稿", type="primary"):
         chosen_indexes = [labels.index(label) for label in selected]
         generated: list[QuickReadArticle] = []
         progress = st.progress(0)
         for run_idx, paper_idx in enumerate(chosen_indexes, start=1):
-            paper = ready[paper_idx]
-            pdf = st.session_state.pdfs[paper.pdf_name]
+            paper = candidates[paper_idx]
+            pdf = st.session_state.pdfs.get(paper.pdf_name) if paper.pdf_name else None
             generated.append(
                 generate_article(
                     paper=paper,
@@ -745,6 +794,7 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
                     base_url=base_url,
                     model=model,
                     target_chars=target_chars,
+                    source_text=manual_content if manual_content.strip() else "",
                 )
             )
             progress.progress(run_idx / len(chosen_indexes), text=f"已生成 {run_idx}/{len(chosen_indexes)}")
@@ -796,7 +846,7 @@ def export_and_publish_tab() -> None:
 
     if unavailable:
         st.download_button(
-            "下载未生成 DOI CSV",
+            "下载待全文增强 DOI CSV",
             unavailable_dois_csv(unavailable).encode("utf-8-sig"),
             file_name="unavailable_dois.csv",
             mime="text/csv",
@@ -874,10 +924,10 @@ def main() -> None:
     init_state()
     provider, api_key, base_url, model, batch_size, delay_seconds = sidebar_settings()
     st.title("微信文献快读工具")
-    st.caption("检索文献、解析开放全文或上传 PDF，再生成中文公众号稿。未下载到全文的论文只导出 DOI CSV。")
+    st.caption("检索文献、粘贴任意文章内容、解析开放全文或上传 PDF，再生成中文公众号稿。PDF 是增强材料，不是生成前提。")
     status_bar()
 
-    tab_search, tab_generate, tab_export = st.tabs(["检索与翻译", "全文与生成", "导出与发布"])
+    tab_search, tab_generate, tab_export = st.tabs(["检索与翻译", "内容与生成", "导出与发布"])
     with tab_search:
         search_tab(provider, api_key, base_url, model, batch_size, delay_seconds)
     with tab_generate:

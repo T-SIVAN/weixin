@@ -2,11 +2,12 @@ import json
 import zipfile
 from io import BytesIO
 
+from weixin_lite import batch_analyze
 from weixin_lite.downloader import download_open_access
 from weixin_lite.exporter import project_zip, unavailable_dois_csv
-from weixin_lite.generator import generate_article
+from weixin_lite.generator import build_prompt, generate_article
 from weixin_lite.llm import _parse_retry_after, default_base_url, default_model
-from weixin_lite.models import BatchProject, FigureAnalysis, PaperInput, generation_ready_papers, unavailable_papers
+from weixin_lite.models import BatchProject, FigureAnalysis, PaperInput, generation_candidate_papers, generation_ready_papers, unavailable_papers
 from weixin_lite.pdf_reader import PdfContent, extract_figure_legends, extract_numeric_evidence
 from weixin_lite.search import (
     build_plain_search_queries,
@@ -338,7 +339,7 @@ def test_article_places_screenshot_before_short_note():
     article = generate_article(paper, pdf=pdf)
 
     image_pos = article.body_markdown.find("![Fig. 3](images/paper-page-3.png)")
-    note_pos = article.body_markdown.find("**Fig. 3：原文关键结果截图**")
+    note_pos = article.body_markdown.find("**Fig. 3：原文关键信息截图**")
     assert image_pos >= 0
     assert note_pos > image_pos
 
@@ -375,6 +376,72 @@ def test_generation_ready_requires_open_status_and_parsed_pdf():
 
     assert generation_ready_papers([ready, no_pdf, failed], pdfs) == [ready]
     assert [paper.doi for paper in unavailable_papers([ready, no_pdf, failed], pdfs)] == ["10.1000/nopdf", "10.1000/failed"]
+
+
+def test_generation_candidates_include_metadata_without_pdf():
+    ready = PaperInput(title_en="Ready", doi="10.1000/ready", access_status="open", pdf_name="ready.pdf")
+    no_pdf = PaperInput(title_en="No PDF", abstract_en="Metadata is enough.", doi="10.1000/nopdf", access_status="open")
+    failed = PaperInput(title_en="Failed", doi="10.1000/failed", access_status="download_failed")
+    paywalled = PaperInput(title_en="Paywalled", doi="10.1000/pay", access_status="paywalled")
+    unknown = PaperInput(title_en="Unknown", doi="10.1000/unknown", access_status="unknown")
+    pdfs = {"ready.pdf": PdfContent(text="Fig. 1 data")}
+
+    assert generation_candidate_papers([ready, no_pdf, failed, paywalled, unknown], pdfs) == [
+        ready,
+        no_pdf,
+        failed,
+        paywalled,
+        unknown,
+    ]
+
+
+def test_batch_analyze_does_not_duplicate_open_without_pdf(monkeypatch, tmp_path):
+    paper = PaperInput(title_en="Open without parsed PDF", doi="10.1000/open", access_status="open")
+    input_path = tmp_path / "papers.json"
+    output_path = tmp_path / "project.zip"
+    input_path.write_text(json.dumps([paper.to_dict()], ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr("sys.argv", ["batch_analyze", "--input", str(input_path), "--output", str(output_path)])
+
+    batch_analyze.main()
+
+    with zipfile.ZipFile(output_path) as zf:
+        latest = json.loads(zf.read("latest_papers.json").decode("utf-8"))
+    assert [item["doi"] for item in latest] == ["10.1000/open"]
+
+
+def test_generate_article_without_pdf_uses_metadata():
+    paper = PaperInput(
+        title_en="A general technology article",
+        journal="Example Journal",
+        abstract_en="The article explains a new engineering workflow.",
+        access_status="paywalled",
+    )
+
+    article = generate_article(paper)
+
+    assert "文章核心要点简述" in article.body_markdown
+    assert "文章的创新意义" in article.body_markdown
+    assert any("题录/摘要" in warning or "摘要级" in warning for warning in article.warnings)
+
+
+def test_manual_source_text_enters_prompt_and_generation():
+    paper = PaperInput(title_en="Manual source article")
+    prompt = build_prompt(paper, None, 1200, source_text="This is pasted source material about market adoption.")
+
+    assert "用户提供正文/材料" in prompt
+    assert "market adoption" in prompt
+
+    article = generate_article(paper, source_text="This is pasted source material about market adoption.")
+    assert any("用户粘贴材料" in warning or "材料级" in warning for warning in article.warnings)
+
+
+def test_fallback_article_is_not_domain_limited():
+    paper = PaperInput(title_en="A general article", abstract_en="A policy and industry analysis.")
+
+    article = generate_article(paper)
+
+    forbidden = ["TdT", "PUP", "DNA/RNA", "酶促 DNA", "酶促DNA", "生物技术"]
+    assert all(term not in article.body_markdown for term in forbidden)
 
 
 def test_unavailable_dois_csv_includes_open_without_pdf_and_error():

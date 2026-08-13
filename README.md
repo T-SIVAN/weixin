@@ -1,13 +1,13 @@
 # 微信文献快读工具
 
-这是一个 Streamlit 应用，用于按期刊清单追踪 Nature、Cell、Science 等生命科学顶刊的最新文章，解析开放全文或用户上传 PDF，并生成可导出的中文微信公众号快读稿。
+这是一个 Streamlit 应用，用于按期刊清单追踪 Nature、Cell、Science 等顶刊的最新文章，也支持粘贴任意文章、论文、新闻稿、综述或技术正文，并生成可导出的中文微信公众号解读稿。PDF 全文和截图是增强材料，不是生成前提。
 
 ## 核心流程
 
 1. **检索与翻译**：按 `config/journals.json` 中启用的期刊，从 PubMed、Europe PMC、OpenAlex、Crossref 抓取最近若干天的最新文章。检索默认不调用翻译模型，结果会先立即展示。
 2. **标题翻译**：在网页中点击“翻译全部未翻译标题”或“重试失败翻译”后，才会翻译英文标题。工具会优先使用本地缓存，并显示进度、缓存命中、失败和待翻译统计。
-3. **全文与生成**：自动下载合法开放全文或上传 PDF。只有已解析到 PDF 全文的论文才会生成公众号正文。
-4. **导出与发布**：导出项目包、单篇 Markdown/HTML、未生成 DOI CSV，也可以 dry-run 预览或真实创建微信公众号草稿。
+3. **内容与生成**：自动下载合法开放全文、上传 PDF，或粘贴文章内容/摘要/正文。所有有题录、摘要、DOI、PDF 或手动文本的候选都可以生成公众号稿。
+4. **导出与发布**：导出项目包、单篇 Markdown/HTML、待全文增强 DOI CSV，也可以 dry-run 预览或真实创建微信公众号草稿。
 
 检索结果显示正式发表日期；Crossref 只读取 `published`、`published-online`、`published-print`、`issued`、`posted` 等发表字段，不把 `created`、`indexed`、`deposited` 这类入库日期当作发表日期。
 
@@ -91,7 +91,7 @@ python -m weixin_lite.translate --input data/latest_papers.json --provider deeps
 python -m weixin_lite.batch_analyze --input data/latest_papers.json --limit 20
 ```
 
-`batch_analyze` 会复用网页的生成准入规则：没有解析 PDF 全文的记录会被跳过，只进入 DOI CSV 和下载状态文件。
+`batch_analyze` 会复用网页的开放生成规则：没有解析 PDF 全文的记录也会基于题录、摘要和链接生成摘要级解读；PDF、图注和截图只作为增强材料。待补全文的记录仍会进入 DOI CSV 和下载状态文件，方便后续补证据。
 
 ## 微信公众号草稿
 

@@ -303,5 +303,29 @@ def generation_ready_papers(papers: list[PaperInput], pdfs: Mapping[str, Any] | 
     return [paper for paper in papers if is_generation_ready(paper, pdfs)]
 
 
+def is_generation_candidate(paper: PaperInput, pdfs: Mapping[str, Any] | None = None) -> bool:
+    """Return True when enough metadata or content exists to generate a draft."""
+    pdf_cache = pdfs or {}
+    has_pdf = bool(paper.pdf_name and paper.pdf_name in pdf_cache)
+    has_metadata = any(
+        [
+            paper.title,
+            paper.title_en,
+            paper.title_zh,
+            paper.abstract,
+            paper.abstract_en,
+            paper.abstract_zh,
+            paper.doi,
+            paper.pmid,
+            paper.url,
+        ]
+    )
+    return bool(has_pdf or has_metadata)
+
+
+def generation_candidate_papers(papers: list[PaperInput], pdfs: Mapping[str, Any] | None = None) -> list[PaperInput]:
+    return [paper for paper in papers if is_generation_candidate(paper, pdfs)]
+
+
 def unavailable_papers(papers: list[PaperInput], pdfs: Mapping[str, Any] | None = None) -> list[PaperInput]:
     return [paper for paper in papers if not is_generation_ready(paper, pdfs)]
