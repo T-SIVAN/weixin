@@ -4,8 +4,8 @@ from io import BytesIO
 
 from weixin_lite import batch_analyze
 from weixin_lite.downloader import download_open_access
-from weixin_lite.exporter import project_zip, unavailable_dois_csv
-from weixin_lite.generator import build_prompt, generate_article
+from weixin_lite.exporter import article_html, project_zip, unavailable_dois_csv
+from weixin_lite.generator import build_prompt, generate_article, markdown_to_wechat_html
 from weixin_lite.llm import _parse_retry_after, default_base_url, default_model
 from weixin_lite.models import BatchProject, FigureAnalysis, PaperInput, generation_candidate_papers, generation_ready_papers, unavailable_papers
 from weixin_lite.pdf_reader import PdfContent, extract_figure_legends, extract_numeric_evidence
@@ -342,6 +342,44 @@ def test_article_places_screenshot_before_short_note():
     note_pos = article.body_markdown.find("**Fig. 3：原文关键信息截图**")
     assert image_pos >= 0
     assert note_pos > image_pos
+
+
+def test_wechat_markdown_html_matches_reference_style_without_duplicate_title():
+    markdown = """# 平台标题
+
+引言里有**重点**。
+
+## 文章核心要点简述
+
+1. **核心策略：** 先放原文截图，再写中文说明。
+
+![Fig. 1](images/fig1.png)
+
+**Fig. 1：原文关键信息截图**
+
+原文信息：Nature / DOI: 10.1000/test
+"""
+
+    html = markdown_to_wechat_html(markdown)
+
+    assert "平台标题" not in html
+    assert "font-size:18px;line-height:2.05;color:#000" in html
+    assert "font-size:22px" in html
+    assert "width:100%;height:auto;display:block" in html
+    assert '<strong style="font-weight:800;color:#000;">重点</strong>' in html
+    assert "原文信息" in html
+
+
+def test_exported_article_html_includes_wechat_platform_header():
+    article = generate_article(PaperInput(title_zh="测试文章", journal="Nature Biotechnology"))
+
+    html = article_html(article)
+
+    assert "原创" in html
+    assert "陶小花" in html
+    assert "遇见生物合成" in html
+    assert 'font-size:28px;line-height:1.22' in html
+    assert article.title in html
 
 
 def test_project_zip_contains_paywalled_and_download_status():

@@ -9,7 +9,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
-from .exporter import article_html
+from .exporter import article_html, wechat_content_html
 from .models import QuickReadArticle
 
 
@@ -113,17 +113,7 @@ def replace_content_image_sources(html: str, access_token: str, image_assets: di
 
 
 def duyi_wechat_html(article: QuickReadArticle, content_html: str | None = None) -> str:
-    body = content_html or article.body_html
-    return f"""
-<section style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;color:#22313f;line-height:1.85;font-size:16px;">
-  <section style="margin:0 0 22px;">
-    <h1 style="font-size:24px;line-height:1.45;margin:0;color:#0f172a;font-weight:800;">{article.title}</h1>
-    <p style="margin:10px 0 0;color:#64748b;font-size:15px;line-height:1.7;">{article.digest}</p>
-  </section>
-  <section style="height:1px;background:#e5e7eb;margin:18px 0 22px;"></section>
-  {body}
-</section>
-""".strip()
+    return wechat_content_html(article, content_html=content_html)
 
 
 def build_draft_payload(

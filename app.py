@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from weixin_lite.downloader import download_open_access
 from weixin_lite.exporter import (
+    article_document_html,
     export_article_html,
     export_article_markdown,
     project_zip,
@@ -494,26 +497,32 @@ def rows_to_journals(rows: object) -> list[JournalFilter]:
 
 
 def render_article_preview(article: QuickReadArticle) -> None:
-    pending: list[str] = []
+    def image_mime(data: bytes) -> str:
+        if data.startswith(b"\x89PNG"):
+            return "image/png"
+        if data.startswith(b"\xff\xd8"):
+            return "image/jpeg"
+        if data.startswith(b"GIF8"):
+            return "image/gif"
+        if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+            return "image/webp"
+        return "image/png"
 
-    def flush() -> None:
-        if pending:
-            st.markdown("\n".join(pending))
-            pending.clear()
+    html = article_document_html(article)
 
-    for raw in article.body_markdown.splitlines():
-        line = raw.strip()
-        if line.startswith("![") and "](" in line and line.endswith(")"):
-            flush()
-            image_name = line[line.find("(") + 1 : line.rfind(")")].replace("images/", "", 1)
-            image_bytes = st.session_state.images.get(image_name)
-            if image_bytes:
-                st.image(image_bytes, use_container_width=True)
-            else:
-                st.caption(f"图片未找到：{image_name}")
-        else:
-            pending.append(raw)
-    flush()
+    def replace_image(match: re.Match[str]) -> str:
+        src = match.group(1)
+        if not src.startswith("images/"):
+            return match.group(0)
+        image_name = src.removeprefix("images/")
+        image_bytes = st.session_state.images.get(image_name)
+        if not image_bytes:
+            return match.group(0)
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        return match.group(0).replace(src, f"data:{image_mime(image_bytes)};base64,{encoded}")
+
+    html = re.sub(r'src="([^"]+)"', replace_image, html)
+    components.html(html, height=900, scrolling=True)
 
 
 def sidebar_settings() -> tuple[str, str, str, str, int, float]:

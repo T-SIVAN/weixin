@@ -219,28 +219,54 @@ def render_markdown(paper: PaperInput, data: dict[str, Any], figures: list[Figur
     return "\n".join(lines).strip()
 
 
+WECHAT_P_STYLE = "margin:20px 0;font-size:18px;line-height:2.05;color:#000;text-align:justify;"
+WECHAT_HEADING_STYLE = "margin:44px 0 22px;font-size:22px;line-height:1.45;color:#000;font-weight:800;"
+WECHAT_SUBHEAD_STYLE = "margin:30px 0 18px;font-size:20px;line-height:1.55;color:#000;font-weight:800;"
+WECHAT_IMAGE_WRAP_STYLE = "margin:38px 0 34px;"
+WECHAT_STRONG_STYLE = "font-weight:800;color:#000;"
+WECHAT_NOTE_STYLE = "margin:12px 0 22px;font-size:15px;line-height:1.8;color:#8a8f98;"
+WECHAT_META_STYLE = "margin:38px 0 0;font-size:14px;line-height:1.8;color:#8a8f98;"
+
+
+def _wechat_inline(text: str) -> str:
+    escaped = html.escape(text)
+    return re.sub(
+        r"\*\*(.*?)\*\*",
+        rf'<strong style="{WECHAT_STRONG_STYLE}">\1</strong>',
+        escaped,
+    )
+
+
 def markdown_to_wechat_html(markdown: str) -> str:
     html_lines: list[str] = []
     for raw in markdown.splitlines():
         line = raw.strip()
         if not line:
-            html_lines.append("<p><br></p>")
+            continue
         elif line.startswith("# "):
-            html_lines.append(f"<h2>{html.escape(line[2:])}</h2>")
+            # The WeChat platform owns the article title. Export and local preview
+            # add the title back outside the rich-text body to avoid draft duplicates.
+            continue
         elif line.startswith("## "):
-            html_lines.append(f"<h3>{html.escape(line[3:])}</h3>")
+            html_lines.append(f'<p style="{WECHAT_HEADING_STYLE}">{html.escape(line[3:])}</p>')
         elif line.startswith("!["):
             alt = html.escape(line[line.find("[") + 1 : line.find("]")])
             src = html.escape(line[line.find("(") + 1 : line.rfind(")")])
-            html_lines.append(f'<p style="margin:24px 0 10px;"><img src="{src}" alt="{alt}" style="width:100%;height:auto;display:block;margin:0 auto;"></p>')
+            html_lines.append(
+                f'<section style="{WECHAT_IMAGE_WRAP_STYLE}">'
+                f'<img src="{src}" alt="{alt}" style="width:100%;height:auto;display:block;margin:0 auto;">'
+                "</section>"
+            )
         elif line.startswith("> "):
-            html_lines.append(f'<p style="color:#8a8f98;font-size:15px;line-height:1.7;">{html.escape(line[2:])}</p>')
+            html_lines.append(f'<p style="{WECHAT_NOTE_STYLE}">{html.escape(line[2:])}</p>')
+        elif line.startswith("**") and line.endswith("**") and len(line) <= 120:
+            html_lines.append(f'<p style="{WECHAT_SUBHEAD_STYLE}">{_wechat_inline(line)}</p>')
         elif re.match(r"^\d+\.\s+", line):
-            html_lines.append(f'<p style="font-size:17px;line-height:1.9;margin:16px 0;">{html.escape(line)}</p>')
+            html_lines.append(f'<p style="{WECHAT_P_STYLE}">{_wechat_inline(line)}</p>')
+        elif line.startswith("原文信息："):
+            html_lines.append(f'<p style="{WECHAT_META_STYLE}">{_wechat_inline(line)}</p>')
         else:
-            escaped = html.escape(line)
-            escaped = re.sub(r"\*\*(.*?)\*\*", r"<strong>\1</strong>", escaped)
-            html_lines.append(f'<p style="font-size:17px;line-height:1.9;margin:16px 0;">{escaped}</p>')
+            html_lines.append(f'<p style="{WECHAT_P_STYLE}">{_wechat_inline(line)}</p>')
     return "\n".join(html_lines)
 
 

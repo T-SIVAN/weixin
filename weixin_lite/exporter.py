@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import csv
+from datetime import datetime
+import html as html_lib
 import io
 import json
+import os
 import re
 import zipfile
 from typing import Any
@@ -16,26 +19,92 @@ def safe_slug(value: str, fallback: str = "article") -> str:
     return (slug or fallback)[:80]
 
 
-def article_html(article: QuickReadArticle) -> str:
+ARTICLE_CANVAS_STYLE = (
+    "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;"
+    "max-width:760px;margin:0 auto;padding:0 10px 44px;background:#fff;color:#000;"
+)
+ARTICLE_TITLE_STYLE = "margin:0 0 24px;font-size:28px;line-height:1.22;color:#000;font-weight:800;"
+ARTICLE_META_STYLE = "margin:0 0 42px;font-size:15px;line-height:1.7;color:#a0a4aa;"
+ARTICLE_ORIGINAL_STYLE = (
+    "display:inline-block;margin:0 10px 0 0;padding:1px 6px;border-radius:2px;"
+    "background:#f3f3f3;color:#a0a4aa;font-size:14px;vertical-align:1px;"
+)
+ARTICLE_ACCOUNT_STYLE = "color:#576b95;text-decoration:none;margin:0 12px 0 8px;"
+ARTICLE_AUTHOR_STYLE = "color:#a0a4aa;margin:0;"
+ARTICLE_COVER_STYLE = "margin:0 0 42px;"
+WECHAT_CONTENT_STYLE = (
+    "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;"
+    "background:#fff;color:#000;line-height:2.05;font-size:18px;"
+)
+
+
+def _format_article_time(value: str) -> str:
+    try:
+        parsed = datetime.fromisoformat((value or "").replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    return f"{parsed.year}年{parsed.month}月{parsed.day}日 {parsed.hour:02d}:{parsed.minute:02d}"
+
+
+def _wechat_author(author: str = "") -> str:
+    return author or os.getenv("WECHAT_AUTHOR_NAME", "陶小花")
+
+
+def _wechat_account(account_name: str = "") -> str:
+    return account_name or os.getenv("WECHAT_ACCOUNT_NAME", "遇见生物合成")
+
+
+def article_platform_header_html(article: QuickReadArticle, *, author: str = "", account_name: str = "") -> str:
+    published_at = _format_article_time(article.created_at)
+    date_html = f'<span>{html_lib.escape(published_at)}</span>' if published_at else ""
+    return (
+        f'<h1 style="{ARTICLE_TITLE_STYLE}">{html_lib.escape(article.title)}</h1>\n'
+        f'<section style="{ARTICLE_META_STYLE}">'
+        f'<span style="{ARTICLE_ORIGINAL_STYLE}">原创</span>'
+        f'<span style="{ARTICLE_AUTHOR_STYLE}">{html_lib.escape(_wechat_author(author))}</span>'
+        f'<span style="{ARTICLE_ACCOUNT_STYLE}">{html_lib.escape(_wechat_account(account_name))}</span>'
+        f"{date_html}"
+        "</section>"
+    )
+
+
+def wechat_content_html(article: QuickReadArticle, content_html: str | None = None, *, include_cover: bool = False) -> str:
     cover = ""
-    if article.cover_image_name:
-        cover = f'<p style="margin:0 0 22px;"><img src="images/{article.cover_image_name}" alt="publisher title image" style="width:100%;height:auto;display:block;"></p>\n'
+    if include_cover and article.cover_image_name:
+        cover = (
+            f'<section style="{ARTICLE_COVER_STYLE}">'
+            f'<img src="images/{html_lib.escape(article.cover_image_name)}" alt="publisher title image" '
+            'style="width:100%;height:auto;display:block;margin:0 auto;">'
+            "</section>\n"
+        )
+    return f'<section style="{WECHAT_CONTENT_STYLE}">\n{cover}{content_html or article.body_html}\n</section>'
+
+
+def article_document_html(article: QuickReadArticle, *, author: str = "", account_name: str = "") -> str:
+    return (
+        f'<section style="{ARTICLE_CANVAS_STYLE}">\n'
+        f"{article_platform_header_html(article, author=author, account_name=account_name)}\n"
+        f"{wechat_content_html(article, include_cover=True)}\n"
+        "</section>"
+    )
+
+
+def article_html(article: QuickReadArticle) -> str:
+    content = article_document_html(article)
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{article.title}</title>
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; line-height: 1.95; max-width: 760px; margin: 0 auto 40px; color: #0f172a; background: #fff; }}
-    h2 {{ font-size: 24px; line-height: 1.45; margin: 18px 0 18px; font-weight: 800; }}
-    h3 {{ font-size: 20px; line-height: 1.55; margin: 26px 0 14px; font-weight: 800; }}
-    p {{ font-size: 17px; line-height: 1.95; margin: 16px 0; }}
-    img {{ max-width: 100%; height: auto; display: block; margin: 24px auto 10px; }}
-    strong {{ color: #000; font-weight: 800; }}
+    html, body {{ margin:0; padding:0; background:#fff; }}
+    body {{ padding:0 0 60px; }}
+    img {{ max-width:100%; }}
   </style>
 </head>
 <body>
-{cover}{article.body_html}
+{content}
 </body>
 </html>
 """
