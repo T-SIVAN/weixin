@@ -1,0 +1,7 @@
+__pycache__/
+.pytest_cache/
+.streamlit/secrets.toml
+*.pyc
+*.zip
+*.weixin-project.zip
+outputs/

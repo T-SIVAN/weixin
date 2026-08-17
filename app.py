@@ -17,7 +17,8 @@ from weixin_lite.exporter import (
     project_zip,
     unavailable_dois_csv,
 )
-from weixin_lite.generator import generate_article
+from weixin_lite.article_analysis import analyze_paper
+from weixin_lite.generator import ArticleGenerationError, chineseish_len, generate_article, markdown_to_wechat_html
 from weixin_lite.llm import (
     PROVIDERS,
     default_api_key,
@@ -38,7 +39,7 @@ from weixin_lite.models import (
     generation_candidate_papers,
     unavailable_papers,
 )
-from weixin_lite.pdf_reader import PdfContent, parse_pdf
+from weixin_lite.pdf_reader import PdfContent, adjust_and_render_crop, parse_pdf
 from weixin_lite.search import (
     DEFAULT_KEYWORDS,
     DEFAULT_JOURNALS_PATH,
@@ -65,11 +66,18 @@ def init_state() -> None:
     st.session_state.setdefault("pdfs", {})
     st.session_state.setdefault("articles", [])
     st.session_state.setdefault("images", {})
+    st.session_state.setdefault("pdf_bytes", {})
     st.session_state.setdefault("downloads", [])
     st.session_state.setdefault("keywords", ", ".join(DEFAULT_KEYWORDS))
     st.session_state.setdefault("query_plan", None)
     st.session_state.setdefault("search_append", False)
     st.session_state.setdefault("last_translation_report", None)
+    st.session_state.setdefault("single_active_paper", None)
+    st.session_state.setdefault("single_active_pdf_name", "")
+    st.session_state.setdefault("single_source_text", "")
+    st.session_state.setdefault("single_analysis", None)
+    st.session_state.setdefault("single_article", None)
+    st.session_state.setdefault("single_stage", 1)
 
 
 def paper_key(paper: PaperInput) -> str:
@@ -525,6 +533,43 @@ def render_article_preview(article: QuickReadArticle) -> None:
     components.html(html, height=900, scrolling=True)
 
 
+def set_single_active_paper(paper: PaperInput, pdf_name: str = "", source_text: str = "") -> None:
+    st.session_state.single_active_paper = paper
+    st.session_state.single_active_pdf_name = pdf_name or paper.pdf_name
+    st.session_state.single_source_text = source_text
+    st.session_state.single_analysis = None
+    st.session_state.single_article = None
+    st.session_state.single_stage = 2 if (pdf_name or paper.pdf_name or source_text.strip()) else 1
+
+
+def active_pdf() -> PdfContent | None:
+    name = str(st.session_state.get("single_active_pdf_name") or "")
+    if not name:
+        paper = st.session_state.get("single_active_paper")
+        name = paper.pdf_name if isinstance(paper, PaperInput) else ""
+    return st.session_state.pdfs.get(name) if name else None
+
+
+def confirmed_single_figures(pdf: PdfContent | None) -> list:
+    if not pdf:
+        return []
+    figures = []
+    for idx, figure in enumerate(pdf.legends, start=1):
+        figure.selected = bool(st.session_state.get(f"single_fig_select_{idx}", figure.selected))
+        figure.order = int(st.session_state.get(f"single_fig_order_{idx}", figure.order or idx) or idx)
+        figure.role = str(st.session_state.get(f"single_fig_role_{idx}", figure.role or "key_result"))
+        if figure.selected:
+            figures.append(figure)
+    return sorted(figures, key=lambda item: (item.order or 999, item.figure_id))[:4]
+
+
+def update_article_from_editor(article: QuickReadArticle, markdown: str) -> QuickReadArticle:
+    article.body_markdown = markdown
+    article.body_html = markdown_to_wechat_html(markdown)
+    article.word_count = chineseish_len(markdown)
+    return article
+
+
 def sidebar_settings() -> tuple[str, str, str, str, int, float]:
     st.sidebar.header("翻译/生成模型")
     provider_keys = list(PROVIDERS.keys())
@@ -671,60 +716,49 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
 
 
 def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
-    st.subheader("内容与生成")
+    st.subheader("单篇论文工作台")
     papers: list[PaperInput] = st.session_state.papers
     pdfs: dict[str, PdfContent] = st.session_state.pdfs
+    st.caption("一篇文章一次推进：输入解析、确认分析和配图、再生成公众号正文。")
 
-    if papers:
-        st.dataframe(paper_rows(papers), use_container_width=True, hide_index=True)
-        if st.button("下载并解析开放全文"):
-            progress = st.progress(0)
-            downloads: list[DownloadedPaper] = []
-            for idx, paper in enumerate(papers, start=1):
-                downloaded = download_open_access(paper)
-                downloads.append(downloaded)
-                if downloaded.status == "open" and downloaded.content_bytes and "pdf" in downloaded.content_type.lower():
-                    try:
-                        pdf = parse_pdf(downloaded.content_bytes)
-                        pdf_name = downloaded.file_name or f"{paper_key(paper)}.pdf"
-                        pdfs[pdf_name] = pdf
-                        st.session_state.images.update(pdf.rendered_images)
-                        paper.pdf_name = pdf_name
-                        paper.access_status = "open"
-                        paper.download_error = ""
-                    except Exception as exc:
-                        paper.download_error = f"PDF 解析失败：{exc}"
-                        paper.access_status = "download_failed"
-                else:
-                    paper.access_status = downloaded.status
-                    paper.download_error = downloaded.error or "未下载到 PDF 全文。"
-                progress.progress(idx / len(papers), text=f"已处理 {idx}/{len(papers)}")
-            st.session_state.downloads = downloads
-            st.success("开放全文下载和解析完成。未成功解析的文章仍可基于题录、摘要或手动材料生成。")
-    else:
-        st.info("可以先检索文章、粘贴 DOI/标题、上传 PDF，或直接粘贴正文材料生成。")
-
-    uploaded = st.file_uploader("上传 PDF（可选，用于增强全文和图注证据）", type=["pdf"], accept_multiple_files=True)
-    if uploaded and st.button("解析上传 PDF"):
-        parsed_papers: list[PaperInput] = []
-        progress = st.progress(0)
-        for idx, file in enumerate(uploaded, start=1):
-            pdf = parse_pdf(file.getvalue())
-            pdfs[file.name] = pdf
+    st.markdown("#### 1. 输入与解析")
+    col_upload, col_existing = st.columns([1.05, 1])
+    with col_upload:
+        single_pdf = st.file_uploader("上传单篇 PDF", type=["pdf"], key="single_pdf_upload")
+        parse_mode = st.selectbox("PDF 解析模式", ["auto", "enhanced", "pypdf"], format_func={"auto": "自动增强", "enhanced": "强制增强", "pypdf": "快速兼容"}.get)
+        if st.button("解析为活动文章", type="primary", disabled=single_pdf is None):
+            assert single_pdf is not None
+            pdf_bytes = single_pdf.getvalue()
+            with st.spinner("正在解析 PDF、识别章节、图注和候选截图..."):
+                pdf = parse_pdf(pdf_bytes, mode=parse_mode)
+            pdfs[single_pdf.name] = pdf
+            st.session_state.pdf_bytes[single_pdf.name] = pdf_bytes
             st.session_state.images.update(pdf.rendered_images)
-            parsed_papers.append(infer_paper_from_pdf(file.name, pdf))
-            progress.progress(idx / len(uploaded), text=f"已解析 {idx}/{len(uploaded)}")
-        st.session_state.papers = merge_papers(st.session_state.papers, parsed_papers)
-        st.success(f"已解析 {len(parsed_papers)} 个 PDF。")
+            paper = infer_paper_from_pdf(single_pdf.name, pdf)
+            st.session_state.papers = merge_papers(st.session_state.papers, [paper])
+            set_single_active_paper(paper, single_pdf.name)
+            st.success(f"已解析 {single_pdf.name}：{pdf.page_count} 页，质量 {pdf.quality}，候选图 {len(pdf.all_figures)} 个。")
+    with col_existing:
+        candidates = generation_candidate_papers(st.session_state.papers, st.session_state.pdfs)
+        if candidates:
+            labels = [f"{idx}. {generation_source_label(paper, pdfs)} | {paper.display_title[:80]}" for idx, paper in enumerate(candidates, start=1)]
+            selected_label = st.selectbox("使用已有检索/解析结果", labels, key="single_existing_select")
+            if st.button("设为活动文章"):
+                selected_paper = candidates[labels.index(selected_label)]
+                set_single_active_paper(selected_paper, selected_paper.pdf_name)
+                st.success("已切换活动文章。")
+        else:
+            st.info("还没有候选文章。可以上传 PDF、从检索页加入文章，或在下方粘贴正文。")
 
-    manual = st.text_area("手动粘贴 DOI / PMID / 标题（每行一篇，可选）", height=90)
-    manual_content = st.text_area(
-        "粘贴文章内容 / 摘要 / 正文（可选）",
-        height=180,
-        help="可作为选中文章的补充材料；如果没有候选文章，会自动创建一条手动文章用于生成。",
+    manual = st.text_area("粘贴 DOI / PMID / 标题（每行一篇，可选）", height=80, key="single_manual_list")
+    source_text = st.text_area(
+        "粘贴正文 / 摘要 / 论文片段（可选）",
+        value=st.session_state.get("single_source_text", ""),
+        height=150,
+        key="single_manual_content",
     )
-    col_d, col_e = st.columns([1, 3])
-    if col_d.button("解析手动列表"):
+    col_manual_a, col_manual_b, col_manual_c = st.columns([1, 1, 2])
+    if col_manual_a.button("解析 DOI/标题"):
         records = parse_manual_inputs(manual)
         resolved: list[PaperInput] = []
         for record in records:
@@ -736,115 +770,277 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
             else:
                 resolved.append(record)
         st.session_state.papers = merge_papers(st.session_state.papers, resolved)
-        st.success(f"已加入 {len(resolved)} 条手动文献。")
-    if col_e.button("清空当前批次"):
-        st.session_state.papers = []
-        st.session_state.articles = []
-        st.session_state.pdfs = {}
-        st.session_state.images = {}
-        st.session_state.downloads = []
-        st.info("已清空当前批次。")
-
-    st.divider()
-    candidates = generation_candidate_papers(st.session_state.papers, st.session_state.pdfs)
-    unavailable = unavailable_papers(st.session_state.papers, st.session_state.pdfs)
-    if unavailable:
-        st.info(f"{len(unavailable)} 篇当前没有可解析 PDF，可继续作为摘要/题录稿生成，也可导出 DOI 状态后补全文。")
-        st.dataframe(paper_rows(unavailable), use_container_width=True, hide_index=True)
-
-    if not candidates and manual_content.strip():
-        manual_paper = PaperInput(
-            title="手动粘贴文章",
-            title_en="Manual pasted article",
-            abstract=manual_content[:1000],
-            abstract_en=manual_content[:1000],
-            source="manual text",
-            access_status="unknown",
-        )
-        candidates = [manual_paper]
-
-    if not candidates:
-        st.info("暂无可生成内容。请检索文章、粘贴 DOI/标题、上传 PDF，或在上方粘贴文章内容。")
-        return
-
-    source_rows = [
-        {
-            "#": str(idx),
-            "标题": paper.display_title,
-            "内容来源": generation_source_label(paper, st.session_state.pdfs, manual_content),
-            "全文状态": paper.access_status,
-            "PDF": paper.pdf_name,
-            "DOI": paper.doi,
-        }
-        for idx, paper in enumerate(candidates, start=1)
-    ]
-    st.dataframe(source_rows, use_container_width=True, hide_index=True)
-
-    labels = [
-        f"{idx}. {generation_source_label(paper, st.session_state.pdfs, manual_content)} | {paper.display_title[:80]}"
-        for idx, paper in enumerate(candidates, start=1)
-    ]
-    selected = st.multiselect("选择生成文章", labels, default=labels[: min(10, len(labels))])
-    target_chars = st.slider("目标字数", 500, 1500, 1200, step=50)
-    if not api_key.strip():
-        st.warning("未填写 LLM API Key 时只能生成通用占位级模板稿；配置模型后可生成真正的深度解读。")
-    if st.button("生成公众号稿", type="primary"):
-        chosen_indexes = [labels.index(label) for label in selected]
-        generated: list[QuickReadArticle] = []
-        progress = st.progress(0)
-        for run_idx, paper_idx in enumerate(chosen_indexes, start=1):
-            paper = candidates[paper_idx]
-            pdf = st.session_state.pdfs.get(paper.pdf_name) if paper.pdf_name else None
-            generated.append(
-                generate_article(
-                    paper=paper,
-                    pdf=pdf,
-                    api_key=api_key,
-                    base_url=base_url,
-                    model=model,
-                    target_chars=target_chars,
-                    source_text=manual_content if manual_content.strip() else "",
-                )
+        if resolved:
+            set_single_active_paper(resolved[0], resolved[0].pdf_name, source_text)
+        st.success(f"已加入 {len(resolved)} 条。")
+    if col_manual_b.button("使用粘贴正文"):
+        paper = st.session_state.get("single_active_paper")
+        if not isinstance(paper, PaperInput):
+            paper = PaperInput(
+                title="手动粘贴文章",
+                title_en="Manual pasted article",
+                abstract=source_text[:1000],
+                abstract_en=source_text[:1000],
+                source="manual text",
+                access_status="unknown",
             )
-            progress.progress(run_idx / len(chosen_indexes), text=f"已生成 {run_idx}/{len(chosen_indexes)}")
-        st.session_state.articles = generated
-        st.success(f"已生成 {len(generated)} 篇中文公众号稿。")
+            st.session_state.papers = merge_papers(st.session_state.papers, [paper])
+        set_single_active_paper(paper, paper.pdf_name, source_text)
+        st.success("粘贴材料已关联到活动文章。")
+    if col_manual_c.button("清空当前单篇"):
+        st.session_state.single_active_paper = None
+        st.session_state.single_active_pdf_name = ""
+        st.session_state.single_source_text = ""
+        st.session_state.single_analysis = None
+        st.session_state.single_article = None
+        st.info("已清空当前单篇状态。")
 
-    for idx, article in enumerate(st.session_state.articles, start=1):
-        with st.expander(f"{idx}. {article.title} | {article.word_count} 字", expanded=idx == 1):
-            cover = st.file_uploader("上传封面图（可选）", type=["png", "jpg", "jpeg"], key=f"cover-{idx}")
-            if cover:
-                name = f"cover-{idx}-{cover.name}"
-                st.session_state.images[name] = cover.getvalue()
-                article.cover_image_name = name
-            if article.figures:
-                st.caption("原文截图")
-                for fig_idx, figure in enumerate(article.figures, start=1):
-                    current = figure.image_name
-                    if current and current in st.session_state.images:
-                        st.image(st.session_state.images[current], caption=f"{figure.figure_id} 自动截图", use_container_width=True)
-                    replacement = st.file_uploader(
-                        f"替换 {figure.figure_id} 截图",
-                        type=["png", "jpg", "jpeg"],
-                        key=f"figure-replace-{idx}-{fig_idx}",
+    paper = st.session_state.get("single_active_paper")
+    pdf = active_pdf()
+    if isinstance(paper, PaperInput):
+        st.divider()
+        st.markdown("#### 2. 分析与配图")
+        source_label = generation_source_label(paper, pdfs, st.session_state.get("single_source_text", ""))
+        col_meta_a, col_meta_b, col_meta_c, col_meta_d = st.columns(4)
+        col_meta_a.metric("当前来源", source_label)
+        col_meta_b.metric("PDF 页数", pdf.page_count if pdf else 0)
+        col_meta_c.metric("解析质量", pdf.quality if pdf else "无 PDF")
+        col_meta_d.metric("候选图", len(pdf.legends) if pdf else 0)
+        st.write(f"**{paper.display_title}**")
+        if pdf and pdf.warning:
+            st.warning(pdf.warning)
+        if pdf and pdf.coverage:
+            st.caption("章节覆盖：" + "、".join(pdf.coverage))
+
+        if pdf and st.button("执行结构化全文分析", type="primary"):
+            with st.spinner("正在生成可追溯论文分析..."):
+                analysis = analyze_paper(
+                    paper,
+                    pdf,
+                    {
+                        "api_key": api_key,
+                        "base_url": base_url,
+                        "model": model,
+                        "cache": st.session_state.setdefault("analysis_cache", {}),
+                    },
+                    previous_analysis=st.session_state.get("single_analysis"),
+                )
+            st.session_state.single_analysis = analysis
+            st.session_state.single_stage = 2
+            if analysis.complete:
+                st.success("结构化分析完成。")
+            else:
+                st.error(analysis.error or "结构化分析未完成。")
+        elif not pdf:
+            st.info("当前没有 PDF。可先基于粘贴材料生成材料级稿；需要全文级分析和自动裁图，请上传或下载 PDF。")
+
+        analysis = st.session_state.get("single_analysis")
+        if analysis:
+            if analysis.warnings:
+                st.warning("；".join(analysis.warnings))
+            rows = []
+            labels_by_field = {
+                "research_question": "研究问题",
+                "background": "背景",
+                "methods": "方法",
+                "key_results": "关键结果",
+                "innovation": "创新意义",
+                "limitations": "局限性",
+                "conclusion": "结论",
+            }
+            for field_name, label in labels_by_field.items():
+                for claim in getattr(analysis, field_name, []):
+                    rows.append(
+                        {
+                            "类型": label,
+                            "判断": claim.statement,
+                            "页码": claim.page,
+                            "图号": claim.figure_id,
+                            "证据": claim.evidence_text,
+                            "置信度": claim.confidence,
+                        }
                     )
+            if rows:
+                st.dataframe(rows, use_container_width=True, hide_index=True)
+
+        if pdf and pdf.legends:
+            st.markdown("##### 候选配图")
+            pdf_bytes_map: dict[str, bytes] = st.session_state.get("pdf_bytes", {})
+            pdf_name = st.session_state.get("single_active_pdf_name", "")
+            for idx, figure in enumerate(pdf.legends, start=1):
+                with st.expander(f"{idx}. {figure.figure_id} | {figure.role or 'key_result'} | p.{figure.page}", expanded=idx <= 2):
+                    col_fig_a, col_fig_b, col_fig_c = st.columns([0.8, 0.8, 1.4])
+                    col_fig_a.checkbox("选入正文", value=figure.selected, key=f"single_fig_select_{idx}")
+                    col_fig_b.number_input("顺序", min_value=1, max_value=4, value=int(figure.order or min(idx, 4)), key=f"single_fig_order_{idx}")
+                    col_fig_c.selectbox(
+                        "角色",
+                        ["mechanism", "method", "key_result", "validation"],
+                        index=["mechanism", "method", "key_result", "validation"].index(figure.role) if figure.role in {"mechanism", "method", "key_result", "validation"} else 2,
+                        key=f"single_fig_role_{idx}",
+                    )
+                    st.caption(figure.caption[:700])
+                    if figure.image_name and figure.image_name in st.session_state.images:
+                        st.image(st.session_state.images[figure.image_name], caption=f"当前截图；置信度 {figure.confidence:.2f}", use_container_width=True)
+                    if figure.crop_bbox and pdf_name in pdf_bytes_map:
+                        crop_cols = st.columns(4)
+                        left = crop_cols[0].slider("左", -0.2, 0.2, 0.0, 0.01, key=f"crop_l_{idx}")
+                        top = crop_cols[1].slider("上", -0.2, 0.2, 0.0, 0.01, key=f"crop_t_{idx}")
+                        right = crop_cols[2].slider("右", -0.2, 0.2, 0.0, 0.01, key=f"crop_r_{idx}")
+                        bottom = crop_cols[3].slider("下", -0.2, 0.2, 0.0, 0.01, key=f"crop_b_{idx}")
+                        if st.button("应用裁剪", key=f"apply_crop_{idx}"):
+                            try:
+                                bbox, image = adjust_and_render_crop(
+                                    pdf_bytes_map[pdf_name],
+                                    int(figure.page),
+                                    figure.crop_bbox,
+                                    left=left,
+                                    top=top,
+                                    right=right,
+                                    bottom=bottom,
+                                )
+                                figure.crop_bbox = bbox
+                                if not figure.image_name:
+                                    figure.image_name = f"{paper_key(paper)}-{figure.figure_id}.png"
+                                st.session_state.images[figure.image_name] = image
+                                st.success("裁剪已更新。")
+                            except Exception as exc:
+                                st.error(f"裁剪失败：{type(exc).__name__}: {exc}")
+                    replacement = st.file_uploader(f"替换 {figure.figure_id} 图片", type=["png", "jpg", "jpeg"], key=f"single_fig_replace_{idx}")
                     if replacement:
-                        new_name = f"figure-{idx}-{fig_idx}-{replacement.name}"
+                        old_name = figure.image_name
+                        new_name = f"single-{idx}-{replacement.name}"
                         st.session_state.images[new_name] = replacement.getvalue()
-                        if current:
-                            article.body_markdown = article.body_markdown.replace(f"images/{current}", f"images/{new_name}")
-                            article.body_html = article.body_html.replace(f"images/{current}", f"images/{new_name}")
                         figure.image_name = new_name
                         figure.page_image_name = new_name
+                        if old_name and old_name in st.session_state.images:
+                            st.caption("已替换为人工上传图片。")
+
+        st.divider()
+        st.markdown("#### 3. 成稿与发布")
+        target_chars = st.slider("公众号正文字数", 1500, 2800, 2000, step=100, key="single_target_chars")
+        use_quality = bool(analysis and getattr(analysis, "complete", False))
+        if use_quality:
+            st.success("将基于结构化分析和已选配图生成质量优先稿。")
+        elif not api_key.strip():
+            st.warning("未填写 LLM API Key，只能生成占位级模板；配置模型后可重试当前阶段。")
+        else:
+            st.info("当前没有完整结构化分析，将按 PDF/粘贴材料直接生成，并保留证据边界提示。")
+        if st.button("生成单篇公众号稿", type="primary"):
+            try:
+                with st.spinner("正在生成公众号正文..."):
+                    article = generate_article(
+                        paper=paper,
+                        pdf=pdf,
+                        api_key=api_key,
+                        base_url=base_url,
+                        model=model,
+                        target_chars=target_chars,
+                        source_text=st.session_state.get("single_source_text", ""),
+                        analysis=analysis if use_quality else None,
+                        confirmed_figures=confirmed_single_figures(pdf),
+                        target_profile="adaptive",
+                    )
+                st.session_state.single_article = article
+                st.session_state.articles = [article] + [item for item in st.session_state.articles if item.title != article.title]
+                st.session_state.single_stage = 3
+                st.success("单篇公众号稿已生成。")
+            except ArticleGenerationError as exc:
+                st.error(str(exc))
+            except Exception as exc:
+                st.error(f"生成失败：{type(exc).__name__}: {exc}")
+
+        article = st.session_state.get("single_article")
+        if isinstance(article, QuickReadArticle):
+            cover = st.file_uploader("上传平台封面图（不插入正文）", type=["png", "jpg", "jpeg"], key="single_cover")
+            if cover:
+                name = f"single-cover-{cover.name}"
+                st.session_state.images[name] = cover.getvalue()
+                article.cover_image_name = name
+            edited = st.text_area("编辑正文 Markdown", value=article.body_markdown, height=360, key="single_article_editor")
+            if st.button("更新预览"):
+                update_article_from_editor(article, edited)
+                st.session_state.single_article = article
+                st.success("预览已更新。")
             if article.warnings:
                 st.warning("；".join(article.warnings))
             render_article_preview(article)
-            if article.evidence:
-                st.caption("证据追踪")
-                st.dataframe([item.to_dict() for item in article.evidence[:12]], use_container_width=True, hide_index=True)
-            col_a, col_b = st.columns(2)
-            col_a.download_button("Markdown", export_article_markdown(article), file_name=f"{idx:02d}-{article.title}.md")
-            col_b.download_button("HTML", export_article_html(article), file_name=f"{idx:02d}-{article.title}.html")
+            col_a, col_b, col_c = st.columns(3)
+            col_a.download_button("Markdown", export_article_markdown(article), file_name=f"{article.title}.md")
+            col_b.download_button("HTML", export_article_html(article), file_name=f"{article.title}.html")
+            col_c.metric("正文长度", article.word_count)
+    else:
+        st.info("请先上传 PDF、选择已有结果，或粘贴正文作为活动文章。")
+
+    st.divider()
+    with st.expander("批量工具和旧流程"):
+        if papers:
+            st.dataframe(paper_rows(papers), use_container_width=True, hide_index=True)
+            if st.button("下载并解析开放全文"):
+                progress = st.progress(0)
+                downloads: list[DownloadedPaper] = []
+                for idx, paper_item in enumerate(papers, start=1):
+                    downloaded = download_open_access(paper_item)
+                    downloads.append(downloaded)
+                    if downloaded.status == "open" and downloaded.content_bytes and "pdf" in downloaded.content_type.lower():
+                        try:
+                            pdf_item = parse_pdf(downloaded.content_bytes)
+                            pdf_name = downloaded.file_name or f"{paper_key(paper_item)}.pdf"
+                            pdfs[pdf_name] = pdf_item
+                            st.session_state.pdf_bytes[pdf_name] = downloaded.content_bytes
+                            st.session_state.images.update(pdf_item.rendered_images)
+                            paper_item.pdf_name = pdf_name
+                            paper_item.access_status = "open"
+                            paper_item.download_error = ""
+                        except Exception as exc:
+                            paper_item.download_error = f"PDF 解析失败：{exc}"
+                            paper_item.access_status = "download_failed"
+                    else:
+                        paper_item.access_status = downloaded.status
+                        paper_item.download_error = downloaded.error or "未下载到 PDF 全文。"
+                    progress.progress(idx / len(papers), text=f"已处理 {idx}/{len(papers)}")
+                st.session_state.downloads = downloads
+                st.success("开放全文下载和解析完成。")
+        uploaded = st.file_uploader("批量上传 PDF", type=["pdf"], accept_multiple_files=True, key="batch_pdf_upload")
+        if uploaded and st.button("解析批量 PDF"):
+            parsed_papers: list[PaperInput] = []
+            progress = st.progress(0)
+            for idx, file in enumerate(uploaded, start=1):
+                pdf_item = parse_pdf(file.getvalue())
+                pdfs[file.name] = pdf_item
+                st.session_state.pdf_bytes[file.name] = file.getvalue()
+                st.session_state.images.update(pdf_item.rendered_images)
+                parsed_papers.append(infer_paper_from_pdf(file.name, pdf_item))
+                progress.progress(idx / len(uploaded), text=f"已解析 {idx}/{len(uploaded)}")
+            st.session_state.papers = merge_papers(st.session_state.papers, parsed_papers)
+            st.success(f"已解析 {len(parsed_papers)} 个 PDF。")
+        batch_candidates = generation_candidate_papers(st.session_state.papers, st.session_state.pdfs)
+        if batch_candidates:
+            batch_labels = [
+                f"{idx}. {generation_source_label(item, st.session_state.pdfs)} | {item.display_title[:80]}"
+                for idx, item in enumerate(batch_candidates, start=1)
+            ]
+            selected = st.multiselect("批量选择生成文章", batch_labels, default=batch_labels[: min(10, len(batch_labels))])
+            batch_target = st.slider("批量目标字数", 500, 1500, 1200, step=50)
+            if st.button("批量生成公众号稿"):
+                chosen_indexes = [batch_labels.index(label) for label in selected]
+                generated: list[QuickReadArticle] = []
+                progress = st.progress(0)
+                for run_idx, paper_idx in enumerate(chosen_indexes, start=1):
+                    paper_item = batch_candidates[paper_idx]
+                    pdf_item = st.session_state.pdfs.get(paper_item.pdf_name) if paper_item.pdf_name else None
+                    generated.append(
+                        generate_article(
+                            paper=paper_item,
+                            pdf=pdf_item,
+                            api_key=api_key,
+                            base_url=base_url,
+                            model=model,
+                            target_chars=batch_target,
+                        )
+                    )
+                    progress.progress(run_idx / len(chosen_indexes), text=f"已生成 {run_idx}/{len(chosen_indexes)}")
+                st.session_state.articles = generated
+                st.success(f"已生成 {len(generated)} 篇中文公众号稿。")
 
 
 def export_and_publish_tab() -> None:
