@@ -5,12 +5,18 @@ import re
 from typing import Any
 
 from .llm import LLMError, call_openai_compatible, parse_json_object
-from .models import FigureAnalysis, PaperInput, QuickReadArticle
+from .models import FigureAnalysis, PaperAnalysis, PaperInput, QuickReadArticle
 from .pdf_reader import PdfContent, compact_text
 
 
 TARGET_MIN = 500
 TARGET_MAX = 1500
+ANALYSIS_TARGET_MIN = 1500
+ANALYSIS_TARGET_MAX = 2800
+
+
+class ArticleGenerationError(RuntimeError):
+    """Raised when a quality-first article cannot be generated safely."""
 
 
 SYSTEM_PROMPT = """你是一个严谨、克制、面向中文读者的公众号文章解读作者。
@@ -114,6 +120,64 @@ PMID：{paper.pmid}
 """.strip()
 
 
+def _analysis_claims(analysis: PaperAnalysis) -> str:
+    labels = {
+        "research_question": "研究问题",
+        "background": "背景",
+        "methods": "方法",
+        "key_results": "关键结果",
+        "innovation": "创新点",
+        "limitations": "局限性",
+        "conclusion": "结论",
+    }
+    lines: list[str] = []
+    for field_name, label in labels.items():
+        lines.append(f"\n## {label}")
+        for claim in getattr(analysis, field_name):
+            source = " / ".join(bit for bit in [f"p.{claim.page}" if claim.page else "", claim.figure_id] if bit)
+            lines.append(f"- {claim.statement} [{source}] 证据：{claim.evidence_text}")
+    return "\n".join(lines).strip()
+
+
+def build_analysis_article_prompt(
+    paper: PaperInput,
+    analysis: PaperAnalysis,
+    figures: list[FigureAnalysis],
+    target_chars: int,
+) -> str:
+    figure_lines = [
+        f"- {item.figure_id} | role={item.role} | page={item.page} | caption={item.caption}"
+        for item in figures
+    ]
+    return f"""
+请根据已经审核为可追溯的结构化分析，生成一篇可直接排版为微信公众号正文的中文深度解读稿。
+目标长度：{target_chars} 个中文字符，允许范围 {ANALYSIS_TARGET_MIN}-{ANALYSIS_TARGET_MAX}。
+不得加入结构化分析之外的事实、数字或结论。只使用确认配图，并按给定顺序生成图下注释。
+
+输出 JSON Schema：
+{{
+  "title": "不超过32个中文字符的公众号标题",
+  "digest": "不超过120字摘要",
+  "intro": "导语，交代问题和研究价值",
+  "core_points": ["完整、连贯的核心分析段落，包含证据边界"],
+  "figure_notes": [{{"figure_id":"Fig. 1", "heading":"图文小标题", "note":"结合证据的中文图解"}}],
+  "innovation": ["创新意义"],
+  "limitations": ["论文局限性和解读边界"],
+  "take_home": "总结"
+}}
+
+论文：{paper.title_zh or paper.title_en or paper.title}
+期刊：{paper.journal}
+DOI：{paper.doi}
+
+结构化分析（每条均附页码或图号）：
+{_analysis_claims(analysis)}
+
+确认配图：
+{chr(10).join(figure_lines) if figure_lines else '无确认配图；不要生成 figure_notes。'}
+""".strip()
+
+
 def short_title(paper: PaperInput) -> str:
     journal = (paper.journal or "文章").split()[0][:10]
     base = paper.title_zh or paper.title_en or paper.title or paper.doi or paper.pmid or paper.pdf_name or "单篇解读"
@@ -179,8 +243,15 @@ def fallback_article(
     }
 
 
-def render_markdown(paper: PaperInput, data: dict[str, Any], figures: list[FigureAnalysis]) -> str:
+def render_markdown(
+    paper: PaperInput,
+    data: dict[str, Any],
+    figures: list[FigureAnalysis],
+    lead_image: FigureAnalysis | None = None,
+) -> str:
     lines: list[str] = [f"# {data.get('title') or short_title(paper)}", ""]
+    if lead_image and lead_image.image_name:
+        lines.extend([f"![论文首页](images/{lead_image.image_name})", ""])
     intro = str(data.get("intro") or "").strip()
     if intro:
         lines.extend([intro, ""])
@@ -209,9 +280,13 @@ def render_markdown(paper: PaperInput, data: dict[str, Any], figures: list[Figur
     lines.append("")
     for idx, point in enumerate(data.get("innovation") or [], start=1):
         lines.append(f"{idx}. {str(point).strip()}")
+    limitations = data.get("limitations") or []
+    if limitations:
+        lines.extend(["", "## 局限性与解读边界", ""])
+        for idx, point in enumerate(limitations, start=1):
+            lines.append(f"{idx}. {str(point).strip()}")
     if data.get("take_home"):
-        lines.append("")
-        lines.append(str(data["take_home"]).strip())
+        lines.extend(["", "## 总结", "", str(data["take_home"]).strip()])
     meta = " / ".join(bit for bit in [paper.journal, paper.publication_date or paper.year, f"DOI: {paper.doi}" if paper.doi else "", paper.url] if bit)
     if meta:
         lines.append("")
@@ -278,6 +353,18 @@ def attach_interpretations(figures: list[FigureAnalysis], data: dict[str, Any]) 
             figure.interpretation = str(item.get("note") or item.get("interpretation") or "")
 
 
+def _friendly_llm_failure(exc: Exception, action: str) -> str:
+    message = str(exc).lower()
+    status_code = exc.status_code if isinstance(exc, LLMError) else None
+    if status_code == 429 or "too many requests" in message or "quota" in message:
+        return f"{action}：模型接口额度不足或被限流，请检查 API Key 余额/套餐，或稍后重试。"
+    if status_code in {401, 403}:
+        return f"{action}：模型接口鉴权失败，请检查 API Key、Base URL 和模型权限。"
+    if isinstance(exc, LLMError) and exc.transient:
+        return f"{action}：模型接口暂时不可用，请稍后重试。"
+    return f"{action}：模型调用失败，已保留当前可用结果。"
+
+
 def generate_article(
     paper: PaperInput,
     pdf: PdfContent | None = None,
@@ -287,15 +374,37 @@ def generate_article(
     target_chars: int = 1200,
     source_text: str = "",
     extra_text: str = "",
+    analysis: PaperAnalysis | None = None,
+    confirmed_figures: list[FigureAnalysis] | None = None,
+    target_profile: str = "adaptive",
 ) -> QuickReadArticle:
     warnings: list[str] = []
     level = source_level(pdf, source_text, extra_text)
-    if pdf:
+    quality_first = analysis is not None
+    if quality_first and not analysis.complete:
+        raise ArticleGenerationError(
+            analysis.error or "结构化论文分析尚未完成，已停止生成以避免产生无证据的完成稿。"
+        )
+    if quality_first:
+        warnings.append("已基于带页码/图号的结构化分析生成深度稿。")
+    elif pdf:
         warnings.append("已基于 PDF 全文/图注生成深度解读稿；发布前仍建议核对关键数据和截图。")
     elif source_text.strip() or extra_text.strip():
         warnings.append("未提供 PDF 全文，已基于用户粘贴材料生成材料级解读；不要把它表述为全文级结论。")
     else:
         warnings.append("未提供 PDF 全文或额外正文，已基于题录/摘要生成摘要级解读；证据边界较窄。")
+
+    if confirmed_figures is not None:
+        figures = sorted(confirmed_figures, key=lambda item: (item.order or 999, item.figure_id))[:4]
+    else:
+        figures = list(pdf.legends[:4]) if pdf else []
+
+    if quality_first and not api_key.strip():
+        raise ArticleGenerationError("未配置模型 API Key，无法把结构化分析生成质量优先公众号稿。")
+
+    if quality_first and target_profile == "adaptive":
+        target_chars = 2000 if target_chars == 1200 else target_chars
+        target_chars = max(ANALYSIS_TARGET_MIN, min(ANALYSIS_TARGET_MAX, target_chars))
 
     if api_key.strip():
         try:
@@ -304,40 +413,34 @@ def generate_article(
                 base_url=base_url,
                 model=model,
                 system_prompt=SYSTEM_PROMPT,
-                user_prompt=build_prompt(paper, pdf, target_chars, source_text=source_text, extra_text=extra_text),
+                user_prompt=(
+                    build_analysis_article_prompt(paper, analysis, figures, target_chars)
+                    if analysis
+                    else build_prompt(paper, pdf, target_chars, source_text=source_text, extra_text=extra_text)
+                ),
             )
             data = parse_json_object(raw)
+            if analysis and not all(data.get(field) for field in ("intro", "core_points", "innovation", "take_home")):
+                raise ValueError("模型返回的深度稿缺少必要章节")
         except Exception as exc:
-            warnings.append(f"LLM 生成失败，已使用通用保守模板：{exc}")
+            if quality_first:
+                raise ArticleGenerationError(
+                    _friendly_llm_failure(exc, "质量优先稿件生成失败，结构化分析已保留")
+                ) from exc
+            warnings.append(_friendly_llm_failure(exc, "LLM 生成失败，已使用通用保守模板"))
             data = fallback_article(paper, pdf, source_text=source_text, extra_text=extra_text)
     else:
         warnings.append("未填写 LLM API Key，已生成通用占位级模板稿；深度解读需要配置模型后重新生成。")
         data = fallback_article(paper, pdf, source_text=source_text, extra_text=extra_text)
 
-    figures = pdf.legends[:4] if pdf else []
     attach_interpretations(figures, data)
-    markdown = render_markdown(paper, data, figures)
+    lead_image = pdf.lead_image if pdf else None
+    markdown = render_markdown(paper, data, figures, lead_image=lead_image)
     count = chineseish_len(markdown)
-    if api_key.strip() and (count < TARGET_MIN or count > TARGET_MAX):
-        try:
-            repair_prompt = (
-                f"请把下面公众号稿改写到 {TARGET_MIN}-{TARGET_MAX} 个中文字符。"
-                "只保留中文正文，不新增未给出的事实、数字或结论，保留两个固定小标题。\n\n"
-                f"{markdown}"
-            )
-            markdown = call_openai_compatible(
-                api_key=api_key,
-                base_url=base_url,
-                model=model,
-                system_prompt="你是严谨的中文科技编辑，只做长度和表达修正。",
-                user_prompt=repair_prompt,
-                timeout=90,
-            )
-            count = chineseish_len(markdown)
-        except LLMError as exc:
-            warnings.append(f"长度自动修正失败：{exc}")
-    if count < TARGET_MIN or count > TARGET_MAX:
-        warnings.append(f"当前字数 {count}，不在 500-1500 发布目标内；可人工微调或换更强模型重生成。")
+    minimum = ANALYSIS_TARGET_MIN if quality_first else TARGET_MIN
+    maximum = ANALYSIS_TARGET_MAX if quality_first else TARGET_MAX
+    if count < minimum or count > maximum:
+        warnings.append(f"当前字数 {count}，不在 {minimum}-{maximum} 发布目标内；请使用显式补写/精简操作，不会自动发起第二次模型调用。")
     evidence = pdf.evidence[:30] if pdf else []
     if not pdf or not pdf.legends:
         warnings.append(f"内容来源：{level}；未获得可靠图注，图例分析需开放全文或上传 PDF 后补充。")
@@ -351,4 +454,7 @@ def generate_article(
         evidence=evidence,
         word_count=count,
         warnings=warnings,
+        analysis_version=analysis.version if analysis else "",
+        source_hash=(analysis.source_hash if analysis else (pdf.hash if pdf else "")),
+        lead_image_name=lead_image.image_name if lead_image else "",
     )

@@ -4,6 +4,7 @@ import json
 import os
 import re
 import socket
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -19,11 +20,15 @@ class LLMError(RuntimeError):
         status_code: int | None = None,
         retry_after: float | None = None,
         transient: bool = False,
+        error_code: str = "",
+        quota_exhausted: bool = False,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.retry_after = retry_after
         self.transient = transient
+        self.error_code = error_code
+        self.quota_exhausted = quota_exhausted
 
 
 @dataclass(frozen=True)
@@ -81,6 +86,36 @@ def call_openai_compatible(
     user_prompt: str,
     temperature: float = 0.2,
     timeout: int = 120,
+    max_attempts: int = 3,
+) -> str:
+    attempts = max(1, min(int(max_attempts), 3))
+    for attempt in range(attempts):
+        try:
+            return _call_openai_compatible_once(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=temperature,
+                timeout=timeout,
+            )
+        except LLMError as exc:
+            if exc.quota_exhausted or not exc.transient or attempt + 1 >= attempts:
+                raise
+            delay = exc.retry_after if exc.retry_after is not None else float(2**attempt)
+            time.sleep(max(0.0, delay))
+    raise LLMError("LLM retry loop ended unexpectedly")
+
+
+def _call_openai_compatible_once(
+    api_key: str,
+    base_url: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float = 0.2,
+    timeout: int = 120,
 ) -> str:
     if not api_key.strip():
         raise LLMError("Missing API key")
@@ -107,10 +142,18 @@ def call_openai_compatible(
             body = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         retry_after = _parse_retry_after(exc.headers.get("Retry-After") if exc.headers else None)
-        detail = _read_http_error_detail(exc)
-        transient = exc.code == 429 or exc.code >= 500
+        detail, error_code = _read_http_error_detail(exc)
+        quota_exhausted = _is_quota_exhaustion(detail, error_code)
+        transient = (exc.code == 429 or exc.code >= 500) and not quota_exhausted
         message = f"LLM HTTP {exc.code} {exc.reason}: {detail}".strip()
-        raise LLMError(message, status_code=exc.code, retry_after=retry_after, transient=transient) from exc
+        raise LLMError(
+            message,
+            status_code=exc.code,
+            retry_after=retry_after,
+            transient=transient,
+            error_code=error_code,
+            quota_exhausted=quota_exhausted,
+        ) from exc
     except urllib.error.URLError as exc:
         reason = getattr(exc, "reason", exc)
         transient = isinstance(reason, (TimeoutError, socket.timeout)) or "timed out" in str(reason).lower()
@@ -146,26 +189,41 @@ def _parse_retry_after(value: str | None) -> float | None:
     return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
 
 
-def _read_http_error_detail(exc: urllib.error.HTTPError) -> str:
+def _is_quota_exhaustion(message: str, error_code: str = "") -> bool:
+    value = f"{error_code} {message}".lower()
+    return any(
+        marker in value
+        for marker in (
+            "insufficient_quota",
+            "current quota",
+            "billing quota",
+            "run out of credits",
+            "no balance left",
+            "exceeded your quota",
+        )
+    )
+
+
+def _read_http_error_detail(exc: urllib.error.HTTPError) -> tuple[str, str]:
     try:
         raw = exc.read().decode("utf-8", errors="replace")
     except Exception:
         raw = ""
     if not raw:
-        return "no response body"
+        return "no response body", ""
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        return raw[:500]
+        return raw[:500], ""
     if isinstance(data, dict):
         error = data.get("error")
         if isinstance(error, dict):
-            return str(error.get("message") or error)
+            return str(error.get("message") or error), str(error.get("code") or error.get("type") or "")
         if error:
-            return str(error)
+            return str(error), ""
         if data.get("message"):
-            return str(data["message"])
-    return raw[:500]
+            return str(data["message"]), str(data.get("code") or "")
+    return raw[:500], ""
 
 
 def test_llm_connection(api_key: str, base_url: str, model: str) -> str:

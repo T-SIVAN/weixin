@@ -2,12 +2,16 @@ import json
 import zipfile
 from io import BytesIO
 
+import pytest
+
 from weixin_lite import batch_analyze
+from weixin_lite import llm as llm_module
+from weixin_lite.article_analysis import analysis_cache_key, analyze_paper
 from weixin_lite.downloader import download_open_access
 from weixin_lite.exporter import article_html, project_zip, unavailable_dois_csv
-from weixin_lite.generator import build_prompt, generate_article, markdown_to_wechat_html
-from weixin_lite.llm import _parse_retry_after, default_base_url, default_model
-from weixin_lite.models import BatchProject, FigureAnalysis, PaperInput, generation_candidate_papers, generation_ready_papers, unavailable_papers
+from weixin_lite.generator import ArticleGenerationError, build_prompt, generate_article, markdown_to_wechat_html
+from weixin_lite.llm import _parse_retry_after, call_openai_compatible, default_base_url, default_model
+from weixin_lite.models import AnalysisClaim, BatchProject, FigureAnalysis, PaperAnalysis, PaperInput, generation_candidate_papers, generation_ready_papers, unavailable_papers
 from weixin_lite.pdf_reader import PdfContent, extract_figure_legends, extract_numeric_evidence
 from weixin_lite.search import (
     build_plain_search_queries,
@@ -370,16 +374,165 @@ def test_wechat_markdown_html_matches_reference_style_without_duplicate_title():
     assert "原文信息" in html
 
 
-def test_exported_article_html_includes_wechat_platform_header():
+def test_exported_article_html_omits_wechat_platform_header():
     article = generate_article(PaperInput(title_zh="测试文章", journal="Nature Biotechnology"))
 
     html = article_html(article)
 
-    assert "原创" in html
-    assert "陶小花" in html
-    assert "遇见生物合成" in html
-    assert 'font-size:28px;line-height:1.22' in html
-    assert article.title in html
+    assert "原创" not in html
+    assert "陶小花" not in html
+    assert "遇见生物合成" not in html
+    assert 'font-size:28px;line-height:1.22' not in html
+    assert "文章核心要点简述" in html
+
+
+def test_llm_429_warning_is_user_friendly(monkeypatch):
+    def fail_call(**kwargs):
+        raise LLMError(
+            "LLM HTTP 429 Too Many Requests: You exceeded your current quota. https://platform.openai.com/docs",
+            status_code=429,
+            transient=True,
+        )
+
+    monkeypatch.setattr("weixin_lite.generator.call_openai_compatible", fail_call)
+    article = generate_article(PaperInput(title_zh="测试文章"), api_key="test-key")
+    joined = "；".join(article.warnings)
+
+    assert "模型接口额度不足或被限流" in joined
+    assert "Too Many Requests" not in joined
+    assert "platform.openai.com" not in joined
+
+
+def test_llm_retries_transient_429_and_respects_retry_after(monkeypatch):
+    calls = {"count": 0}
+    sleeps: list[float] = []
+
+    def fake_once(**kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise LLMError("rate_limit_exceeded", status_code=429, retry_after=2.5, transient=True)
+        return "ok"
+
+    monkeypatch.setattr(llm_module, "_call_openai_compatible_once", fake_once)
+    monkeypatch.setattr(llm_module.time, "sleep", sleeps.append)
+
+    result = call_openai_compatible("key", "https://example.test/v1", "model", "system", "user")
+
+    assert result == "ok"
+    assert calls["count"] == 2
+    assert sleeps == [2.5]
+
+
+def test_llm_does_not_retry_exhausted_quota(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_once(**kwargs):
+        calls["count"] += 1
+        raise LLMError(
+            "You exceeded your current quota",
+            status_code=429,
+            transient=False,
+            error_code="insufficient_quota",
+            quota_exhausted=True,
+        )
+
+    monkeypatch.setattr(llm_module, "_call_openai_compatible_once", fake_once)
+    monkeypatch.setattr(llm_module.time, "sleep", lambda seconds: pytest.fail("quota errors must not sleep"))
+
+    with pytest.raises(LLMError) as error:
+        call_openai_compatible("key", "https://example.test/v1", "model", "system", "user")
+
+    assert error.value.quota_exhausted is True
+    assert calls["count"] == 1
+
+
+def _complete_analysis() -> PaperAnalysis:
+    return PaperAnalysis(
+        research_question=[AnalysisClaim("研究问题", page="1", evidence_text="摘要")],
+        methods=[AnalysisClaim("研究方法", page="3", figure_id="Fig. 1", evidence_text="方法段")],
+        key_results=[AnalysisClaim("关键结果", page="5", figure_id="Fig. 2", evidence_text="结果段")],
+        innovation=[AnalysisClaim("创新意义", page="6", evidence_text="讨论段")],
+        limitations=[AnalysisClaim("样本有限", page="7", evidence_text="局限段")],
+        conclusion=[AnalysisClaim("论文结论", page="8", evidence_text="结论段")],
+        status="complete",
+        source_hash="source-hash",
+        model="test-model",
+    )
+
+
+def test_analysis_models_serialize_and_cache_key_excludes_api_key():
+    analysis = _complete_analysis()
+    restored = PaperAnalysis.from_dict(analysis.to_dict())
+    paper = PaperInput(title_en="Traceable paper", doi="10.1000/trace")
+    pdf = PdfContent(text="full text", hash="pdf-hash", quality="high", coverage=["results"])
+
+    first = analysis_cache_key(paper, pdf, {"model": "test-model", "api_key": "secret-a"})
+    second = analysis_cache_key(paper, pdf, {"model": "test-model", "api_key": "secret-b"})
+
+    assert restored.complete
+    assert restored.key_results[0].figure_id == "Fig. 2"
+    assert first == second
+    assert "secret" not in first
+
+
+def test_analysis_failure_preserves_previous_complete_analysis(monkeypatch):
+    previous = _complete_analysis()
+    monkeypatch.setattr(
+        "weixin_lite.article_analysis.call_openai_compatible",
+        lambda **kwargs: (_ for _ in ()).throw(LLMError("server overloaded", status_code=500, transient=True)),
+    )
+
+    result = analyze_paper(
+        PaperInput(title_en="Paper"),
+        PdfContent(text="[Page 1] full text", hash="hash"),
+        {"api_key": "key", "model": "test-model"},
+        previous_analysis=previous,
+    )
+
+    assert result.complete
+    assert result.key_results[0].statement == "关键结果"
+    assert any("已保留上一次完整分析" in warning for warning in result.warnings)
+
+
+def test_failed_analysis_cannot_generate_fake_completed_article():
+    failed = PaperAnalysis(status="failed", error="analysis unavailable")
+
+    with pytest.raises(ArticleGenerationError, match="analysis unavailable"):
+        generate_article(PaperInput(title_en="Paper"), analysis=failed, api_key="key")
+
+
+def test_quality_generation_uses_one_call_without_hidden_length_repair(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_call(**kwargs):
+        calls["count"] += 1
+        return json.dumps(
+            {
+                "title": "可追溯解读",
+                "digest": "摘要",
+                "intro": "导语",
+                "core_points": ["核心结果来自第五页。"],
+                "figure_notes": [],
+                "innovation": ["创新点来自第六页。"],
+                "limitations": ["样本有限。"],
+                "take_home": "总结。",
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr("weixin_lite.generator.call_openai_compatible", fake_call)
+
+    article = generate_article(
+        PaperInput(title_en="Paper"),
+        pdf=PdfContent(text="full text", hash="source-hash"),
+        api_key="key",
+        analysis=_complete_analysis(),
+    )
+
+    assert calls["count"] == 1
+    assert article.analysis_version == "paper-analysis-v1"
+    assert "局限性与解读边界" in article.body_markdown
+    assert any("显式补写/精简" in warning for warning in article.warnings)
 
 
 def test_project_zip_contains_paywalled_and_download_status():

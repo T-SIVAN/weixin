@@ -230,6 +230,11 @@ class EvidenceItem:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "EvidenceItem":
+        fields = cls.__dataclass_fields__
+        return cls(**{key: value for key, value in data.items() if key in fields})
+
 
 @dataclass
 class FigureAnalysis:
@@ -243,11 +248,123 @@ class FigureAnalysis:
     evidence: list[EvidenceItem] = field(default_factory=list)
     needs_manual_check: bool = False
     needs_manual_crop: bool = False
+    crop_bbox: tuple[float, float, float, float] | None = None
+    confidence: float = 0.0
+    role: str = ""
+    selected: bool = False
+    order: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["evidence"] = [item.to_dict() for item in self.evidence]
         return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "FigureAnalysis":
+        fields = cls.__dataclass_fields__
+        values = {key: value for key, value in data.items() if key in fields}
+        values["evidence"] = [
+            EvidenceItem.from_dict(item)
+            for item in data.get("evidence") or []
+            if isinstance(item, dict)
+        ]
+        bbox = data.get("crop_bbox")
+        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            values["crop_bbox"] = tuple(float(value) for value in bbox)
+        return cls(**values)
+
+
+@dataclass
+class AnalysisClaim:
+    statement: str
+    page: str = ""
+    figure_id: str = ""
+    evidence_text: str = ""
+    confidence: str = "medium"
+
+    @property
+    def traceable(self) -> bool:
+        return bool(self.page.strip() or self.figure_id.strip())
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AnalysisClaim":
+        fields = cls.__dataclass_fields__
+        return cls(**{key: value for key, value in data.items() if key in fields})
+
+
+@dataclass
+class PaperAnalysis:
+    research_question: list[AnalysisClaim] = field(default_factory=list)
+    background: list[AnalysisClaim] = field(default_factory=list)
+    methods: list[AnalysisClaim] = field(default_factory=list)
+    key_results: list[AnalysisClaim] = field(default_factory=list)
+    innovation: list[AnalysisClaim] = field(default_factory=list)
+    limitations: list[AnalysisClaim] = field(default_factory=list)
+    conclusion: list[AnalysisClaim] = field(default_factory=list)
+    status: str = "pending"
+    error: str = ""
+    warnings: list[str] = field(default_factory=list)
+    source_hash: str = ""
+    model: str = ""
+    version: str = "paper-analysis-v1"
+    created_at: str = field(default_factory=utc_now)
+
+    @property
+    def claims(self) -> list[AnalysisClaim]:
+        return [
+            claim
+            for name in (
+                "research_question",
+                "background",
+                "methods",
+                "key_results",
+                "innovation",
+                "limitations",
+                "conclusion",
+            )
+            for claim in getattr(self, name)
+        ]
+
+    @property
+    def complete(self) -> bool:
+        return self.status == "complete" and bool(self.claims)
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        for name in (
+            "research_question",
+            "background",
+            "methods",
+            "key_results",
+            "innovation",
+            "limitations",
+            "conclusion",
+        ):
+            data[name] = [item.to_dict() for item in getattr(self, name)]
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PaperAnalysis":
+        fields = cls.__dataclass_fields__
+        values = {key: value for key, value in data.items() if key in fields}
+        for name in (
+            "research_question",
+            "background",
+            "methods",
+            "key_results",
+            "innovation",
+            "limitations",
+            "conclusion",
+        ):
+            values[name] = [
+                AnalysisClaim.from_dict(item)
+                for item in data.get(name) or []
+                if isinstance(item, dict)
+            ]
+        return cls(**values)
 
 
 @dataclass
@@ -264,6 +381,9 @@ class QuickReadArticle:
     status: str = "draft"
     warnings: list[str] = field(default_factory=list)
     created_at: str = field(default_factory=utc_now)
+    analysis_version: str = ""
+    source_hash: str = ""
+    lead_image_name: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

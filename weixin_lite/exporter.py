@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import csv
-from datetime import datetime
 import html as html_lib
 import io
 import json
-import os
 import re
 import zipfile
 from typing import Any
-from urllib import request
+from urllib import parse, request
 
 from .models import BatchProject, DownloadedPaper, PaperInput, QuickReadArticle
 
@@ -19,72 +17,144 @@ def safe_slug(value: str, fallback: str = "article") -> str:
     return (slug or fallback)[:80]
 
 
+_IMG_TAG_RE = re.compile(r"<img\b[^>]*>", flags=re.I | re.S)
+_SRC_ATTR_RE = re.compile(r"(?<![\w:-])src(\s*=\s*)([\"'])(.*?)\2", flags=re.I | re.S)
+
+
+def _safe_asset_basename(name: str) -> str:
+    decoded = parse.unquote(html_lib.unescape(str(name or ""))).replace("\\", "/")
+    basename = decoded.rsplit("/", 1)[-1].strip()
+    basename = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", basename).rstrip(". ")
+    return basename if basename not in {"", ".", ".."} else "image"
+
+
+def _asset_archive_entries(assets: dict[str, bytes]) -> list[tuple[str, str, bytes]]:
+    entries: list[tuple[str, str, bytes]] = []
+    used: set[str] = set()
+    for source_name in sorted(assets, key=lambda value: str(value).replace("\\", "/").casefold()):
+        data = assets[source_name]
+        if not data:
+            continue
+        basename = _safe_asset_basename(source_name)
+        stem, dot, suffix = basename.rpartition(".")
+        if not stem:
+            stem, dot, suffix = basename, "", ""
+        candidate = basename
+        counter = 2
+        while candidate.casefold() in used:
+            candidate = f"{stem}-{counter}{dot}{suffix}"
+            counter += 1
+        used.add(candidate.casefold())
+        entries.append((str(source_name).replace("\\", "/"), candidate, data))
+    return entries
+
+
+def _rewrite_packaged_image_references(content: str, asset_names: dict[str, str]) -> str:
+    def mapped_src(src: str) -> str | None:
+        raw = html_lib.unescape(src).strip()
+        path, marker, tail = raw.partition("?")
+        if not marker:
+            path, marker, tail = raw.partition("#")
+        normalized = path.replace("\\", "/")
+        for prefix in ("./images/", "/images/", "images/"):
+            if normalized.startswith(prefix):
+                source_name = parse.unquote(normalized[len(prefix) :])
+                archived = asset_names.get(source_name)
+                if archived is None:
+                    return None
+                trailer = f"{marker}{tail}" if marker else ""
+                return f"images/{archived}{trailer}"
+        return None
+
+    def replace_tag(tag_match: re.Match[str]) -> str:
+        tag = tag_match.group(0)
+        attr = _SRC_ATTR_RE.search(tag)
+        if not attr:
+            return tag
+        replacement = mapped_src(attr.group(3))
+        if replacement is None:
+            return tag
+        escaped = html_lib.escape(replacement, quote=True)
+        return tag[: attr.start(3)] + escaped + tag[attr.end(3) :]
+
+    rewritten = _IMG_TAG_RE.sub(replace_tag, content or "")
+
+    def replace_markdown(match: re.Match[str]) -> str:
+        destination = match.group(2).strip()
+        wrapped = destination.startswith("<") and destination.endswith(">")
+        raw = destination[1:-1] if wrapped else destination
+        replacement = mapped_src(raw)
+        if replacement is None:
+            return match.group(0)
+        value = f"<{replacement}>" if wrapped else replacement
+        return f"{match.group(1)}{value}{match.group(3)}"
+
+    return re.sub(r"(!\[[^\]]*\]\()([^\r\n)]*)(\))", replace_markdown, rewritten)
+
+
 ARTICLE_CANVAS_STYLE = (
     "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;"
-    "max-width:760px;margin:0 auto;padding:0 10px 44px;background:#fff;color:#000;"
+    "width:100%;max-width:760px;box-sizing:border-box;margin:0 auto;padding:0 14px 44px;"
+    "background:#fff;color:#000;"
 )
-ARTICLE_TITLE_STYLE = "margin:0 0 24px;font-size:28px;line-height:1.22;color:#000;font-weight:800;"
-ARTICLE_META_STYLE = "margin:0 0 42px;font-size:15px;line-height:1.7;color:#a0a4aa;"
-ARTICLE_ORIGINAL_STYLE = (
-    "display:inline-block;margin:0 10px 0 0;padding:1px 6px;border-radius:2px;"
-    "background:#f3f3f3;color:#a0a4aa;font-size:14px;vertical-align:1px;"
-)
-ARTICLE_ACCOUNT_STYLE = "color:#576b95;text-decoration:none;margin:0 12px 0 8px;"
-ARTICLE_AUTHOR_STYLE = "color:#a0a4aa;margin:0;"
-ARTICLE_COVER_STYLE = "margin:0 0 42px;"
+ARTICLE_LEAD_IMAGE_STYLE = "margin:0 0 42px;"
+# Kept for callers that imported the old constant. Platform covers are no longer
+# inserted into the article body.
+ARTICLE_COVER_STYLE = ARTICLE_LEAD_IMAGE_STYLE
 WECHAT_CONTENT_STYLE = (
     "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;"
-    "background:#fff;color:#000;line-height:2.05;font-size:18px;"
+    "background:#fff;color:#000;font-size:18px;line-height:2.05;word-break:break-word;"
 )
 
 
-def _format_article_time(value: str) -> str:
-    try:
-        parsed = datetime.fromisoformat((value or "").replace("Z", "+00:00"))
-    except ValueError:
+def _local_image_names(content_html: str) -> set[str]:
+    names: set[str] = set()
+    for tag_match in _IMG_TAG_RE.finditer(content_html or ""):
+        attr = _SRC_ATTR_RE.search(tag_match.group(0))
+        if not attr:
+            continue
+        src = html_lib.unescape(attr.group(3)).strip().replace("\\", "/")
+        for prefix in ("./images/", "/images/", "images/"):
+            if src.startswith(prefix):
+                name = src[len(prefix) :].split("?", 1)[0].split("#", 1)[0]
+                names.add(parse.unquote(name))
+                break
+    return names
+
+
+def _lead_image_html(article: QuickReadArticle, content_html: str) -> str:
+    lead_image_name = str(getattr(article, "lead_image_name", "") or "").strip()
+    if not lead_image_name or lead_image_name in _local_image_names(content_html):
         return ""
-    return f"{parsed.year}年{parsed.month}月{parsed.day}日 {parsed.hour:02d}:{parsed.minute:02d}"
-
-
-def _wechat_author(author: str = "") -> str:
-    return author or os.getenv("WECHAT_AUTHOR_NAME", "陶小花")
-
-
-def _wechat_account(account_name: str = "") -> str:
-    return account_name or os.getenv("WECHAT_ACCOUNT_NAME", "遇见生物合成")
-
-
-def article_platform_header_html(article: QuickReadArticle, *, author: str = "", account_name: str = "") -> str:
-    published_at = _format_article_time(article.created_at)
-    date_html = f'<span>{html_lib.escape(published_at)}</span>' if published_at else ""
+    escaped_name = html_lib.escape(lead_image_name, quote=True)
     return (
-        f'<h1 style="{ARTICLE_TITLE_STYLE}">{html_lib.escape(article.title)}</h1>\n'
-        f'<section style="{ARTICLE_META_STYLE}">'
-        f'<span style="{ARTICLE_ORIGINAL_STYLE}">原创</span>'
-        f'<span style="{ARTICLE_AUTHOR_STYLE}">{html_lib.escape(_wechat_author(author))}</span>'
-        f'<span style="{ARTICLE_ACCOUNT_STYLE}">{html_lib.escape(_wechat_account(account_name))}</span>'
-        f"{date_html}"
-        "</section>"
+        f'<section style="{ARTICLE_LEAD_IMAGE_STYLE}">'
+        f'<img src="images/{escaped_name}" alt="论文首页" '
+        'style="width:100%;height:auto;display:block;margin:0 auto;">'
+        "</section>\n"
     )
 
 
 def wechat_content_html(article: QuickReadArticle, content_html: str | None = None, *, include_cover: bool = False) -> str:
-    cover = ""
-    if include_cover and article.cover_image_name:
-        cover = (
-            f'<section style="{ARTICLE_COVER_STYLE}">'
-            f'<img src="images/{html_lib.escape(article.cover_image_name)}" alt="publisher title image" '
-            'style="width:100%;height:auto;display:block;margin:0 auto;">'
-            "</section>\n"
-        )
-    return f'<section style="{WECHAT_CONTENT_STYLE}">\n{cover}{content_html or article.body_html}\n</section>'
+    # include_cover remains in the signature for API compatibility. A WeChat
+    # platform cover is a payload asset and must never be duplicated in content.
+    _ = include_cover
+    body = article.body_html if content_html is None else content_html
+    lead = _lead_image_html(article, body)
+    return f'<section style="{WECHAT_CONTENT_STYLE}">\n{lead}{body}\n</section>'
 
 
-def article_document_html(article: QuickReadArticle, *, author: str = "", account_name: str = "") -> str:
+def article_document_html(
+    article: QuickReadArticle,
+    content_html: str | None = None,
+    *,
+    author: str = "",
+    account_name: str = "",
+) -> str:
+    _ = (author, account_name)
     return (
         f'<section style="{ARTICLE_CANVAS_STYLE}">\n'
-        f"{article_platform_header_html(article, author=author, account_name=account_name)}\n"
-        f"{wechat_content_html(article, include_cover=True)}\n"
+        f"{wechat_content_html(article, content_html=content_html)}\n"
         "</section>"
     )
 
@@ -96,7 +166,7 @@ def article_html(article: QuickReadArticle) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{article.title}</title>
+  <title>{html_lib.escape(article.title)}</title>
   <style>
     html, body {{ margin:0; padding:0; background:#fff; }}
     body {{ padding:0 0 60px; }}
@@ -144,6 +214,8 @@ def project_zip(
     downloads: list[DownloadedPaper] | None = None,
 ) -> bytes:
     assets = image_assets or {}
+    asset_entries = _asset_archive_entries(assets)
+    asset_names = {source_name: archived_name for source_name, archived_name, _data in asset_entries}
     download_items = downloads if downloads is not None else project.downloads
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -158,8 +230,10 @@ def project_zip(
         zf.writestr("latest_papers.json", json.dumps([paper.to_dict() for paper in project.papers], ensure_ascii=False, indent=2))
         for index, article in enumerate(project.articles, start=1):
             slug = safe_slug(article.title, f"article-{index:02d}")
-            zf.writestr(f"articles/{index:02d}-{slug}.md", article.body_markdown)
-            zf.writestr(f"articles/{index:02d}-{slug}.html", article_html(article))
+            markdown = _rewrite_packaged_image_references(article.body_markdown, asset_names)
+            rendered_html = _rewrite_packaged_image_references(article_html(article), asset_names)
+            zf.writestr(f"articles/{index:02d}-{slug}.md", markdown)
+            zf.writestr(f"articles/{index:02d}-{slug}.html", rendered_html)
             zf.writestr(
                 f"evidence/{index:02d}-{slug}.json",
                 json.dumps(
@@ -168,14 +242,15 @@ def project_zip(
                         "figures": [figure.to_dict() for figure in article.figures],
                         "evidence": [item.to_dict() for item in article.evidence],
                         "warnings": article.warnings,
+                        "source_hash": str(getattr(article, "source_hash", "") or ""),
+                        "analysis_version": str(getattr(article, "analysis_version", "") or ""),
                     },
                     ensure_ascii=False,
                     indent=2,
                 ),
             )
-        for name, data in assets.items():
-            if data:
-                zf.writestr(f"images/{safe_slug(name, 'image')}", data)
+        for _source_name, archived_name, data in asset_entries:
+            zf.writestr(f"images/{archived_name}", data)
     return buffer.getvalue()
 
 
@@ -195,6 +270,7 @@ def post_to_bridge(bridge_url: str, article: QuickReadArticle, token: str = "") 
         "source_url": article.paper.url,
         "doi": article.paper.doi,
         "warnings": article.warnings,
+        "source_hash": str(getattr(article, "source_hash", "") or ""),
     }
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     headers = {"Content-Type": "application/json"}
