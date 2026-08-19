@@ -41,6 +41,12 @@ class ProviderConfig:
 
 PROVIDERS: dict[str, ProviderConfig] = {
     "openai": ProviderConfig("openai", "OpenAI", "https://api.openai.com/v1", "gpt-4o-mini"),
+    "gemini": ProviderConfig(
+        "gemini",
+        "Google Gemini",
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+        "gemini-2.5-flash",
+    ),
     "deepseek": ProviderConfig("deepseek", "DeepSeek", "https://api.deepseek.com/v1", "deepseek-chat"),
     "siliconflow": ProviderConfig("siliconflow", "SiliconFlow", "https://api.siliconflow.cn/v1", "Qwen/Qwen2.5-7B-Instruct"),
     "custom": ProviderConfig("custom", "Custom OpenAI-compatible", "", ""),
@@ -56,7 +62,10 @@ def default_provider() -> str:
     return normalize_provider(os.getenv("LLM_PROVIDER") or os.getenv("OPENAI_PROVIDER") or "openai")
 
 
-def default_api_key() -> str:
+def default_api_key(provider: str = "") -> str:
+    provider_key = normalize_provider(provider or default_provider())
+    if provider_key == "gemini":
+        return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("LLM_API_KEY") or ""
     return os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY") or ""
 
 

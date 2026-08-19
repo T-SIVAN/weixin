@@ -581,9 +581,9 @@ def sidebar_settings() -> tuple[str, str, str, str, int, float]:
         format_func=lambda key: PROVIDERS[key].label,
     )
     defaults = provider_defaults(provider)
-    api_key = st.sidebar.text_input("API Key", value=default_api_key(), type="password")
-    base_url = st.sidebar.text_input("Base URL", value=default_base_url(provider) or defaults.base_url)
-    model = st.sidebar.text_input("Model", value=default_model(provider) or defaults.default_model)
+    api_key = st.sidebar.text_input("API Key", value=default_api_key(provider), type="password", key=f"api_key_{provider}")
+    base_url = st.sidebar.text_input("Base URL", value=default_base_url(provider) or defaults.base_url, key=f"base_url_{provider}")
+    model = st.sidebar.text_input("Model", value=default_model(provider) or defaults.default_model, key=f"model_{provider}")
     batch_size = st.sidebar.slider("翻译批量", 1, 20, 8)
     delay_seconds = st.sidebar.slider("翻译间隔（秒）", 0.0, 10.0, 1.0, step=0.5)
     st.sidebar.caption("支持 OpenAI-compatible 接口。标题翻译会优先使用本地缓存；遇到 429 会自动退避重试。")

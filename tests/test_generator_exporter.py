@@ -10,7 +10,7 @@ from weixin_lite.article_analysis import analysis_cache_key, analyze_paper
 from weixin_lite.downloader import download_open_access
 from weixin_lite.exporter import article_html, project_zip, unavailable_dois_csv
 from weixin_lite.generator import ArticleGenerationError, build_prompt, generate_article, markdown_to_wechat_html
-from weixin_lite.llm import _parse_retry_after, call_openai_compatible, default_base_url, default_model
+from weixin_lite.llm import _parse_retry_after, call_openai_compatible, default_api_key, default_base_url, default_model
 from weixin_lite.models import AnalysisClaim, BatchProject, FigureAnalysis, PaperAnalysis, PaperInput, generation_candidate_papers, generation_ready_papers, unavailable_papers
 from weixin_lite.pdf_reader import PdfContent, extract_figure_legends, extract_numeric_evidence
 from weixin_lite.search import (
@@ -292,9 +292,19 @@ def test_retry_after_naive_http_date_does_not_raise():
 
 
 def test_provider_defaults_are_configured():
+    assert default_base_url("gemini") == "https://generativelanguage.googleapis.com/v1beta/openai"
+    assert default_model("gemini") == "gemini-2.5-flash"
     assert default_base_url("deepseek") == "https://api.deepseek.com/v1"
     assert default_model("deepseek") == "deepseek-chat"
     assert default_base_url("siliconflow") == "https://api.siliconflow.cn/v1"
+
+
+def test_gemini_api_key_uses_gemini_environment(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+
+    assert default_api_key("gemini") == "gemini-key"
 
 
 def test_paywalled_without_oa_url_keeps_doi_only():
