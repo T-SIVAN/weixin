@@ -44,11 +44,14 @@ from weixin_lite.search import (
     DEFAULT_KEYWORDS,
     DEFAULT_JOURNALS_PATH,
     JournalFilter,
+    filter_records_by_keywords,
     load_journal_filters,
     parse_manual_inputs,
+    parse_keywords,
     resolve_doi,
     resolve_keyword_plan,
     run_journal_latest_search,
+    suggest_filter_keywords,
 )
 from weixin_lite.translate import DEFAULT_CACHE_PATH, TranslationReport, translate_records
 from weixin_lite.wechat_publish import WechatDraftConfig, export_wechat_payload, publish_draft
@@ -71,6 +74,9 @@ def init_state() -> None:
     st.session_state.setdefault("keywords", ", ".join(DEFAULT_KEYWORDS))
     st.session_state.setdefault("query_plan", None)
     st.session_state.setdefault("search_append", False)
+    st.session_state.setdefault("search_filter_keywords", [])
+    st.session_state.setdefault("search_filter_custom", "")
+    st.session_state.setdefault("search_filter_suggestions", [])
     st.session_state.setdefault("last_translation_report", None)
     st.session_state.setdefault("single_active_paper", None)
     st.session_state.setdefault("single_active_pdf_name", "")
@@ -630,7 +636,8 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
 
     col_a, col_b, col_c, col_d = st.columns([1, 1, 1.3, 1.4])
     limit = col_a.slider("结果数量", 10, 200, 100, step=10)
-    since_days = col_b.slider("抓取天数", 1, 30, 7)
+    since_years = col_b.slider("抓取年数", 1, 10, 1)
+    since_days = since_years * 365
     selected_sources = col_c.multiselect(
         "数据源",
         ["PubMed", "Europe PMC", "Crossref", "OpenAlex"],
@@ -657,7 +664,7 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
     )
     journals = rows_to_journals(edited_journals)
     enabled_count = len([journal for journal in journals if journal.enabled])
-    st.caption(f"已启用 {enabled_count} 本期刊；默认抓取最近 {since_days} 天，按期刊优先级和发表日期排序。")
+    st.caption(f"已启用 {enabled_count} 本期刊；抓取最近 {since_years} 年内的全部期刊文章，搜索后再按关键词筛选。")
 
     if st.button("抓取最新文章", type="primary"):
         with st.spinner("正在按期刊检索 PubMed、Europe PMC、OpenAlex、Crossref..."):
@@ -675,6 +682,9 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
             st.info("；".join(run.warnings))
         if run.records:
             st.success(f"已抓取 {len(run.records)} 条文章。可继续点击下方按钮翻译标题。")
+            st.session_state.search_filter_suggestions = suggest_filter_keywords(run.records)
+            st.session_state.search_filter_keywords = []
+            st.session_state.search_filter_custom = ""
         else:
             st.info("本次没有符合条件的最新文章。")
         show_paper_table(run.records, "last_search", filters=True)
@@ -684,10 +694,50 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
     papers: list[PaperInput] = st.session_state.papers
     if papers:
         st.divider()
+        st.markdown("#### 搜索后关键词筛选")
+        suggestions = suggest_filter_keywords(papers)
+        filter_options = list(
+            dict.fromkeys(
+                [
+                    *st.session_state.get("search_filter_suggestions", []),
+                    *suggestions,
+                    *DEFAULT_KEYWORDS,
+                ]
+            )
+        )
+        current_filter = [
+            item for item in st.session_state.get("search_filter_keywords", []) if item in filter_options
+        ]
+        if current_filter != st.session_state.get("search_filter_keywords", []):
+            st.session_state.search_filter_keywords = current_filter
+        if filter_options:
+            st.caption("推荐筛选词：" + "，".join(filter_options[:12]))
+        selected_filter_keywords = st.multiselect(
+            "选择关键词后只筛选当前候选，不会丢失全量检索结果",
+            filter_options,
+            key="search_filter_keywords",
+        )
+        custom_filter_keywords = st.text_input(
+            "自定义筛选关键词",
+            key="search_filter_custom",
+            placeholder="例如：CRISPR, metabolic engineering, cell factory",
+        )
+        active_filter_terms = list(
+            dict.fromkeys([*selected_filter_keywords, *parse_keywords(custom_filter_keywords)])
+        )
+        filtered_papers = filter_records_by_keywords(papers, active_filter_terms) if active_filter_terms else list(papers)
+        st.caption(f"已保留全量 {len(papers)} 条；当前显示 {len(filtered_papers)} 条。未选择关键词时显示全部。")
+        if active_filter_terms and st.button("将筛选结果设为候选"):
+            st.session_state.papers = filtered_papers
+            papers = filtered_papers
+            st.success(f"已将候选收窄为 {len(filtered_papers)} 条。")
+
         col_translate, col_retry = st.columns(2)
-        if col_translate.button("翻译全部未翻译标题"):
+        if not api_key.strip():
+            st.warning("翻译需要先在左侧“翻译/生成模型”填写对应供应商的 API Key；没有密钥时系统会保留英文并标记为待翻译。")
+        if col_translate.button("翻译当前筛选结果"):
             report = translate_current_papers(
-                papers,
+                filtered_papers,
                 provider=provider,
                 api_key=api_key,
                 base_url=base_url,
@@ -696,9 +746,9 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
                 delay_seconds=delay_seconds,
             )
             st.session_state.last_translation_report = report
-        if col_retry.button("重试失败翻译"):
+        if col_retry.button("重试当前筛选失败翻译"):
             report = translate_current_papers(
-                papers,
+                filtered_papers,
                 provider=provider,
                 api_key=api_key,
                 base_url=base_url,
@@ -711,8 +761,8 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
         last_report = st.session_state.get("last_translation_report")
         if isinstance(last_report, TranslationReport):
             show_translation_report(last_report)
-        show_paper_table(papers, "current_candidates", filters=True)
-        show_details(papers, "查看候选摘要和错误")
+        show_paper_table(filtered_papers, "current_candidates", filters=True)
+        show_details(filtered_papers, "查看候选摘要和错误")
 
 
 def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:

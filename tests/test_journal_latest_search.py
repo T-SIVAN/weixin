@@ -7,10 +7,12 @@ from weixin_lite.search import (
     JournalFilter,
     build_europe_pmc_journal_query,
     build_pubmed_journal_query,
+    filter_records_by_keywords,
     journal_latest_search,
     load_journal_filters,
     run_journal_latest_search,
     should_keep_article_type,
+    suggest_filter_keywords,
 )
 
 
@@ -127,6 +129,28 @@ def test_journal_latest_search_merges_sources_filters_types_and_sorts(monkeypatc
     assert [record.doi for record in records] == ["10.1000/nature-review", "10.1000/shared"]
     assert records[1].abstract_en == "More complete abstract."
     assert "Europe PMC" in records[1].source
+
+
+def test_keyword_filtering_is_applied_after_latest_search_results_are_kept():
+    papers = [
+        PaperInput(
+            title_en="Metabolic engineering of microbial cell factories",
+            abstract_en="A synthetic biology route for biomanufacturing.",
+            doi="10.1000/metabolic",
+        ),
+        PaperInput(
+            title_en="Clinical trial of a cardiac device",
+            abstract_en="A patient outcome study.",
+            doi="10.1000/clinical",
+        ),
+    ]
+
+    suggestions = suggest_filter_keywords(papers, limit=8)
+    filtered = filter_records_by_keywords(papers, ["代谢工程"])
+
+    assert any("metabolic" in keyword.lower() or keyword == "代谢工程" for keyword in suggestions)
+    assert [paper.doi for paper in filtered] == ["10.1000/metabolic"]
+    assert filter_records_by_keywords(papers, []) == papers
 
 
 def test_journal_latest_search_skips_openalex_without_key(monkeypatch):
