@@ -250,39 +250,68 @@ def test_translation_retries_429(monkeypatch, tmp_path):
 
 
 def test_translation_splits_failed_batch(monkeypatch, tmp_path):
-    seen_batch_sizes: list[int] = []
+    seen_prompts: list[str] = []
 
     def fake_call(**kwargs):
-        payload = json.loads(kwargs["user_prompt"])
-        seen_batch_sizes.append(len(payload))
-        if len(payload) > 1:
-            raise LLMError("server overloaded", status_code=500, transient=True)
-        return '[{"title_zh": "单篇成功"}]'
+        prompt = kwargs["user_prompt"]
+        seen_prompts.append(prompt)
+        if prompt.startswith("["):
+            payload = json.loads(prompt)
+            if len(payload) > 1:
+                raise LLMError("server overloaded", status_code=500, transient=True)
+            return '[{"title_zh": "单篇成功"}]'
+        if prompt == "First":
+            return '{"title_zh": "第一篇成功"}'
+        if prompt == "Second":
+            return "第二篇成功"
+        raise AssertionError(f"Unexpected prompt: {prompt}")
 
     monkeypatch.setattr("weixin_lite.translate.call_openai_compatible", fake_call)
     papers = [PaperInput(title_en="First"), PaperInput(title_en="Second")]
 
     report = translate_records(papers, api_key="test-key", batch_size=2, delay_seconds=0, max_retries=0, cache_path=tmp_path / "cache.json")
 
-    assert seen_batch_sizes == [2, 1, 1]
-    assert [paper.title_zh for paper in papers] == ["单篇成功", "单篇成功"]
+    assert seen_prompts == ['[{"title_en": "First"}, {"title_en": "Second"}]', "First", "Second"]
+    assert [paper.title_zh for paper in papers] == ["第一篇成功", "第二篇成功"]
     assert report.failed_count == 0
+    assert report.ok
 
 
-def test_translation_mismatched_json_marks_missing_failed(monkeypatch, tmp_path):
+def test_translation_mismatched_json_falls_back_to_single_title(monkeypatch, tmp_path):
+    seen_prompts: list[str] = []
+
     def fake_call(**kwargs):
-        return '[{"title_zh": "第一篇"}]'
+        prompt = kwargs["user_prompt"]
+        seen_prompts.append(prompt)
+        if prompt.startswith("["):
+            return '[{"title_zh": "第一篇"}]'
+        return json.dumps({"title_zh": f"{prompt} 中文"}, ensure_ascii=False)
 
     monkeypatch.setattr("weixin_lite.translate.call_openai_compatible", fake_call)
     papers = [PaperInput(title_en="First"), PaperInput(title_en="Second")]
 
     report = translate_records(papers, api_key="test-key", batch_size=2, delay_seconds=0, cache_path=tmp_path / "cache.json")
 
-    assert papers[0].title_zh == "第一篇"
-    assert papers[0].translation_status == "translated"
-    assert papers[1].title_zh == ""
-    assert papers[1].translation_status == "failed"
-    assert report.translated_count == 1
+    assert seen_prompts == ['[{"title_en": "First"}, {"title_en": "Second"}]', "First", "Second"]
+    assert [paper.title_zh for paper in papers] == ["First 中文", "Second 中文"]
+    assert [paper.translation_status for paper in papers] == ["translated", "translated"]
+    assert report.translated_count == 2
+    assert report.failed_count == 0
+    assert report.ok
+
+
+def test_translation_single_title_fallback_failure_marks_failed(monkeypatch, tmp_path):
+    def fake_call(**kwargs):
+        if kwargs["user_prompt"].startswith("["):
+            raise LLMError("server overloaded", status_code=500, transient=True)
+        raise LLMError("quota exhausted", status_code=429, transient=False)
+
+    monkeypatch.setattr("weixin_lite.translate.call_openai_compatible", fake_call)
+    paper = PaperInput(title_en="First")
+
+    report = translate_records([paper], api_key="test-key", batch_size=1, delay_seconds=0, max_retries=0, cache_path=tmp_path / "cache.json")
+
+    assert paper.translation_status == "failed"
     assert report.failed_count == 1
     assert report.failed_items
 

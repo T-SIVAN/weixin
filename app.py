@@ -590,9 +590,9 @@ def sidebar_settings() -> tuple[str, str, str, str, int, float]:
     api_key = st.sidebar.text_input("API Key", value=default_api_key(provider), type="password", key=f"api_key_{provider}")
     base_url = st.sidebar.text_input("Base URL", value=default_base_url(provider) or defaults.base_url, key=f"base_url_{provider}")
     model = st.sidebar.text_input("Model", value=default_model(provider) or defaults.default_model, key=f"model_{provider}")
-    batch_size = st.sidebar.slider("翻译批量", 1, 20, 8)
+    batch_size = st.sidebar.slider("标题翻译批量", 1, 20, 8)
     delay_seconds = st.sidebar.slider("翻译间隔（秒）", 0.0, 10.0, 1.0, step=0.5)
-    st.sidebar.caption("支持 OpenAI-compatible 接口。标题翻译会优先使用本地缓存；遇到 429 会自动退避重试。")
+    st.sidebar.caption("只翻译论文标题，不翻译摘要。优先使用本地缓存；批量失败会逐条标题兜底，遇到 429 会自动退避重试。")
     if st.sidebar.button("测试翻译模型"):
         try:
             raw = test_llm_connection(api_key=api_key, base_url=base_url, model=model)
@@ -636,8 +636,17 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
 
     col_a, col_b, col_c, col_d = st.columns([1, 1, 1.3, 1.4])
     limit = col_a.slider("结果数量", 10, 200, 100, step=10)
-    since_years = col_b.slider("抓取年数", 1, 10, 1)
-    since_days = since_years * 365
+    since_years = col_b.slider("抓取年数", 0, 10, 1)
+    since_months = col_b.slider("抓取月数", 0, 11, 0)
+    if since_years == 0 and since_months == 0:
+        since_months = 1
+    since_days = since_years * 365 + since_months * 30
+    window_parts = []
+    if since_years:
+        window_parts.append(f"{since_years} 年")
+    if since_months:
+        window_parts.append(f"{since_months} 个月")
+    search_window = "".join(window_parts) or "1 个月"
     selected_sources = col_c.multiselect(
         "数据源",
         ["PubMed", "Europe PMC", "Crossref", "OpenAlex"],
@@ -664,7 +673,7 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
     )
     journals = rows_to_journals(edited_journals)
     enabled_count = len([journal for journal in journals if journal.enabled])
-    st.caption(f"已启用 {enabled_count} 本期刊；抓取最近 {since_years} 年内的全部期刊文章，搜索后再按关键词筛选。")
+    st.caption(f"已启用 {enabled_count} 本期刊；抓取最近 {search_window} 内的全部期刊文章，搜索后再按关键词筛选。")
 
     if st.button("抓取最新文章", type="primary"):
         with st.spinner("正在按期刊检索 PubMed、Europe PMC、OpenAlex、Crossref..."):
@@ -681,7 +690,7 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
         if run.warnings:
             st.info("；".join(run.warnings))
         if run.records:
-            st.success(f"已抓取 {len(run.records)} 条文章。可继续点击下方按钮翻译标题。")
+            st.success(f"已抓取 {len(run.records)} 条文章。可继续点击下方按钮只翻译标题。")
             st.session_state.search_filter_suggestions = suggest_filter_keywords(run.records)
             st.session_state.search_filter_keywords = []
             st.session_state.search_filter_custom = ""
@@ -735,7 +744,7 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
         col_translate, col_retry = st.columns(2)
         if not api_key.strip():
             st.warning("翻译需要先在左侧“翻译/生成模型”填写对应供应商的 API Key；没有密钥时系统会保留英文并标记为待翻译。")
-        if col_translate.button("翻译当前筛选结果"):
+        if col_translate.button("只翻译当前筛选标题"):
             report = translate_current_papers(
                 filtered_papers,
                 provider=provider,
@@ -746,7 +755,7 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
                 delay_seconds=delay_seconds,
             )
             st.session_state.last_translation_report = report
-        if col_retry.button("重试当前筛选失败翻译"):
+        if col_retry.button("重试当前筛选失败标题"):
             report = translate_current_papers(
                 filtered_papers,
                 provider=provider,

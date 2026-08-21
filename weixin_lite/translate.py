@@ -17,6 +17,10 @@ TRANSLATE_SYSTEM = """你是生命科学文献标题翻译助手。
 把英文论文标题忠实翻译为中文，不扩写、不加入评价、不改变数字和专业术语。
 返回 JSON 数组，每个对象只包含 title_zh。"""
 
+TRANSLATE_SINGLE_TITLE_SYSTEM = """你是生命科学文献标题翻译助手。
+只翻译用户给出的一个英文论文标题，不翻译摘要，不解释。
+返回 JSON 对象，格式为 {"title_zh": "中文标题"}。"""
+
 DEFAULT_CACHE_PATH = Path("data/translation_cache.json")
 
 
@@ -187,6 +191,63 @@ def _call_translation_batch(
     raise last_error
 
 
+def _extract_title_translation(raw: str) -> str:
+    text = str(raw or "").strip()
+    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.I)
+    if fenced:
+        text = fenced.group(1).strip()
+    parsed: Any = None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{[\s\S]*?\}|\[[\s\S]*?\]", text)
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                parsed = None
+    if isinstance(parsed, list) and parsed:
+        parsed = parsed[0]
+    if isinstance(parsed, dict):
+        return str(parsed.get("title_zh") or "").strip()
+    return text.strip().strip('"').strip("'")
+
+
+def _call_translation_title(
+    candidate: _TranslationCandidate,
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    delay_seconds: float,
+    max_retries: int,
+) -> dict[str, str]:
+    last_error: Exception | None = None
+    attempts = max(1, max_retries + 1)
+    for attempt in range(attempts):
+        try:
+            raw = call_openai_compatible(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                system_prompt=TRANSLATE_SINGLE_TITLE_SYSTEM,
+                user_prompt=candidate.title,
+                temperature=0.1,
+                timeout=120,
+            )
+            title_zh = _extract_title_translation(raw)
+            if not title_zh:
+                raise ValueError("模型未返回有效 title_zh")
+            return {"title_zh": title_zh}
+        except Exception as exc:
+            last_error = exc
+            if attempt >= attempts - 1 or not _is_transient_error(exc):
+                break
+            _sleep_for_retry(exc, attempt, delay_seconds)
+    assert last_error is not None
+    raise last_error
+
+
 def _mark_failed(report: TranslationReport, candidate: _TranslationCandidate, error: str) -> None:
     candidate.record.translation_status = "failed"
     report.failed_count += 1
@@ -243,31 +304,61 @@ def _translate_chunk(
             delay_seconds=delay_seconds,
             max_retries=max_retries,
         )
-    except Exception as exc:
-        if len(chunk) > 1:
-            for candidate in chunk:
-                _translate_chunk(
-                    report,
-                    cache,
-                    [candidate],
+    except Exception:
+        for candidate in chunk:
+            try:
+                item = _call_translation_title(
+                    candidate,
                     api_key=api_key,
                     base_url=base_url,
                     model=model,
                     delay_seconds=delay_seconds,
                     max_retries=max_retries,
                 )
-            return
-        message = f"{type(exc).__name__}: {exc}"
-        report.errors.append(message)
-        _mark_failed(report, chunk[0], message)
+                if not _apply_translation(report, cache, candidate, item):
+                    _mark_failed(report, candidate, "模型未返回有效 title_zh")
+            except Exception as single_exc:
+                message = f"{type(single_exc).__name__}: {single_exc}"
+                report.errors.append(message)
+                _mark_failed(report, candidate, message)
         return
 
     if len(translated) != len(chunk):
-        report.errors.append(f"模型返回数量不匹配：请求 {len(chunk)} 条，返回 {len(translated)} 条")
+        for candidate in chunk:
+            try:
+                item = _call_translation_title(
+                    candidate,
+                    api_key=api_key,
+                    base_url=base_url,
+                    model=model,
+                    delay_seconds=delay_seconds,
+                    max_retries=max_retries,
+                )
+                if not _apply_translation(report, cache, candidate, item):
+                    _mark_failed(report, candidate, "模型未返回有效 title_zh")
+            except Exception as single_exc:
+                message = f"{type(single_exc).__name__}: {single_exc}"
+                report.errors.append(message)
+                _mark_failed(report, candidate, message)
+        return
     for idx, candidate in enumerate(chunk):
         item = translated[idx] if idx < len(translated) else {}
         if not _apply_translation(report, cache, candidate, item):
-            _mark_failed(report, candidate, "模型未返回有效 title_zh")
+            try:
+                item = _call_translation_title(
+                    candidate,
+                    api_key=api_key,
+                    base_url=base_url,
+                    model=model,
+                    delay_seconds=delay_seconds,
+                    max_retries=max_retries,
+                )
+                if not _apply_translation(report, cache, candidate, item):
+                    _mark_failed(report, candidate, "模型未返回有效 title_zh")
+            except Exception as single_exc:
+                message = f"{type(single_exc).__name__}: {single_exc}"
+                report.errors.append(message)
+                _mark_failed(report, candidate, message)
 
 
 def translate_records(
