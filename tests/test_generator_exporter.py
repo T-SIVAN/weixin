@@ -6,7 +6,7 @@ import pytest
 
 from weixin_lite import batch_analyze
 from weixin_lite import llm as llm_module
-from weixin_lite.article_analysis import analysis_cache_key, analyze_paper
+from weixin_lite.article_analysis import ANALYSIS_PROMPT_VERSION, analysis_cache_key, analyze_paper, build_analysis_prompt
 from weixin_lite.downloader import download_open_access
 from weixin_lite.exporter import article_html, project_zip, unavailable_dois_csv
 from weixin_lite.figure_analysis import analyze_confirmed_figures
@@ -619,6 +619,22 @@ def test_analysis_models_serialize_and_cache_key_excludes_api_key():
     assert restored.key_results[0].figure_id == "Fig. 2"
     assert first == second
     assert "secret" not in first
+
+
+def test_analysis_prompt_uses_expert_deep_reading_guide():
+    prompt = build_analysis_prompt(
+        PaperInput(title_en="Traceable paper", doi="10.1000/trace"),
+        PdfContent(text="[Page 1]\nAbstract\nKey result.", hash="pdf-hash"),
+    )
+
+    assert ANALYSIS_PROMPT_VERSION == "paper-analysis-v2"
+    assert "世界顶级学术专家" in prompt
+    assert "### 论文的研究目标是什么？想要解决什么实际问题？" in prompt
+    assert "### 这个问题对于产业发展有什么重要意义？" in prompt
+    assert "### 实验是如何设计的？实验数据和结果如何？" in prompt
+    assert "blockquote" in prompt
+    assert '"research_question"' in prompt
+    assert "只返回符合要求的 JSON" in prompt
 
 
 def test_analysis_failure_preserves_previous_complete_analysis(monkeypatch):
