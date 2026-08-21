@@ -9,6 +9,7 @@ from weixin_lite import llm as llm_module
 from weixin_lite.article_analysis import analysis_cache_key, analyze_paper
 from weixin_lite.downloader import download_open_access
 from weixin_lite.exporter import article_html, project_zip, unavailable_dois_csv
+from weixin_lite.figure_analysis import analyze_confirmed_figures
 from weixin_lite.generator import ArticleGenerationError, build_prompt, generate_article, markdown_to_wechat_html
 from weixin_lite.llm import _parse_retry_after, call_openai_compatible, default_api_key, default_base_url, default_model
 from weixin_lite.models import AnalysisClaim, BatchProject, FigureAnalysis, PaperAnalysis, PaperInput, generation_candidate_papers, generation_ready_papers, unavailable_papers
@@ -385,6 +386,112 @@ def test_article_places_screenshot_before_short_note():
     note_pos = article.body_markdown.find("**Fig. 3：原文关键信息截图**")
     assert image_pos >= 0
     assert note_pos > image_pos
+
+
+def test_confirmed_figure_analysis_falls_back_to_caption_evidence():
+    paper = PaperInput(title_en="A test paper")
+    figure = FigureAnalysis(
+        figure_id="Fig. 2",
+        caption="Fig. 2 The engineered strain reached 90% conversion.",
+        page="4",
+        image_name="fig2.png",
+        role="key_result",
+        selected=True,
+        order=1,
+    )
+    analysis = PaperAnalysis(
+        key_results=[
+            AnalysisClaim(
+                "工程菌株提高了转化效率",
+                page="4",
+                figure_id="Fig. 2",
+                evidence_text="reached 90% conversion",
+            )
+        ],
+        status="complete",
+    )
+
+    figures = analyze_confirmed_figures(paper, analysis, [figure])
+
+    assert figures == [figure]
+    assert figure.interpretation
+    assert "工程菌株提高了转化效率" in figure.interpretation
+
+
+def test_confirmed_figures_ignore_unconfirmed_model_figure_notes(monkeypatch):
+    def fake_call(**kwargs):
+        return json.dumps(
+            {
+                "title": "确认配图稿",
+                "digest": "摘要",
+                "intro": "导语",
+                "core_points": ["核心分析。"],
+                "figure_notes": [{"figure_id": "Fig. 99", "heading": "不应出现", "note": "不应进入正文"}],
+                "innovation": ["创新意义。"],
+                "limitations": ["证据边界。"],
+                "take_home": "总结。",
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr("weixin_lite.generator.call_openai_compatible", fake_call)
+    monkeypatch.setattr(
+        "weixin_lite.figure_analysis.call_openai_compatible",
+        lambda **kwargs: json.dumps(
+            {
+                "figures": [
+                    {
+                        "figure_id": "Fig. 2",
+                        "heading": "Fig. 2：关键结果图",
+                        "note": "确认图解。",
+                        "evidence_text": "caption evidence",
+                        "page": "4",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+    )
+    paper = PaperInput(title_en="A test paper")
+    figure = FigureAnalysis(
+        figure_id="Fig. 2",
+        caption="Fig. 2 Result.",
+        page="4",
+        image_name="fig2.png",
+        role="key_result",
+        selected=True,
+        order=1,
+    )
+    pdf = PdfContent(
+        text="Fig. 2 Result.",
+        legends=[figure],
+        lead_image=FigureAnalysis("Lead", "Title", page="1", image_name="lead.png"),
+    )
+
+    article = generate_article(paper, pdf=pdf, api_key="key", confirmed_figures=[figure])
+
+    assert "![论文首页](images/lead.png)" in article.body_markdown
+    assert "![Fig. 2](images/fig2.png)" in article.body_markdown
+    assert "确认图解" in article.body_markdown
+    assert "Fig. 99" not in article.body_markdown
+    assert article.body_markdown.find("![论文首页]") < article.body_markdown.find("导语")
+    assert article.body_markdown.find("![Fig. 2]") < article.body_markdown.find("确认图解")
+
+
+def test_untraceable_confirmed_figure_is_not_rendered():
+    paper = PaperInput(title_en="A test paper")
+    figure = FigureAnalysis(
+        figure_id="Fig. 5",
+        caption="",
+        page="",
+        image_name="fig5.png",
+        selected=True,
+        order=1,
+    )
+
+    article = generate_article(paper, confirmed_figures=[figure])
+
+    assert "fig5.png" not in article.body_markdown
 
 
 def test_wechat_markdown_html_matches_reference_style_without_duplicate_title():

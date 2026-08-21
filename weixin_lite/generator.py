@@ -4,6 +4,7 @@ import html
 import re
 from typing import Any
 
+from .figure_analysis import analyze_confirmed_figures, figure_heading
 from .llm import LLMError, call_openai_compatible, parse_json_object
 from .models import FigureAnalysis, PaperAnalysis, PaperInput, QuickReadArticle
 from .pdf_reader import PdfContent, compact_text
@@ -26,7 +27,7 @@ SYSTEM_PROMPT = """你是一个严谨、克制、面向中文读者的公众号�
 2. 按证据强度写作：有全文时可做深度解读；只有题录、摘要或粘贴材料时，只做摘要级/材料级解读，并明确边界。
 3. 必须包含“文章核心要点简述”和“文章的创新意义”两个小标题。
 4. 数字、结论、机构、作者和技术细节只能来自题录、摘要、全文、图注、证据或用户提供材料，不得编造。
-5. 有图片或图注时，只写图下短说明；没有图片或图注时，不强行写图解，也不要假装读过图。
+5. 有确认配图时，正文图解由系统另行插入；不要自行增加未确认图片或虚构图中细节。
 6. 标题不超过 32 个中文字符，digest 不超过 120 字。
 7. 目标正文 500-1500 个中文字符，优先 1000-1300 字。
 只返回 JSON，不要返回 Markdown 代码块。"""
@@ -105,9 +106,7 @@ PMID：{paper.pmid}
   "digest": "不超过120字摘要",
   "intro": "约80-120字，用中文说明这篇文章讨论什么问题，以及当前解读依据是什么",
   "core_points": ["2-3条核心要点，每条必须基于给定材料"],
-  "figure_notes": [
-    {{"figure_id": "Fig. 1", "heading": "一句话概括图中信息", "note": "1-2句中文短说明，只写可核对信息"}}
-  ],
+  "figure_notes": [],
   "innovation": ["2-3条创新意义、启发或价值"],
   "take_home": "一句话总结"
 }}
@@ -160,7 +159,7 @@ def build_analysis_article_prompt(
   "digest": "不超过120字摘要",
   "intro": "导语，交代问题和研究价值",
   "core_points": ["完整、连贯的核心分析段落，包含证据边界"],
-  "figure_notes": [{{"figure_id":"Fig. 1", "heading":"图文小标题", "note":"结合证据的中文图解"}}],
+  "figure_notes": [],
   "innovation": ["创新意义"],
   "limitations": ["论文局限性和解读边界"],
   "take_home": "总结"
@@ -248,6 +247,8 @@ def render_markdown(
     data: dict[str, Any],
     figures: list[FigureAnalysis],
     lead_image: FigureAnalysis | None = None,
+    *,
+    confirmed_figure_notes: bool = False,
 ) -> str:
     lines: list[str] = [f"# {data.get('title') or short_title(paper)}", ""]
     if lead_image and lead_image.image_name:
@@ -260,16 +261,29 @@ def render_markdown(
     for idx, point in enumerate(data.get("core_points") or [], start=1):
         lines.append(f"{idx}. {str(point).strip()}")
     figure_map = {figure.figure_id.lower(): figure for figure in figures}
-    figure_items = data.get("figure_notes") or data.get("figure_analyses") or []
+    if confirmed_figure_notes:
+        figure_items = [
+            {
+                "figure_id": figure.figure_id,
+                "heading": figure.why_selected or figure_heading(figure),
+                "note": figure.interpretation,
+            }
+            for figure in figures
+            if figure.image_name and figure.interpretation
+        ]
+    else:
+        figure_items = data.get("figure_notes") or data.get("figure_analyses") or []
     for figure_index, item in enumerate(figure_items, start=1):
         fig_id = str(item.get("figure_id") or "").strip()
         heading = str(item.get("heading") or f"{figure_index}. {fig_id or '原文截图'}").strip()
         note = str(item.get("note") or item.get("interpretation") or "").strip()
         figure = figure_map.get(fig_id.lower())
         lines.append("")
+        if confirmed_figure_notes and not (figure and figure.image_name and note):
+            continue
         if figure and figure.image_name:
             lines.append(f"![{fig_id}](images/{figure.image_name})")
-        elif fig_id:
+        elif fig_id and not confirmed_figure_notes:
             lines.append(f"> {fig_id} 需要上传原图截图后发布。")
         lines.append(f"**{heading}**")
         if note:
@@ -292,6 +306,21 @@ def render_markdown(
         lines.append("")
         lines.append(f"原文信息：{meta}")
     return "\n".join(lines).strip()
+
+
+def render_article_with_confirmed_figures(
+    paper: PaperInput,
+    data: dict[str, Any],
+    figures: list[FigureAnalysis],
+    lead_image: FigureAnalysis | None = None,
+) -> str:
+    return render_markdown(
+        paper,
+        data,
+        figures,
+        lead_image=lead_image,
+        confirmed_figure_notes=True,
+    )
 
 
 WECHAT_P_STYLE = "margin:20px 0;font-size:18px;line-height:2.05;color:#000;text-align:justify;"
@@ -394,8 +423,14 @@ def generate_article(
     else:
         warnings.append("未提供 PDF 全文或额外正文，已基于题录/摘要生成摘要级解读；证据边界较窄。")
 
-    if confirmed_figures is not None:
-        figures = sorted(confirmed_figures, key=lambda item: (item.order or 999, item.figure_id))[:4]
+    using_confirmed_figures = confirmed_figures is not None
+    if using_confirmed_figures:
+        figures = analyze_confirmed_figures(
+            paper,
+            analysis,
+            sorted(confirmed_figures or [], key=lambda item: (item.order or 999, item.figure_id))[:4],
+            {"api_key": api_key, "base_url": base_url, "model": model},
+        )
     else:
         figures = list(pdf.legends[:4]) if pdf else []
 
@@ -433,9 +468,13 @@ def generate_article(
         warnings.append("未填写 LLM API Key，已生成通用占位级模板稿；深度解读需要配置模型后重新生成。")
         data = fallback_article(paper, pdf, source_text=source_text, extra_text=extra_text)
 
-    attach_interpretations(figures, data)
+    if not using_confirmed_figures:
+        attach_interpretations(figures, data)
     lead_image = pdf.lead_image if pdf else None
-    markdown = render_markdown(paper, data, figures, lead_image=lead_image)
+    if using_confirmed_figures:
+        markdown = render_article_with_confirmed_figures(paper, data, figures, lead_image=lead_image)
+    else:
+        markdown = render_markdown(paper, data, figures, lead_image=lead_image)
     count = chineseish_len(markdown)
     minimum = ANALYSIS_TARGET_MIN if quality_first else TARGET_MIN
     maximum = ANALYSIS_TARGET_MAX if quality_first else TARGET_MAX

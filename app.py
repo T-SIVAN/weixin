@@ -564,7 +564,7 @@ def confirmed_single_figures(pdf: PdfContent | None) -> list:
         figure.selected = bool(st.session_state.get(f"single_fig_select_{idx}", figure.selected))
         figure.order = int(st.session_state.get(f"single_fig_order_{idx}", figure.order or idx) or idx)
         figure.role = str(st.session_state.get(f"single_fig_role_{idx}", figure.role or "key_result"))
-        if figure.selected:
+        if figure.selected and figure.image_name:
             figures.append(figure)
     return sorted(figures, key=lambda item: (item.order or 999, item.figure_id))[:4]
 
@@ -924,6 +924,7 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
 
         if pdf and pdf.legends:
             st.markdown("##### 候选配图")
+            st.caption("系统会先推荐并裁剪候选图；只有勾选“选入正文”的图片才会进入最终稿。低置信度截图默认需要人工确认。")
             pdf_bytes_map: dict[str, bytes] = st.session_state.get("pdf_bytes", {})
             pdf_name = st.session_state.get("single_active_pdf_name", "")
             for idx, figure in enumerate(pdf.legends, start=1):
@@ -938,6 +939,14 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
                         key=f"single_fig_role_{idx}",
                     )
                     st.caption(figure.caption[:700])
+                    if figure.why_selected:
+                        st.caption(f"推荐理由：{figure.why_selected}")
+                    if figure.needs_manual_crop:
+                        st.warning("这张图裁剪置信度较低，默认不进入正文；请检查截图、手动裁剪或替换后再勾选。")
+                    elif figure.confidence:
+                        st.caption(f"裁剪置信度：{figure.confidence:.2f}")
+                    if figure.interpretation:
+                        st.info("当前图解：" + figure.interpretation)
                     if figure.image_name and figure.image_name in st.session_state.images:
                         st.image(st.session_state.images[figure.image_name], caption=f"当前截图；置信度 {figure.confidence:.2f}", use_container_width=True)
                     if figure.crop_bbox and pdf_name in pdf_bytes_map:
@@ -958,6 +967,8 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
                                     bottom=bottom,
                                 )
                                 figure.crop_bbox = bbox
+                                figure.confidence = max(figure.confidence, 0.75)
+                                figure.needs_manual_crop = False
                                 if not figure.image_name:
                                     figure.image_name = f"{paper_key(paper)}-{figure.figure_id}.png"
                                 st.session_state.images[figure.image_name] = image
@@ -971,6 +982,8 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
                         st.session_state.images[new_name] = replacement.getvalue()
                         figure.image_name = new_name
                         figure.page_image_name = new_name
+                        figure.confidence = max(figure.confidence, 0.8)
+                        figure.needs_manual_crop = False
                         if old_name and old_name in st.session_state.images:
                             st.caption("已替换为人工上传图片。")
 
@@ -984,6 +997,11 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
             st.warning("未填写 LLM API Key，只能生成占位级模板；配置模型后可重试当前阶段。")
         else:
             st.info("当前没有完整结构化分析，将按 PDF/粘贴材料直接生成，并保留证据边界提示。")
+        selected_figures = confirmed_single_figures(pdf)
+        if selected_figures:
+            st.caption(f"已确认 {len(selected_figures)} 张正文配图；生成时会先对这些图做逐图中文分析。")
+        elif pdf and pdf.legends:
+            st.warning("当前还没有确认正文配图。可先勾选 2-4 张关键图，再生成带图解读稿。")
         if st.button("生成单篇公众号稿", type="primary"):
             try:
                 with st.spinner("正在生成公众号正文..."):
@@ -996,7 +1014,7 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
                         target_chars=target_chars,
                         source_text=st.session_state.get("single_source_text", ""),
                         analysis=analysis if use_quality else None,
-                        confirmed_figures=confirmed_single_figures(pdf),
+                        confirmed_figures=selected_figures,
                         target_profile="adaptive",
                     )
                 st.session_state.single_article = article
