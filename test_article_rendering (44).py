@@ -4,11 +4,9 @@ import io
 import zipfile
 
 import pytest
-from PIL import Image
 
-from weixin_lite.docx_exporter import DocxExportError
-from weixin_lite.exporter import article_document_html, article_html, export_article_docx_bytes, export_article_html, project_zip, wechat_content_html
-from weixin_lite.models import BatchProject, FigureAnalysis, PaperInput, QuickReadArticle
+from weixin_lite.exporter import article_document_html, article_html, project_zip, wechat_content_html
+from weixin_lite.models import BatchProject, PaperInput, QuickReadArticle
 from weixin_lite.wechat_publish import (
     WechatDraftConfig,
     WechatPublishError,
@@ -27,12 +25,6 @@ def make_article(body_html: str = "<p style=\"margin:20px 0;font-size:18px;line-
         body_html=body_html,
         cover_image_name="platform-cover.png",
     )
-
-
-def png_bytes(color: str = "white") -> bytes:
-    buffer = io.BytesIO()
-    Image.new("RGB", (24, 16), color=color).save(buffer, format="PNG")
-    return buffer.getvalue()
 
 
 def test_preview_export_and_draft_share_one_inline_body_without_platform_header():
@@ -126,7 +118,7 @@ def test_project_zip_preserves_unicode_spaces_and_rewrites_colliding_asset_names
 
     archive = project_zip(
         project,
-        {"组甲/结果 图.png": png_bytes("red"), "组乙/结果 图.png": png_bytes("blue"), "../危险.png": png_bytes("green")},
+        {"组甲/结果 图.png": b"first", "组乙/结果 图.png": b"second", "../危险.png": b"safe"},
     )
 
     with zipfile.ZipFile(io.BytesIO(archive)) as zf:
@@ -146,49 +138,6 @@ def test_project_zip_preserves_unicode_spaces_and_rewrites_colliding_asset_names
         assert "images/结果 图-2.png" in markdown
         assert "组甲/" not in rendered_html + markdown
         assert "组乙/" not in rendered_html + markdown
-
-
-def test_editable_docx_embeds_lead_and_confirmed_figure_once():
-    article = make_article()
-    article.title = "可编辑论文解读"
-    article.lead_image_name = "lead.png"
-    article.body_markdown = """# 可编辑论文解读
-
-![论文首页](images/lead.png)
-
-导语中的**关键术语**可编辑。
-
-## 关键图证据解读
-
-![Fig. 2](images/fig2.png)
-
-**Fig. 2：关键结果图**
-
-图展示什么：验证结果。
-"""
-    article.figures = [FigureAnalysis("Fig. 2", "结果图", page="4", image_name="fig2.png", selected=True)]
-    data = export_article_docx_bytes(article, {"lead.png": png_bytes(), "fig2.png": png_bytes("blue")})
-
-    from docx import Document
-
-    document = Document(io.BytesIO(data))
-    assert "可编辑论文解读" in "\n".join(item.text for item in document.paragraphs)
-    assert "关键术语" in "\n".join(item.text for item in document.paragraphs)
-    with zipfile.ZipFile(io.BytesIO(data)) as archive:
-        images = [name for name in archive.namelist() if name.startswith("word/media/")]
-    assert len(images) == 2
-
-
-def test_docx_export_rejects_missing_referenced_image_and_portable_html_embeds_bytes():
-    article = make_article('<img src="images/lead.png" alt="论文首页">')
-    article.body_markdown = "# 标题\n\n![论文首页](images/lead.png)"
-    article.lead_image_name = "lead.png"
-
-    with pytest.raises(DocxExportError, match="lead.png"):
-        export_article_docx_bytes(article, {})
-
-    portable = export_article_html(article, {"lead.png": png_bytes()}).decode("utf-8")
-    assert "data:image/png;base64," in portable
 
 
 def test_src_parsing_normalizes_local_forms_preserves_alt_and_ignores_data_src(monkeypatch):

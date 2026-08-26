@@ -6,12 +6,11 @@ import pytest
 
 from weixin_lite import batch_analyze
 from weixin_lite import llm as llm_module
-from weixin_lite.article_analysis import ANALYSIS_PROMPT_VERSION, analysis_cache_key, analyze_paper, build_analysis_prompt
+from weixin_lite.article_analysis import analysis_cache_key, analyze_paper
 from weixin_lite.downloader import download_open_access
 from weixin_lite.exporter import article_html, project_zip, unavailable_dois_csv
-from weixin_lite.figure_analysis import analyze_confirmed_figures
 from weixin_lite.generator import ArticleGenerationError, build_prompt, generate_article, markdown_to_wechat_html
-from weixin_lite.llm import _parse_retry_after, call_openai_compatible, default_api_key, default_base_url, default_model
+from weixin_lite.llm import _parse_retry_after, call_openai_compatible, default_base_url, default_model
 from weixin_lite.models import AnalysisClaim, BatchProject, FigureAnalysis, PaperAnalysis, PaperInput, generation_candidate_papers, generation_ready_papers, unavailable_papers
 from weixin_lite.pdf_reader import PdfContent, extract_figure_legends, extract_numeric_evidence
 from weixin_lite.search import (
@@ -251,68 +250,39 @@ def test_translation_retries_429(monkeypatch, tmp_path):
 
 
 def test_translation_splits_failed_batch(monkeypatch, tmp_path):
-    seen_prompts: list[str] = []
+    seen_batch_sizes: list[int] = []
 
     def fake_call(**kwargs):
-        prompt = kwargs["user_prompt"]
-        seen_prompts.append(prompt)
-        if prompt.startswith("["):
-            payload = json.loads(prompt)
-            if len(payload) > 1:
-                raise LLMError("server overloaded", status_code=500, transient=True)
-            return '[{"title_zh": "单篇成功"}]'
-        if prompt == "First":
-            return '{"title_zh": "第一篇成功"}'
-        if prompt == "Second":
-            return "第二篇成功"
-        raise AssertionError(f"Unexpected prompt: {prompt}")
+        payload = json.loads(kwargs["user_prompt"])
+        seen_batch_sizes.append(len(payload))
+        if len(payload) > 1:
+            raise LLMError("server overloaded", status_code=500, transient=True)
+        return '[{"title_zh": "单篇成功"}]'
 
     monkeypatch.setattr("weixin_lite.translate.call_openai_compatible", fake_call)
     papers = [PaperInput(title_en="First"), PaperInput(title_en="Second")]
 
     report = translate_records(papers, api_key="test-key", batch_size=2, delay_seconds=0, max_retries=0, cache_path=tmp_path / "cache.json")
 
-    assert seen_prompts == ['[{"title_en": "First"}, {"title_en": "Second"}]', "First", "Second"]
-    assert [paper.title_zh for paper in papers] == ["第一篇成功", "第二篇成功"]
+    assert seen_batch_sizes == [2, 1, 1]
+    assert [paper.title_zh for paper in papers] == ["单篇成功", "单篇成功"]
     assert report.failed_count == 0
-    assert report.ok
 
 
-def test_translation_mismatched_json_falls_back_to_single_title(monkeypatch, tmp_path):
-    seen_prompts: list[str] = []
-
+def test_translation_mismatched_json_marks_missing_failed(monkeypatch, tmp_path):
     def fake_call(**kwargs):
-        prompt = kwargs["user_prompt"]
-        seen_prompts.append(prompt)
-        if prompt.startswith("["):
-            return '[{"title_zh": "第一篇"}]'
-        return json.dumps({"title_zh": f"{prompt} 中文"}, ensure_ascii=False)
+        return '[{"title_zh": "第一篇"}]'
 
     monkeypatch.setattr("weixin_lite.translate.call_openai_compatible", fake_call)
     papers = [PaperInput(title_en="First"), PaperInput(title_en="Second")]
 
     report = translate_records(papers, api_key="test-key", batch_size=2, delay_seconds=0, cache_path=tmp_path / "cache.json")
 
-    assert seen_prompts == ['[{"title_en": "First"}, {"title_en": "Second"}]', "First", "Second"]
-    assert [paper.title_zh for paper in papers] == ["First 中文", "Second 中文"]
-    assert [paper.translation_status for paper in papers] == ["translated", "translated"]
-    assert report.translated_count == 2
-    assert report.failed_count == 0
-    assert report.ok
-
-
-def test_translation_single_title_fallback_failure_marks_failed(monkeypatch, tmp_path):
-    def fake_call(**kwargs):
-        if kwargs["user_prompt"].startswith("["):
-            raise LLMError("server overloaded", status_code=500, transient=True)
-        raise LLMError("quota exhausted", status_code=429, transient=False)
-
-    monkeypatch.setattr("weixin_lite.translate.call_openai_compatible", fake_call)
-    paper = PaperInput(title_en="First")
-
-    report = translate_records([paper], api_key="test-key", batch_size=1, delay_seconds=0, max_retries=0, cache_path=tmp_path / "cache.json")
-
-    assert paper.translation_status == "failed"
+    assert papers[0].title_zh == "第一篇"
+    assert papers[0].translation_status == "translated"
+    assert papers[1].title_zh == ""
+    assert papers[1].translation_status == "failed"
+    assert report.translated_count == 1
     assert report.failed_count == 1
     assert report.failed_items
 
@@ -322,19 +292,9 @@ def test_retry_after_naive_http_date_does_not_raise():
 
 
 def test_provider_defaults_are_configured():
-    assert default_base_url("gemini") == "https://generativelanguage.googleapis.com/v1beta/openai"
-    assert default_model("gemini") == "gemini-2.5-flash"
     assert default_base_url("deepseek") == "https://api.deepseek.com/v1"
     assert default_model("deepseek") == "deepseek-chat"
     assert default_base_url("siliconflow") == "https://api.siliconflow.cn/v1"
-
-
-def test_gemini_api_key_uses_gemini_environment(monkeypatch):
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("LLM_API_KEY", raising=False)
-    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
-
-    assert default_api_key("gemini") == "gemini-key"
 
 
 def test_paywalled_without_oa_url_keeps_doi_only():
@@ -386,112 +346,6 @@ def test_article_places_screenshot_before_short_note():
     note_pos = article.body_markdown.find("**Fig. 3：原文关键信息截图**")
     assert image_pos >= 0
     assert note_pos > image_pos
-
-
-def test_confirmed_figure_analysis_falls_back_to_caption_evidence():
-    paper = PaperInput(title_en="A test paper")
-    figure = FigureAnalysis(
-        figure_id="Fig. 2",
-        caption="Fig. 2 The engineered strain reached 90% conversion.",
-        page="4",
-        image_name="fig2.png",
-        role="key_result",
-        selected=True,
-        order=1,
-    )
-    analysis = PaperAnalysis(
-        key_results=[
-            AnalysisClaim(
-                "工程菌株提高了转化效率",
-                page="4",
-                figure_id="Fig. 2",
-                evidence_text="reached 90% conversion",
-            )
-        ],
-        status="complete",
-    )
-
-    figures = analyze_confirmed_figures(paper, analysis, [figure])
-
-    assert figures == [figure]
-    assert figure.interpretation
-    assert "工程菌株提高了转化效率" in figure.interpretation
-
-
-def test_confirmed_figures_ignore_unconfirmed_model_figure_notes(monkeypatch):
-    def fake_call(**kwargs):
-        return json.dumps(
-            {
-                "title": "确认配图稿",
-                "digest": "摘要",
-                "intro": "导语",
-                "core_points": ["核心分析。"],
-                "figure_notes": [{"figure_id": "Fig. 99", "heading": "不应出现", "note": "不应进入正文"}],
-                "innovation": ["创新意义。"],
-                "limitations": ["证据边界。"],
-                "take_home": "总结。",
-            },
-            ensure_ascii=False,
-        )
-
-    monkeypatch.setattr("weixin_lite.generator.call_openai_compatible", fake_call)
-    monkeypatch.setattr(
-        "weixin_lite.figure_analysis.call_openai_compatible",
-        lambda **kwargs: json.dumps(
-            {
-                "figures": [
-                    {
-                        "figure_id": "Fig. 2",
-                        "heading": "Fig. 2：关键结果图",
-                        "note": "确认图解。",
-                        "evidence_text": "caption evidence",
-                        "page": "4",
-                    }
-                ]
-            },
-            ensure_ascii=False,
-        ),
-    )
-    paper = PaperInput(title_en="A test paper")
-    figure = FigureAnalysis(
-        figure_id="Fig. 2",
-        caption="Fig. 2 Result.",
-        page="4",
-        image_name="fig2.png",
-        role="key_result",
-        selected=True,
-        order=1,
-    )
-    pdf = PdfContent(
-        text="Fig. 2 Result.",
-        legends=[figure],
-        lead_image=FigureAnalysis("Lead", "Title", page="1", image_name="lead.png"),
-    )
-
-    article = generate_article(paper, pdf=pdf, api_key="key", confirmed_figures=[figure])
-
-    assert "![论文首页](images/lead.png)" in article.body_markdown
-    assert "![Fig. 2](images/fig2.png)" in article.body_markdown
-    assert "确认图解" in article.body_markdown
-    assert "Fig. 99" not in article.body_markdown
-    assert article.body_markdown.find("![论文首页]") < article.body_markdown.find("导语")
-    assert article.body_markdown.find("![Fig. 2]") < article.body_markdown.find("确认图解")
-
-
-def test_untraceable_confirmed_figure_is_not_rendered():
-    paper = PaperInput(title_en="A test paper")
-    figure = FigureAnalysis(
-        figure_id="Fig. 5",
-        caption="",
-        page="",
-        image_name="fig5.png",
-        selected=True,
-        order=1,
-    )
-
-    article = generate_article(paper, confirmed_figures=[figure])
-
-    assert "fig5.png" not in article.body_markdown
 
 
 def test_wechat_markdown_html_matches_reference_style_without_duplicate_title():
@@ -621,22 +475,6 @@ def test_analysis_models_serialize_and_cache_key_excludes_api_key():
     assert "secret" not in first
 
 
-def test_analysis_prompt_uses_expert_deep_reading_guide():
-    prompt = build_analysis_prompt(
-        PaperInput(title_en="Traceable paper", doi="10.1000/trace"),
-        PdfContent(text="[Page 1]\nAbstract\nKey result.", hash="pdf-hash"),
-    )
-
-    assert ANALYSIS_PROMPT_VERSION == "paper-analysis-v3"
-    assert "世界顶级学术专家" in prompt
-    assert "### 论文的研究目标是什么？想要解决什么实际问题？" in prompt
-    assert "### 这个问题对于产业发展有什么重要意义？" in prompt
-    assert "### 实验是如何设计的？实验数据和结果如何？" in prompt
-    assert "blockquote" in prompt
-    assert '"research_question"' in prompt
-    assert "只返回符合要求的 JSON" in prompt
-
-
 def test_analysis_failure_preserves_previous_complete_analysis(monkeypatch):
     previous = _complete_analysis()
     monkeypatch.setattr(
@@ -673,10 +511,7 @@ def test_quality_generation_uses_one_call_without_hidden_length_repair(monkeypat
                 "title": "可追溯解读",
                 "digest": "摘要",
                 "intro": "导语",
-                "research_question": "研究问题来自第一页。",
-                "approach_advantage": ["方法优势来自第三页。"],
-                "experiment_validation": ["验证设计来自第四页。"],
-                "quantitative_findings": ["核心结果来自第五页。"],
+                "core_points": ["核心结果来自第五页。"],
                 "figure_notes": [],
                 "innovation": ["创新点来自第六页。"],
                 "limitations": ["样本有限。"],
@@ -695,11 +530,7 @@ def test_quality_generation_uses_one_call_without_hidden_length_repair(monkeypat
     )
 
     assert calls["count"] == 1
-    assert article.analysis_version == "paper-analysis-v3"
-    assert "研究问题与现实意义" in article.body_markdown
-    assert "方法路径与比较优势" in article.body_markdown
-    assert "实验设计与验证" in article.body_markdown
-    assert "关键数据与结果" in article.body_markdown
+    assert article.analysis_version == "paper-analysis-v1"
     assert "局限性与解读边界" in article.body_markdown
     assert any("显式补写/精简" in warning for warning in article.warnings)
 
@@ -718,7 +549,6 @@ def test_project_zip_contains_paywalled_and_download_status():
         latest = json.loads(zf.read("latest_papers.json").decode("utf-8"))
 
     assert any(name.startswith("articles/") and name.endswith(".html") for name in names)
-    assert any(name.startswith("articles/") and name.endswith(".docx") for name in names)
     assert "images/cover.png" in names
     assert "paywalled_dois.csv" in names
     assert "unavailable_dois.csv" in names

@@ -8,10 +8,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field
 from datetime import date, timedelta
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -564,16 +563,11 @@ def record_search_text(record: PaperInput) -> str:
     return " ".join(
         [
             record.title_en,
-            record.title_zh,
             record.title,
             record.abstract_en,
-            record.abstract_zh,
             record.abstract,
-            " ".join(record.keywords),
             record.journal,
             record.source,
-            record.doi,
-            record.pmid,
         ]
     ).lower()
 
@@ -590,86 +584,6 @@ def keyword_terms(keywords: str | list[str] | SearchQueryPlan) -> list[str]:
     for keyword in parse_keywords(keywords):
         terms.extend(KEYWORD_EXPANSIONS.get(keyword.lower(), [keyword]))
     return list(dict.fromkeys(clean_text(term) for term in terms if clean_text(term)))
-
-
-FILTER_KEYWORD_STOPWORDS = {
-    "about",
-    "after",
-    "against",
-    "analysis",
-    "article",
-    "based",
-    "between",
-    "cells",
-    "clinical",
-    "data",
-    "disease",
-    "effect",
-    "from",
-    "gene",
-    "genes",
-    "human",
-    "into",
-    "model",
-    "models",
-    "nature",
-    "novel",
-    "paper",
-    "protein",
-    "study",
-    "system",
-    "systems",
-    "that",
-    "their",
-    "these",
-    "this",
-    "through",
-    "using",
-    "with",
-}
-
-
-def filter_records_by_keywords(records: list[PaperInput], keywords: str | list[str]) -> list[PaperInput]:
-    terms = keyword_terms(keywords)
-    if not terms:
-        return list(records)
-    filtered: list[PaperInput] = []
-    for record in records:
-        text = record_search_text(record)
-        if any(term_in_text(term, text) for term in terms):
-            filtered.append(record)
-    return filtered
-
-
-def suggest_filter_keywords(records: list[PaperInput], limit: int = 12) -> list[str]:
-    counts: Counter[str] = Counter()
-    for record in records:
-        text = record_search_text(record)
-        for original, expanded in KEYWORD_EXPANSIONS.items():
-            if contains_chinese(original):
-                label = original
-            else:
-                label = clean_text(original)
-            if not label:
-                continue
-            if any(term_in_text(term, text) for term in [original, *expanded]):
-                counts[label] += 4
-        for keyword in record.keywords:
-            keyword = clean_text(keyword)
-            if 3 <= len(keyword) <= 40:
-                counts[keyword] += 3
-        title_text = " ".join([record.title_en, record.title]).lower()
-        for token in re.findall(r"\b[a-z][a-z0-9-]{3,}\b", title_text):
-            if token in FILTER_KEYWORD_STOPWORDS:
-                continue
-            counts[token] += 1
-    suggestions = [
-        keyword
-        for keyword, _ in counts.most_common(limit * 3)
-        if keyword.lower() not in FILTER_KEYWORD_STOPWORDS
-    ]
-    defaults = [keyword for keyword in DEFAULT_KEYWORDS if keyword not in suggestions]
-    return list(dict.fromkeys([*suggestions, *defaults]))[:limit]
 
 
 def relevance_score(

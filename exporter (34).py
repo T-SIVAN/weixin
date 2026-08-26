@@ -1,17 +1,14 @@
 from __future__ import annotations
 
-import base64
 import csv
 import html as html_lib
 import io
 import json
-import mimetypes
 import re
 import zipfile
 from typing import Any
 from urllib import parse, request
 
-from .docx_exporter import DocxExportError, export_article_docx, validate_article_images
 from .models import BatchProject, DownloadedPaper, PaperInput, QuickReadArticle
 
 
@@ -183,51 +180,6 @@ def article_html(article: QuickReadArticle) -> str:
 """
 
 
-def _local_src_name(src: str) -> str | None:
-    raw = html_lib.unescape(src or "").strip()
-    path = raw.split("?", 1)[0].split("#", 1)[0].replace("\\", "/")
-    for prefix in ("./images/", "/images/", "images/"):
-        if path.startswith(prefix):
-            name = parse.unquote(path[len(prefix) :])
-            if name and ".." not in name.split("/"):
-                return name
-    return None
-
-
-def _portable_html(content: str, image_assets: dict[str, bytes]) -> str:
-    """Inline local images for a standalone HTML file without changing WeChat paths."""
-    missing: set[str] = set()
-
-    def replace_tag(tag_match: re.Match[str]) -> str:
-        tag = tag_match.group(0)
-        attr = _SRC_ATTR_RE.search(tag)
-        if not attr:
-            return tag
-        name = _local_src_name(attr.group(3))
-        if not name:
-            return tag
-        data = image_assets.get(name)
-        if not data:
-            missing.add(name)
-            return tag
-        mime_type = mimetypes.guess_type(name)[0] or "image/png"
-        uri = f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}"
-        return tag[: attr.start(3)] + uri + tag[attr.end(3) :]
-
-    portable = _IMG_TAG_RE.sub(replace_tag, content or "")
-    if missing:
-        raise DocxExportError("无法导出便携 HTML：正文引用的图片缺失：" + "、".join(sorted(missing)))
-    return portable
-
-
-def _validate_html_image_assets(article: QuickReadArticle, image_assets: dict[str, bytes] | None) -> None:
-    """Reject exports that would leave any local article image unresolved."""
-    assets = image_assets or {}
-    missing = sorted(name for name in _local_image_names(article_html(article)) if not assets.get(name))
-    if missing:
-        raise DocxExportError("无法导出：正文引用的图片缺失：" + "、".join(missing))
-
-
 def unavailable_dois_csv(papers: list[PaperInput]) -> str:
     buffer = io.StringIO()
     writer = csv.DictWriter(
@@ -278,14 +230,8 @@ def project_zip(
         zf.writestr("latest_papers.json", json.dumps([paper.to_dict() for paper in project.papers], ensure_ascii=False, indent=2))
         for index, article in enumerate(project.articles, start=1):
             slug = safe_slug(article.title, f"article-{index:02d}")
-            # Fail early: a ZIP with a text-only final manuscript is not a valid
-            # project export, even if its auxiliary Markdown can still be read.
-            validate_article_images(article, assets)
-            _validate_html_image_assets(article, assets)
             markdown = _rewrite_packaged_image_references(article.body_markdown, asset_names)
             rendered_html = _rewrite_packaged_image_references(article_html(article), asset_names)
-            docx_bytes = export_article_docx(article, assets)
-            zf.writestr(f"articles/{index:02d}-{slug}.docx", docx_bytes)
             zf.writestr(f"articles/{index:02d}-{slug}.md", markdown)
             zf.writestr(f"articles/{index:02d}-{slug}.html", rendered_html)
             zf.writestr(
@@ -312,22 +258,8 @@ def export_article_markdown(article: QuickReadArticle) -> bytes:
     return article.body_markdown.encode("utf-8")
 
 
-def export_article_html(article: QuickReadArticle, image_assets: dict[str, bytes] | None = None) -> bytes:
-    """Export standalone HTML; supplied local assets are embedded as data URIs."""
-    content = article_html(article)
-    _validate_html_image_assets(article, image_assets)
-    content = _portable_html(content, image_assets or {})
-    return content.encode("utf-8")
-
-
-def export_portable_article_html(article: QuickReadArticle, image_assets: dict[str, bytes]) -> bytes:
-    """Export a self-contained HTML file for users who need compatibility output."""
-    return export_article_html(article, image_assets)
-
-
-def export_article_docx_bytes(article: QuickReadArticle, image_assets: dict[str, bytes]) -> bytes:
-    """Compatibility export surface used by Streamlit and callers of exporter.py."""
-    return export_article_docx(article, image_assets)
+def export_article_html(article: QuickReadArticle) -> bytes:
+    return article_html(article).encode("utf-8")
 
 
 def post_to_bridge(bridge_url: str, article: QuickReadArticle, token: str = "") -> dict[str, Any]:

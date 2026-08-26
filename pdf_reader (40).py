@@ -419,21 +419,12 @@ def _lead_crop(document: Any, digest: str) -> FigureAnalysis | None:
     page = document.load_page(0)
     blocks = sorted(page.get_text("blocks"), key=lambda block: (block[1], block[0]))
     text_blocks = [block for block in blocks if str(block[4]).strip()]
-    bottom = page.rect.height * 0.34
+    bottom = page.rect.height * 0.32
     if text_blocks:
-        abstract_blocks = [
-            block
-            for block in text_blocks
-            if block[1] < page.rect.height * 0.68 and re.search(r"(?i)\babstract\b|摘要", str(block[4]))
-        ]
-        if abstract_blocks:
-            first_abstract = min(abstract_blocks, key=lambda block: block[1])
-            bottom = min(page.rect.height * 0.58, first_abstract[3] + page.rect.height * 0.08)
-        else:
-            top_blocks = [block for block in text_blocks if block[1] < page.rect.height * 0.48]
-            if top_blocks:
-                bottom = min(page.rect.height * 0.52, max(block[3] for block in top_blocks) + 22)
-    return FigureAnalysis(figure_id="Lead", caption="论文首页标题与题录信息", page="1", image_name=f"{digest}-lead.png", crop_bbox=normalize_crop_bbox((0.035, 0.02, 0.965, max(0.24, bottom / page.rect.height))), confidence=0.92, role="lead", selected=True, order=0)
+        top_blocks = [block for block in text_blocks if block[1] < page.rect.height * 0.4]
+        if top_blocks:
+            bottom = min(page.rect.height * 0.48, max(block[3] for block in top_blocks) + 18)
+    return FigureAnalysis(figure_id="Lead", caption="论文首页标题与题录信息", page="1", image_name=f"{digest}-lead.png", crop_bbox=normalize_crop_bbox((0.04, 0.025, 0.96, max(0.22, bottom / page.rect.height))), confidence=0.9, role="lead", selected=True, order=0)
 
 
 def build_figure_crops(pdf_bytes: bytes, figures: list[FigureAnalysis], digest: str) -> tuple[FigureAnalysis | None, dict[str, bytes]]:
@@ -461,8 +452,6 @@ def build_figure_crops(pdf_bytes: bytes, figures: list[FigureAnalysis], digest: 
         figure.crop_bbox = bbox
         figure.confidence = confidence
         figure.needs_manual_crop = confidence < 0.65
-        if figure.needs_manual_crop:
-            figure.selected = False
         safe_id = re.sub(r"[^a-z0-9]+", "-", figure.figure_id.lower()).strip("-") or "figure"
         figure.image_name = f"{digest}-{safe_id}.png"
         figure.page_image_name = figure.image_name

@@ -10,7 +10,7 @@ from .models import AnalysisClaim, PaperAnalysis, PaperInput
 from .pdf_reader import PdfContent
 
 
-ANALYSIS_PROMPT_VERSION = "paper-analysis-v3"
+ANALYSIS_PROMPT_VERSION = "paper-analysis-v1"
 ANALYSIS_FIELDS = (
     "research_question",
     "background",
@@ -21,42 +21,10 @@ ANALYSIS_FIELDS = (
     "conclusion",
 )
 
-ANALYSIS_SYSTEM_PROMPT = """你是该领域的世界顶级学术专家，正在详细阅读并深入解读一篇论文。
-你必须只根据提供的全文、图注和证据提取结论，多引用论文中的细节内容、关键数据和实验结果，帮助中文读者理解论文主线。
-遇到相对新颖或专业的技术概念，首次出现时在 statement 中用 **术语** 标出，并给出通俗解释；学术名词可保留英文补充。
-每一条分析都必须给出原文页码 page 或图号 figure_id，并在 evidence_text 中放入可核对的原文短引文或原文细节；可引用时使用 blockquote 风格的 `> 原文`。
+ANALYSIS_SYSTEM_PROMPT = """你是严谨的科研论文分析员。只根据提供的全文、图注和证据提取结论。
+每一条分析都必须给出原文页码 page 或图号 figure_id，最好同时给出简短 evidence_text。
 没有可追溯来源的判断不得输出；材料不足时返回空数组，不得补写常识或生成占位结论。
-总体分析应足够深入，且每类必须至少覆盖一条可追溯证据：研究目标、方法路径、实验/对照设计、关键结果或定量数据、局限性与结论。背景字段要说明现实或产业意义；方法字段需包含方法或模型细节；关键结果字段需包含实验/验证结果，能关联图号时必须关联图号。
 只返回符合要求的 JSON，不要输出 Markdown 代码块。"""
-
-
-ANALYSIS_READING_GUIDE = """
-深度解读要求：
-你现在作为该领域的世界顶级学术专家，想详细阅读并深入这篇论文。
-首先，请用约 1000-3000 字信息量的深度来阅读论文；在 JSON 的各字段中分散承载这些内容，而不是另起 Markdown 正文。
-讲述过程中，请多引用论文中的细节内容、关键数据和实验结果；如果技术概念相对新颖，请给出通俗解释。
-
-请围绕以下六个三级标题式问题组织分析，但仍按下方 JSON Schema 输出：
-### 论文的研究目标是什么？想要解决什么实际问题？
-对应 research_question；说明论文要解决的核心科学/技术问题，以及现实痛点。
-### 这个问题对于产业发展有什么重要意义？
-对应 background 或 innovation；分析其对产业、转化、生产、诊疗、平台化或工程应用的价值。
-### 论文提出了哪些新的思路、方法或模型？
-对应 methods 和 innovation；提炼新方法、新模型、新系统或新机制。
-### 跟之前的方法相比有什么特点和优势？
-对应 innovation 和 key_results；尽可能引用对照、性能、效率、成本、准确性、规模化等细节。
-### 论文通过什么实验来验证所提出方法的有效性？
-对应 methods 和 key_results；说明验证路径、关键实验、样本或对照设计。
-### 实验是如何设计的？实验数据和结果如何？
-对应 key_results、limitations 和 conclusion；引用关键数据、实验结果、页码和图号。
-
-格式约束：
-- 使用中文书写，学术名词可以用英文补充。
-- 关键术语首次出现时用 **加粗**。
-- evidence_text 中引用原文时使用 blockquote 风格，例如 `> original sentence`，并保持短引文。
-- 适当关联可用图表；涉及图时必须填写 figure_id。
-- 只返回符合要求的 JSON，不要输出 Markdown 代码块。
-""".strip()
 
 
 def analysis_cache_key(
@@ -87,8 +55,6 @@ def build_analysis_prompt(paper: PaperInput, pdf: PdfContent) -> str:
 中文题名：{paper.title_zh}
 期刊：{paper.journal}
 DOI：{paper.doi}
-
-{ANALYSIS_READING_GUIDE}
 
 输出 JSON Schema：
 {{
@@ -121,9 +87,7 @@ def _claim_from_payload(item: Any) -> AnalysisClaim | None:
         evidence_text=str(item.get("evidence_text") or item.get("evidence") or "").strip(),
         confidence=str(item.get("confidence") or "medium").strip().lower(),
     )
-    # A page/figure reference without a source excerpt is not sufficient to
-    # support a publishable claim. Keep the evidence adjacent to its locator.
-    return claim if claim.traceable and claim.evidence_text else None
+    return claim if claim.traceable else None
 
 
 def paper_analysis_from_payload(
@@ -152,17 +116,8 @@ def paper_analysis_from_payload(
     )
     if dropped:
         analysis.warnings.append(f"已忽略 {dropped} 条缺少页码/图号或正文的不可追溯判断。")
-    required = {
-        "研究问题": analysis.research_question,
-        "现实/产业意义": analysis.background,
-        "方法": analysis.methods,
-        "实验设计与关键结果": analysis.key_results,
-        "局限性": analysis.limitations,
-        "结论": analysis.conclusion,
-    }
-    missing = [label for label, claims in required.items() if not claims]
-    if missing:
-        raise ValueError("结构化分析缺少以下可追溯证据：" + "、".join(missing))
+    if not analysis.research_question or not analysis.key_results or not analysis.conclusion:
+        raise ValueError("结构化分析缺少研究问题、关键结果或结论的可追溯证据")
     return analysis
 
 

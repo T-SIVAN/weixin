@@ -7,12 +7,10 @@ from weixin_lite.search import (
     JournalFilter,
     build_europe_pmc_journal_query,
     build_pubmed_journal_query,
-    filter_records_by_keywords,
     journal_latest_search,
     load_journal_filters,
     run_journal_latest_search,
     should_keep_article_type,
-    suggest_filter_keywords,
 )
 
 
@@ -131,28 +129,6 @@ def test_journal_latest_search_merges_sources_filters_types_and_sorts(monkeypatc
     assert "Europe PMC" in records[1].source
 
 
-def test_keyword_filtering_is_applied_after_latest_search_results_are_kept():
-    papers = [
-        PaperInput(
-            title_en="Metabolic engineering of microbial cell factories",
-            abstract_en="A synthetic biology route for biomanufacturing.",
-            doi="10.1000/metabolic",
-        ),
-        PaperInput(
-            title_en="Clinical trial of a cardiac device",
-            abstract_en="A patient outcome study.",
-            doi="10.1000/clinical",
-        ),
-    ]
-
-    suggestions = suggest_filter_keywords(papers, limit=8)
-    filtered = filter_records_by_keywords(papers, ["代谢工程"])
-
-    assert any("metabolic" in keyword.lower() or keyword == "代谢工程" for keyword in suggestions)
-    assert [paper.doi for paper in filtered] == ["10.1000/metabolic"]
-    assert filter_records_by_keywords(papers, []) == papers
-
-
 def test_journal_latest_search_skips_openalex_without_key(monkeypatch):
     def fail_openalex(*args, **kwargs):
         raise AssertionError("OpenAlex should not run without key")
@@ -201,10 +177,7 @@ def test_daily_search_defaults_to_journal_latest_with_seven_days(monkeypatch, tm
     output = tmp_path / "latest.json"
     monkeypatch.setattr(daily_search, "load_journal_filters", fake_load)
     monkeypatch.setattr(daily_search, "run_journal_latest_search", fake_run)
-    def fail_translate(*args, **kwargs):
-        raise AssertionError("translation should be opt-in")
-
-    monkeypatch.setattr(daily_search, "translate_records", fail_translate)
+    monkeypatch.setattr(daily_search, "translate_records", lambda *args, **kwargs: None)
     monkeypatch.setattr(sys, "argv", ["daily_search", "--output", str(output)])
 
     daily_search.main()
@@ -231,54 +204,3 @@ def test_daily_search_since_days_override(monkeypatch, tmp_path):
     daily_search.main()
 
     assert seen["since_days"] == 3
-
-
-def test_daily_search_translate_is_explicit_and_uses_cache(monkeypatch, tmp_path):
-    from weixin_lite import daily_search
-
-    seen = {}
-
-    def fake_run(journals, limit=100, sources=None, since_days=7, openalex_api_key=""):
-        return SearchRun(
-            run_id="test",
-            keywords=[],
-            started_at="start",
-            records=[PaperInput(title_en="Needs translation")],
-        )
-
-    class FakeReport:
-        errors: list[str] = []
-
-    def fake_translate(records, **kwargs):
-        seen["records"] = records
-        seen["cache_path"] = kwargs.get("cache_path")
-        seen["batch_size"] = kwargs.get("batch_size")
-        records[0].title_zh = "中文"
-        return FakeReport()
-
-    cache_path = tmp_path / "cache.json"
-    output = tmp_path / "latest.json"
-    monkeypatch.setattr(daily_search, "load_journal_filters", lambda path: [JournalFilter(name="Nature")])
-    monkeypatch.setattr(daily_search, "run_journal_latest_search", fake_run)
-    monkeypatch.setattr(daily_search, "translate_records", fake_translate)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "daily_search",
-            "--translate",
-            "--translation-cache",
-            str(cache_path),
-            "--batch-size",
-            "6",
-            "--output",
-            str(output),
-        ],
-    )
-
-    daily_search.main()
-
-    data = json.loads(output.read_text(encoding="utf-8"))
-    assert seen["cache_path"] == str(cache_path)
-    assert seen["batch_size"] == 6
-    assert data["records"][0]["title_zh"] == "中文"

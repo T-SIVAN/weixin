@@ -4,7 +4,6 @@ from weixin_lite.models import EvidenceItem, FigureAnalysis
 from weixin_lite.pdf_reader import (
     PdfContent,
     adjust_crop_bbox,
-    build_figure_crops,
     choose_key_figures,
     extract_figure_legends,
     extract_numeric_evidence,
@@ -93,29 +92,6 @@ def test_crop_bbox_adjustment_and_rendering():
     assert image.startswith(b"\x89PNG")
     with pytest.raises(ValueError):
         adjust_crop_bbox((0.4, 0.4, 0.5, 0.5), left=0.2)
-
-
-def test_low_confidence_figure_crop_requires_manual_confirmation(monkeypatch):
-    fitz = pytest.importorskip("fitz")
-    document = fitz.open()
-    document.new_page(width=300, height=400)
-    pdf_bytes = document.tobytes()
-    figure = FigureAnalysis(
-        figure_id="Fig. 1",
-        caption="Fig. 1 Overview.",
-        page="1",
-        selected=True,
-    )
-
-    monkeypatch.setattr("weixin_lite.pdf_reader._lead_crop", lambda *args: None)
-    monkeypatch.setattr("weixin_lite.pdf_reader._candidate_crop", lambda *args: ((0.0, 0.0, 1.0, 1.0), 0.4))
-    monkeypatch.setattr("weixin_lite.pdf_reader.render_pdf_crop", lambda *args, **kwargs: b"png")
-
-    _lead, images = build_figure_crops(pdf_bytes, [figure], "digest")
-
-    assert images == {"digest-fig-1.png": b"png"}
-    assert figure.needs_manual_crop is True
-    assert figure.selected is False
 
 
 def test_pdf_and_figure_evidence_serialization_round_trip():
