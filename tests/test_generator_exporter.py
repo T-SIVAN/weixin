@@ -627,7 +627,7 @@ def test_analysis_prompt_uses_expert_deep_reading_guide():
         PdfContent(text="[Page 1]\nAbstract\nKey result.", hash="pdf-hash"),
     )
 
-    assert ANALYSIS_PROMPT_VERSION == "paper-analysis-v2"
+    assert ANALYSIS_PROMPT_VERSION == "paper-analysis-v3"
     assert "世界顶级学术专家" in prompt
     assert "### 论文的研究目标是什么？想要解决什么实际问题？" in prompt
     assert "### 这个问题对于产业发展有什么重要意义？" in prompt
@@ -673,7 +673,10 @@ def test_quality_generation_uses_one_call_without_hidden_length_repair(monkeypat
                 "title": "可追溯解读",
                 "digest": "摘要",
                 "intro": "导语",
-                "core_points": ["核心结果来自第五页。"],
+                "research_question": "研究问题来自第一页。",
+                "approach_advantage": ["方法优势来自第三页。"],
+                "experiment_validation": ["验证设计来自第四页。"],
+                "quantitative_findings": ["核心结果来自第五页。"],
                 "figure_notes": [],
                 "innovation": ["创新点来自第六页。"],
                 "limitations": ["样本有限。"],
@@ -692,7 +695,11 @@ def test_quality_generation_uses_one_call_without_hidden_length_repair(monkeypat
     )
 
     assert calls["count"] == 1
-    assert article.analysis_version == "paper-analysis-v1"
+    assert article.analysis_version == "paper-analysis-v3"
+    assert "研究问题与现实意义" in article.body_markdown
+    assert "方法路径与比较优势" in article.body_markdown
+    assert "实验设计与验证" in article.body_markdown
+    assert "关键数据与结果" in article.body_markdown
     assert "局限性与解读边界" in article.body_markdown
     assert any("显式补写/精简" in warning for warning in article.warnings)
 
@@ -711,6 +718,7 @@ def test_project_zip_contains_paywalled_and_download_status():
         latest = json.loads(zf.read("latest_papers.json").decode("utf-8"))
 
     assert any(name.startswith("articles/") and name.endswith(".html") for name in names)
+    assert any(name.startswith("articles/") and name.endswith(".docx") for name in names)
     assert "images/cover.png" in names
     assert "paywalled_dois.csv" in names
     assert "unavailable_dois.csv" in names

@@ -5,6 +5,7 @@ import os
 import re
 import socket
 import time
+import base64
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -117,22 +118,74 @@ def call_openai_compatible(
     raise LLMError("LLM retry loop ended unexpectedly")
 
 
+def call_openai_compatible_with_images(
+    api_key: str,
+    base_url: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    images: list[tuple[bytes, str]],
+    temperature: float = 0.2,
+    timeout: int = 120,
+    max_attempts: int = 3,
+) -> str:
+    """Call an OpenAI-compatible vision endpoint with inline image bytes.
+
+    Gemini's OpenAI-compatible endpoint accepts the same ``image_url`` data URI
+    structure. Providers that do not accept vision requests surface a normal
+    LLMError, allowing callers to fall back to caption/text evidence.
+    """
+    attempts = max(1, min(int(max_attempts), 3))
+    for attempt in range(attempts):
+        try:
+            return _call_openai_compatible_once(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                image_inputs=images,
+                temperature=temperature,
+                timeout=timeout,
+            )
+        except LLMError as exc:
+            if exc.quota_exhausted or not exc.transient or attempt + 1 >= attempts:
+                raise
+            delay = exc.retry_after if exc.retry_after is not None else float(2**attempt)
+            time.sleep(max(0.0, delay))
+    raise LLMError("LLM vision retry loop ended unexpectedly")
+
+
 def _call_openai_compatible_once(
     api_key: str,
     base_url: str,
     model: str,
     system_prompt: str,
     user_prompt: str,
+    image_inputs: list[tuple[bytes, str]] | None = None,
     temperature: float = 0.2,
     timeout: int = 120,
 ) -> str:
     if not api_key.strip():
         raise LLMError("Missing API key")
+    user_content: str | list[dict[str, Any]] = user_prompt
+    if image_inputs:
+        user_content = [{"type": "text", "text": user_prompt}]
+        for image_bytes, mime_type in image_inputs:
+            if not image_bytes:
+                continue
+            encoded = base64.b64encode(image_bytes).decode("ascii")
+            user_content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime_type or 'image/png'};base64,{encoded}"},
+                }
+            )
     payload = {
         "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": user_content},
         ],
         "temperature": temperature,
     }

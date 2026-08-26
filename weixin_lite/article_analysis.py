@@ -10,7 +10,7 @@ from .models import AnalysisClaim, PaperAnalysis, PaperInput
 from .pdf_reader import PdfContent
 
 
-ANALYSIS_PROMPT_VERSION = "paper-analysis-v2"
+ANALYSIS_PROMPT_VERSION = "paper-analysis-v3"
 ANALYSIS_FIELDS = (
     "research_question",
     "background",
@@ -26,7 +26,7 @@ ANALYSIS_SYSTEM_PROMPT = """你是该领域的世界顶级学术专家，正在�
 遇到相对新颖或专业的技术概念，首次出现时在 statement 中用 **术语** 标出，并给出通俗解释；学术名词可保留英文补充。
 每一条分析都必须给出原文页码 page 或图号 figure_id，并在 evidence_text 中放入可核对的原文短引文或原文细节；可引用时使用 blockquote 风格的 `> 原文`。
 没有可追溯来源的判断不得输出；材料不足时返回空数组，不得补写常识或生成占位结论。
-总体分析应足够深入，覆盖研究目标、产业意义、创新思路、方法优势、实验验证、实验设计和关键数据。
+总体分析应足够深入，且每类必须至少覆盖一条可追溯证据：研究目标、方法路径、实验/对照设计、关键结果或定量数据、局限性与结论。背景字段要说明现实或产业意义；方法字段需包含方法或模型细节；关键结果字段需包含实验/验证结果，能关联图号时必须关联图号。
 只返回符合要求的 JSON，不要输出 Markdown 代码块。"""
 
 
@@ -121,7 +121,9 @@ def _claim_from_payload(item: Any) -> AnalysisClaim | None:
         evidence_text=str(item.get("evidence_text") or item.get("evidence") or "").strip(),
         confidence=str(item.get("confidence") or "medium").strip().lower(),
     )
-    return claim if claim.traceable else None
+    # A page/figure reference without a source excerpt is not sufficient to
+    # support a publishable claim. Keep the evidence adjacent to its locator.
+    return claim if claim.traceable and claim.evidence_text else None
 
 
 def paper_analysis_from_payload(
@@ -150,8 +152,17 @@ def paper_analysis_from_payload(
     )
     if dropped:
         analysis.warnings.append(f"已忽略 {dropped} 条缺少页码/图号或正文的不可追溯判断。")
-    if not analysis.research_question or not analysis.key_results or not analysis.conclusion:
-        raise ValueError("结构化分析缺少研究问题、关键结果或结论的可追溯证据")
+    required = {
+        "研究问题": analysis.research_question,
+        "现实/产业意义": analysis.background,
+        "方法": analysis.methods,
+        "实验设计与关键结果": analysis.key_results,
+        "局限性": analysis.limitations,
+        "结论": analysis.conclusion,
+    }
+    missing = [label for label, claims in required.items() if not claims]
+    if missing:
+        raise ValueError("结构化分析缺少以下可追溯证据：" + "、".join(missing))
     return analysis
 
 

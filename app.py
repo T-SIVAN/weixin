@@ -10,8 +10,10 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from weixin_lite.downloader import download_open_access
+from weixin_lite.docx_exporter import DocxExportError
 from weixin_lite.exporter import (
     article_document_html,
+    export_article_docx_bytes,
     export_article_html,
     export_article_markdown,
     project_zip,
@@ -62,6 +64,18 @@ st.set_page_config(page_title="微信文献快读工具", page_icon="🧬", layo
 
 LATEST_PATH = Path("data/latest_papers.json")
 TRANSLATION_CACHE_PATH = DEFAULT_CACHE_PATH
+
+
+def build_project_zip_download(
+    project: BatchProject,
+    image_assets: dict[str, bytes],
+    downloads: list[DownloadedPaper],
+) -> tuple[bytes | None, str | None]:
+    """Build a project archive without letting one stale article break the tab."""
+    try:
+        return project_zip(project, image_assets, downloads), None
+    except (DocxExportError, ValueError) as exc:
+        return None, f"项目包暂不能导出：{exc}。请返回“内容与生成”补齐图片后重试。"
 
 
 def init_state() -> None:
@@ -989,7 +1003,7 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
 
         st.divider()
         st.markdown("#### 3. 成稿与发布")
-        target_chars = st.slider("公众号正文字数", 1500, 2800, 2000, step=100, key="single_target_chars")
+        target_chars = st.slider("公众号正文字数", 2800, 4200, 3200, step=100, key="single_target_chars")
         use_quality = bool(analysis and getattr(analysis, "complete", False))
         if use_quality:
             st.success("将基于结构化分析和已选配图生成质量优先稿。")
@@ -1016,6 +1030,7 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
                         analysis=analysis if use_quality else None,
                         confirmed_figures=selected_figures,
                         target_profile="adaptive",
+                        image_assets=st.session_state.images,
                     )
                 st.session_state.single_article = article
                 st.session_state.articles = [article] + [item for item in st.session_state.articles if item.title != article.title]
@@ -1041,10 +1056,28 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
             if article.warnings:
                 st.warning("；".join(article.warnings))
             render_article_preview(article)
-            col_a, col_b, col_c = st.columns(3)
-            col_a.download_button("Markdown", export_article_markdown(article), file_name=f"{article.title}.md")
-            col_b.download_button("HTML", export_article_html(article), file_name=f"{article.title}.html")
-            col_c.metric("正文长度", article.word_count)
+            try:
+                word_data = export_article_docx_bytes(article, st.session_state.images)
+                st.download_button(
+                    "下载可编辑 Word (.docx)",
+                    word_data,
+                    file_name=f"{article.title}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    type="primary",
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+            st.metric("正文长度", article.word_count)
+            with st.expander("兼容格式与高级导出"):
+                st.download_button("Markdown", export_article_markdown(article), file_name=f"{article.title}.md")
+                try:
+                    st.download_button(
+                        "便携 HTML",
+                        export_article_html(article, st.session_state.images),
+                        file_name=f"{article.title}.html",
+                    )
+                except ValueError as exc:
+                    st.error(str(exc))
     else:
         st.info("请先上传 PDF、选择已有结果，或粘贴正文作为活动文章。")
 
@@ -1142,13 +1175,21 @@ def export_and_publish_tab() -> None:
             articles=articles,
             downloads=st.session_state.downloads,
         )
-        st.download_button(
-            "下载项目包",
-            project_zip(project, st.session_state.images, st.session_state.downloads),
-            file_name="weixin-batch.weixin-project.zip",
-            mime="application/zip",
-            type="primary",
+        project_data, project_error = build_project_zip_download(
+            project,
+            st.session_state.images,
+            st.session_state.downloads,
         )
+        if project_error:
+            st.error(project_error)
+        elif project_data is not None:
+            st.download_button(
+                "下载项目包",
+                project_data,
+                file_name="weixin-batch.weixin-project.zip",
+                mime="application/zip",
+                type="primary",
+            )
 
     if not articles:
         st.info("生成文章后可导出单篇文件或创建公众号草稿。")
@@ -1159,9 +1200,16 @@ def export_and_publish_tab() -> None:
     selected = st.selectbox("选择文章", article_titles)
     article = articles[article_titles.index(selected)]
 
-    col_a, col_b, col_c = st.columns(3)
-    col_a.download_button("单篇 Markdown", export_article_markdown(article), file_name=f"{article.title}.md")
-    col_b.download_button("单篇 HTML", export_article_html(article), file_name=f"{article.title}.html")
+    with st.expander("兼容格式与高级导出"):
+        st.download_button("单篇 Markdown", export_article_markdown(article), file_name=f"{article.title}.md")
+        try:
+            st.download_button(
+                "单篇便携 HTML",
+                export_article_html(article, st.session_state.images),
+                file_name=f"{article.title}.html",
+            )
+        except ValueError as exc:
+            st.error(str(exc))
 
     st.markdown("#### 公众号草稿")
     app_id = st.text_input("APP_ID")
