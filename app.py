@@ -8,6 +8,7 @@ from pathlib import Path
 import streamlit as st
 
 from weixin_lite.downloader import download_open_access
+from weixin_lite.docx_exporter import DocxExportError
 from weixin_lite.exporter import (
     export_article_html,
     export_article_markdown,
@@ -54,6 +55,18 @@ st.set_page_config(page_title="微信文献快读工具", page_icon="🧬", layo
 
 
 LATEST_PATH = Path("data/latest_papers.json")
+
+
+def build_project_zip_download(
+    project: BatchProject,
+    image_assets: dict[str, bytes],
+    downloads: list[DownloadedPaper],
+) -> tuple[bytes | None, str | None]:
+    """Build a project archive without letting a stale image break the page."""
+    try:
+        return project_zip(project, image_assets, downloads), None
+    except (DocxExportError, ValueError) as exc:
+        return None, f"项目包暂不能导出：{exc}。请返回“内容与生成”补齐图片后重试。"
 
 
 def init_state() -> None:
@@ -613,7 +626,14 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
                 st.dataframe([item.to_dict() for item in article.evidence[:12]], use_container_width=True, hide_index=True)
             col_a, col_b = st.columns(2)
             col_a.download_button("Markdown", export_article_markdown(article), file_name=f"{idx:02d}-{article.title}.md")
-            col_b.download_button("HTML", export_article_html(article), file_name=f"{idx:02d}-{article.title}.html")
+            try:
+                col_b.download_button(
+                    "HTML",
+                    export_article_html(article, st.session_state.images),
+                    file_name=f"{idx:02d}-{article.title}.html",
+                )
+            except ValueError as exc:
+                col_b.error(f"HTML 暂不能导出：{exc}")
 
 
 def export_and_publish_tab() -> None:
@@ -638,13 +658,21 @@ def export_and_publish_tab() -> None:
             articles=articles,
             downloads=st.session_state.downloads,
         )
-        st.download_button(
-            "下载项目包",
-            project_zip(project, st.session_state.images, st.session_state.downloads),
-            file_name="weixin-batch.weixin-project.zip",
-            mime="application/zip",
-            type="primary",
+        project_data, project_error = build_project_zip_download(
+            project,
+            st.session_state.images,
+            st.session_state.downloads,
         )
+        if project_error:
+            st.error(project_error)
+        elif project_data is not None:
+            st.download_button(
+                "下载项目包",
+                project_data,
+                file_name="weixin-batch.weixin-project.zip",
+                mime="application/zip",
+                type="primary",
+            )
 
     if not articles:
         st.info("生成文章后可导出单篇文件或创建公众号草稿。")
@@ -657,7 +685,14 @@ def export_and_publish_tab() -> None:
 
     col_a, col_b, col_c = st.columns(3)
     col_a.download_button("单篇 Markdown", export_article_markdown(article), file_name=f"{article.title}.md")
-    col_b.download_button("单篇 HTML", export_article_html(article), file_name=f"{article.title}.html")
+    try:
+        col_b.download_button(
+            "单篇 HTML",
+            export_article_html(article, st.session_state.images),
+            file_name=f"{article.title}.html",
+        )
+    except ValueError as exc:
+        col_b.error(f"HTML 暂不能导出：{exc}")
 
     st.markdown("#### 公众号草稿")
     app_id = st.text_input("APP_ID")
