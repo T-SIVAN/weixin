@@ -309,7 +309,7 @@ class PaperAnalysis:
     warnings: list[str] = field(default_factory=list)
     source_hash: str = ""
     model: str = ""
-    version: str = "paper-analysis-v1"
+    version: str = "paper-analysis-v3"
     created_at: str = field(default_factory=utc_now)
 
     @property

@@ -10,8 +10,10 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from weixin_lite.downloader import download_open_access
+from weixin_lite.docx_exporter import DocxExportError
 from weixin_lite.exporter import (
     article_document_html,
+    export_article_docx_bytes,
     export_article_html,
     export_article_markdown,
     project_zip,
@@ -62,6 +64,18 @@ st.set_page_config(page_title="微信文献快读工具", page_icon="🧬", layo
 
 LATEST_PATH = Path("data/latest_papers.json")
 TRANSLATION_CACHE_PATH = DEFAULT_CACHE_PATH
+
+
+def build_project_zip_download(
+    project: BatchProject,
+    image_assets: dict[str, bytes],
+    downloads: list[DownloadedPaper],
+) -> tuple[bytes | None, str | None]:
+    """Build a project archive without letting one stale article break the tab."""
+    try:
+        return project_zip(project, image_assets, downloads), None
+    except (DocxExportError, ValueError) as exc:
+        return None, f"项目包暂不能导出：{exc}。请返回“内容与生成”补齐图片后重试。"
 
 
 def init_state() -> None:
@@ -564,7 +578,7 @@ def confirmed_single_figures(pdf: PdfContent | None) -> list:
         figure.selected = bool(st.session_state.get(f"single_fig_select_{idx}", figure.selected))
         figure.order = int(st.session_state.get(f"single_fig_order_{idx}", figure.order or idx) or idx)
         figure.role = str(st.session_state.get(f"single_fig_role_{idx}", figure.role or "key_result"))
-        if figure.selected:
+        if figure.selected and figure.image_name:
             figures.append(figure)
     return sorted(figures, key=lambda item: (item.order or 999, item.figure_id))[:4]
 
@@ -924,6 +938,7 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
 
         if pdf and pdf.legends:
             st.markdown("##### 候选配图")
+            st.caption("系统会先推荐并裁剪候选图；只有勾选“选入正文”的图片才会进入最终稿。低置信度截图默认需要人工确认。")
             pdf_bytes_map: dict[str, bytes] = st.session_state.get("pdf_bytes", {})
             pdf_name = st.session_state.get("single_active_pdf_name", "")
             for idx, figure in enumerate(pdf.legends, start=1):
@@ -938,6 +953,14 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
                         key=f"single_fig_role_{idx}",
                     )
                     st.caption(figure.caption[:700])
+                    if figure.why_selected:
+                        st.caption(f"推荐理由：{figure.why_selected}")
+                    if figure.needs_manual_crop:
+                        st.warning("这张图裁剪置信度较低，默认不进入正文；请检查截图、手动裁剪或替换后再勾选。")
+                    elif figure.confidence:
+                        st.caption(f"裁剪置信度：{figure.confidence:.2f}")
+                    if figure.interpretation:
+                        st.info("当前图解：" + figure.interpretation)
                     if figure.image_name and figure.image_name in st.session_state.images:
                         st.image(st.session_state.images[figure.image_name], caption=f"当前截图；置信度 {figure.confidence:.2f}", use_container_width=True)
                     if figure.crop_bbox and pdf_name in pdf_bytes_map:
@@ -958,6 +981,8 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
                                     bottom=bottom,
                                 )
                                 figure.crop_bbox = bbox
+                                figure.confidence = max(figure.confidence, 0.75)
+                                figure.needs_manual_crop = False
                                 if not figure.image_name:
                                     figure.image_name = f"{paper_key(paper)}-{figure.figure_id}.png"
                                 st.session_state.images[figure.image_name] = image
@@ -971,12 +996,14 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
                         st.session_state.images[new_name] = replacement.getvalue()
                         figure.image_name = new_name
                         figure.page_image_name = new_name
+                        figure.confidence = max(figure.confidence, 0.8)
+                        figure.needs_manual_crop = False
                         if old_name and old_name in st.session_state.images:
                             st.caption("已替换为人工上传图片。")
 
         st.divider()
         st.markdown("#### 3. 成稿与发布")
-        target_chars = st.slider("公众号正文字数", 1500, 2800, 2000, step=100, key="single_target_chars")
+        target_chars = st.slider("公众号正文字数", 2800, 4200, 3200, step=100, key="single_target_chars")
         use_quality = bool(analysis and getattr(analysis, "complete", False))
         if use_quality:
             st.success("将基于结构化分析和已选配图生成质量优先稿。")
@@ -984,6 +1011,11 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
             st.warning("未填写 LLM API Key，只能生成占位级模板；配置模型后可重试当前阶段。")
         else:
             st.info("当前没有完整结构化分析，将按 PDF/粘贴材料直接生成，并保留证据边界提示。")
+        selected_figures = confirmed_single_figures(pdf)
+        if selected_figures:
+            st.caption(f"已确认 {len(selected_figures)} 张正文配图；生成时会先对这些图做逐图中文分析。")
+        elif pdf and pdf.legends:
+            st.warning("当前还没有确认正文配图。可先勾选 2-4 张关键图，再生成带图解读稿。")
         if st.button("生成单篇公众号稿", type="primary"):
             try:
                 with st.spinner("正在生成公众号正文..."):
@@ -996,8 +1028,9 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
                         target_chars=target_chars,
                         source_text=st.session_state.get("single_source_text", ""),
                         analysis=analysis if use_quality else None,
-                        confirmed_figures=confirmed_single_figures(pdf),
+                        confirmed_figures=selected_figures,
                         target_profile="adaptive",
+                        image_assets=st.session_state.images,
                     )
                 st.session_state.single_article = article
                 st.session_state.articles = [article] + [item for item in st.session_state.articles if item.title != article.title]
@@ -1023,10 +1056,28 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
             if article.warnings:
                 st.warning("；".join(article.warnings))
             render_article_preview(article)
-            col_a, col_b, col_c = st.columns(3)
-            col_a.download_button("Markdown", export_article_markdown(article), file_name=f"{article.title}.md")
-            col_b.download_button("HTML", export_article_html(article), file_name=f"{article.title}.html")
-            col_c.metric("正文长度", article.word_count)
+            try:
+                word_data = export_article_docx_bytes(article, st.session_state.images)
+                st.download_button(
+                    "下载可编辑 Word (.docx)",
+                    word_data,
+                    file_name=f"{article.title}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    type="primary",
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+            st.metric("正文长度", article.word_count)
+            with st.expander("兼容格式与高级导出"):
+                st.download_button("Markdown", export_article_markdown(article), file_name=f"{article.title}.md")
+                try:
+                    st.download_button(
+                        "便携 HTML",
+                        export_article_html(article, st.session_state.images),
+                        file_name=f"{article.title}.html",
+                    )
+                except ValueError as exc:
+                    st.error(str(exc))
     else:
         st.info("请先上传 PDF、选择已有结果，或粘贴正文作为活动文章。")
 
@@ -1124,13 +1175,21 @@ def export_and_publish_tab() -> None:
             articles=articles,
             downloads=st.session_state.downloads,
         )
-        st.download_button(
-            "下载项目包",
-            project_zip(project, st.session_state.images, st.session_state.downloads),
-            file_name="weixin-batch.weixin-project.zip",
-            mime="application/zip",
-            type="primary",
+        project_data, project_error = build_project_zip_download(
+            project,
+            st.session_state.images,
+            st.session_state.downloads,
         )
+        if project_error:
+            st.error(project_error)
+        elif project_data is not None:
+            st.download_button(
+                "下载项目包",
+                project_data,
+                file_name="weixin-batch.weixin-project.zip",
+                mime="application/zip",
+                type="primary",
+            )
 
     if not articles:
         st.info("生成文章后可导出单篇文件或创建公众号草稿。")
@@ -1141,9 +1200,16 @@ def export_and_publish_tab() -> None:
     selected = st.selectbox("选择文章", article_titles)
     article = articles[article_titles.index(selected)]
 
-    col_a, col_b, col_c = st.columns(3)
-    col_a.download_button("单篇 Markdown", export_article_markdown(article), file_name=f"{article.title}.md")
-    col_b.download_button("单篇 HTML", export_article_html(article), file_name=f"{article.title}.html")
+    with st.expander("兼容格式与高级导出"):
+        st.download_button("单篇 Markdown", export_article_markdown(article), file_name=f"{article.title}.md")
+        try:
+            st.download_button(
+                "单篇便携 HTML",
+                export_article_html(article, st.session_state.images),
+                file_name=f"{article.title}.html",
+            )
+        except ValueError as exc:
+            st.error(str(exc))
 
     st.markdown("#### 公众号草稿")
     app_id = st.text_input("APP_ID")

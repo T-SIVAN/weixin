@@ -6,9 +6,10 @@ import pytest
 
 from weixin_lite import batch_analyze
 from weixin_lite import llm as llm_module
-from weixin_lite.article_analysis import analysis_cache_key, analyze_paper
+from weixin_lite.article_analysis import ANALYSIS_PROMPT_VERSION, analysis_cache_key, analyze_paper, build_analysis_prompt
 from weixin_lite.downloader import download_open_access
 from weixin_lite.exporter import article_html, project_zip, unavailable_dois_csv
+from weixin_lite.figure_analysis import analyze_confirmed_figures
 from weixin_lite.generator import ArticleGenerationError, build_prompt, generate_article, markdown_to_wechat_html
 from weixin_lite.llm import _parse_retry_after, call_openai_compatible, default_api_key, default_base_url, default_model
 from weixin_lite.models import AnalysisClaim, BatchProject, FigureAnalysis, PaperAnalysis, PaperInput, generation_candidate_papers, generation_ready_papers, unavailable_papers
@@ -387,6 +388,112 @@ def test_article_places_screenshot_before_short_note():
     assert note_pos > image_pos
 
 
+def test_confirmed_figure_analysis_falls_back_to_caption_evidence():
+    paper = PaperInput(title_en="A test paper")
+    figure = FigureAnalysis(
+        figure_id="Fig. 2",
+        caption="Fig. 2 The engineered strain reached 90% conversion.",
+        page="4",
+        image_name="fig2.png",
+        role="key_result",
+        selected=True,
+        order=1,
+    )
+    analysis = PaperAnalysis(
+        key_results=[
+            AnalysisClaim(
+                "工程菌株提高了转化效率",
+                page="4",
+                figure_id="Fig. 2",
+                evidence_text="reached 90% conversion",
+            )
+        ],
+        status="complete",
+    )
+
+    figures = analyze_confirmed_figures(paper, analysis, [figure])
+
+    assert figures == [figure]
+    assert figure.interpretation
+    assert "工程菌株提高了转化效率" in figure.interpretation
+
+
+def test_confirmed_figures_ignore_unconfirmed_model_figure_notes(monkeypatch):
+    def fake_call(**kwargs):
+        return json.dumps(
+            {
+                "title": "确认配图稿",
+                "digest": "摘要",
+                "intro": "导语",
+                "core_points": ["核心分析。"],
+                "figure_notes": [{"figure_id": "Fig. 99", "heading": "不应出现", "note": "不应进入正文"}],
+                "innovation": ["创新意义。"],
+                "limitations": ["证据边界。"],
+                "take_home": "总结。",
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr("weixin_lite.generator.call_openai_compatible", fake_call)
+    monkeypatch.setattr(
+        "weixin_lite.figure_analysis.call_openai_compatible",
+        lambda **kwargs: json.dumps(
+            {
+                "figures": [
+                    {
+                        "figure_id": "Fig. 2",
+                        "heading": "Fig. 2：关键结果图",
+                        "note": "确认图解。",
+                        "evidence_text": "caption evidence",
+                        "page": "4",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+    )
+    paper = PaperInput(title_en="A test paper")
+    figure = FigureAnalysis(
+        figure_id="Fig. 2",
+        caption="Fig. 2 Result.",
+        page="4",
+        image_name="fig2.png",
+        role="key_result",
+        selected=True,
+        order=1,
+    )
+    pdf = PdfContent(
+        text="Fig. 2 Result.",
+        legends=[figure],
+        lead_image=FigureAnalysis("Lead", "Title", page="1", image_name="lead.png"),
+    )
+
+    article = generate_article(paper, pdf=pdf, api_key="key", confirmed_figures=[figure])
+
+    assert "![论文首页](images/lead.png)" in article.body_markdown
+    assert "![Fig. 2](images/fig2.png)" in article.body_markdown
+    assert "确认图解" in article.body_markdown
+    assert "Fig. 99" not in article.body_markdown
+    assert article.body_markdown.find("![论文首页]") < article.body_markdown.find("导语")
+    assert article.body_markdown.find("![Fig. 2]") < article.body_markdown.find("确认图解")
+
+
+def test_untraceable_confirmed_figure_is_not_rendered():
+    paper = PaperInput(title_en="A test paper")
+    figure = FigureAnalysis(
+        figure_id="Fig. 5",
+        caption="",
+        page="",
+        image_name="fig5.png",
+        selected=True,
+        order=1,
+    )
+
+    article = generate_article(paper, confirmed_figures=[figure])
+
+    assert "fig5.png" not in article.body_markdown
+
+
 def test_wechat_markdown_html_matches_reference_style_without_duplicate_title():
     markdown = """# 平台标题
 
@@ -514,6 +621,22 @@ def test_analysis_models_serialize_and_cache_key_excludes_api_key():
     assert "secret" not in first
 
 
+def test_analysis_prompt_uses_expert_deep_reading_guide():
+    prompt = build_analysis_prompt(
+        PaperInput(title_en="Traceable paper", doi="10.1000/trace"),
+        PdfContent(text="[Page 1]\nAbstract\nKey result.", hash="pdf-hash"),
+    )
+
+    assert ANALYSIS_PROMPT_VERSION == "paper-analysis-v3"
+    assert "世界顶级学术专家" in prompt
+    assert "### 论文的研究目标是什么？想要解决什么实际问题？" in prompt
+    assert "### 这个问题对于产业发展有什么重要意义？" in prompt
+    assert "### 实验是如何设计的？实验数据和结果如何？" in prompt
+    assert "blockquote" in prompt
+    assert '"research_question"' in prompt
+    assert "只返回符合要求的 JSON" in prompt
+
+
 def test_analysis_failure_preserves_previous_complete_analysis(monkeypatch):
     previous = _complete_analysis()
     monkeypatch.setattr(
@@ -550,7 +673,10 @@ def test_quality_generation_uses_one_call_without_hidden_length_repair(monkeypat
                 "title": "可追溯解读",
                 "digest": "摘要",
                 "intro": "导语",
-                "core_points": ["核心结果来自第五页。"],
+                "research_question": "研究问题来自第一页。",
+                "approach_advantage": ["方法优势来自第三页。"],
+                "experiment_validation": ["验证设计来自第四页。"],
+                "quantitative_findings": ["核心结果来自第五页。"],
                 "figure_notes": [],
                 "innovation": ["创新点来自第六页。"],
                 "limitations": ["样本有限。"],
@@ -569,7 +695,11 @@ def test_quality_generation_uses_one_call_without_hidden_length_repair(monkeypat
     )
 
     assert calls["count"] == 1
-    assert article.analysis_version == "paper-analysis-v1"
+    assert article.analysis_version == "paper-analysis-v3"
+    assert "研究问题与现实意义" in article.body_markdown
+    assert "方法路径与比较优势" in article.body_markdown
+    assert "实验设计与验证" in article.body_markdown
+    assert "关键数据与结果" in article.body_markdown
     assert "局限性与解读边界" in article.body_markdown
     assert any("显式补写/精简" in warning for warning in article.warnings)
 
@@ -588,6 +718,7 @@ def test_project_zip_contains_paywalled_and_download_status():
         latest = json.loads(zf.read("latest_papers.json").decode("utf-8"))
 
     assert any(name.startswith("articles/") and name.endswith(".html") for name in names)
+    assert any(name.startswith("articles/") and name.endswith(".docx") for name in names)
     assert "images/cover.png" in names
     assert "paywalled_dois.csv" in names
     assert "unavailable_dois.csv" in names
