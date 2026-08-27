@@ -78,7 +78,7 @@ def analysis_cache_key(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def build_analysis_prompt(paper: PaperInput, pdf: PdfContent) -> str:
+def build_analysis_prompt(paper: PaperInput, pdf: PdfContent, evidence_chunk: str | None = None) -> str:
     return f"""
 请对下面单篇论文执行完整、可追溯的结构化分析。
 
@@ -102,7 +102,7 @@ DOI：{paper.doi}
 }}
 
 全文证据包：
-{pdf.prompt_text(max_chars=30000)}
+{evidence_chunk if evidence_chunk is not None else pdf.prompt_text()}
 """.strip()
 
 
@@ -131,6 +131,7 @@ def paper_analysis_from_payload(
     *,
     source_hash: str,
     model: str,
+    require_core: bool = True,
 ) -> PaperAnalysis:
     values: dict[str, Any] = {}
     dropped = 0
@@ -161,9 +162,26 @@ def paper_analysis_from_payload(
         "结论": analysis.conclusion,
     }
     missing = [label for label, claims in required.items() if not claims]
-    if missing:
+    if require_core and missing:
         raise ValueError("结构化分析缺少以下可追溯证据：" + "、".join(missing))
     return analysis
+
+
+def merge_analyses(analyses: list[PaperAnalysis], *, source_hash: str, model: str) -> PaperAnalysis:
+    values: dict[str, list[AnalysisClaim]] = {name: [] for name in ANALYSIS_FIELDS}
+    seen: set[tuple[str, str, str]] = set()
+    for partial in analyses:
+        for name in ANALYSIS_FIELDS:
+            for claim in getattr(partial, name):
+                key = (name, claim.page, claim.statement)
+                if key not in seen:
+                    seen.add(key)
+                    values[name].append(claim)
+    merged = PaperAnalysis(**values, status="complete", source_hash=source_hash, model=model, version=ANALYSIS_PROMPT_VERSION)
+    required = (merged.research_question, merged.background, merged.methods, merged.key_results, merged.limitations, merged.conclusion)
+    if not all(required):
+        raise ValueError("结构化分析缺少完整的可追溯证据，无法生成最终稿。")
+    return merged
 
 
 def _cached_analysis(cache: MutableMapping[str, Any] | None, key: str) -> PaperAnalysis | None:
@@ -203,15 +221,18 @@ def analyze_paper(
             version=ANALYSIS_PROMPT_VERSION,
         )
     try:
-        raw = call_openai_compatible(
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-            system_prompt=ANALYSIS_SYSTEM_PROMPT,
-            user_prompt=build_analysis_prompt(paper, pdf),
-            temperature=0.1,
-        )
-        analysis = paper_analysis_from_payload(parse_json_object(raw), source_hash=source_hash, model=model)
+        partials: list[PaperAnalysis] = []
+        for chunk in pdf.analysis_chunks():
+            raw = call_openai_compatible(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                system_prompt=ANALYSIS_SYSTEM_PROMPT,
+                user_prompt=build_analysis_prompt(paper, pdf, chunk),
+                temperature=0.1,
+            )
+            partials.append(paper_analysis_from_payload(parse_json_object(raw), source_hash=source_hash, model=model, require_core=False))
+        analysis = merge_analyses(partials, source_hash=source_hash, model=model)
     except Exception as exc:
         if previous_analysis and previous_analysis.complete:
             preserved = PaperAnalysis.from_dict(previous_analysis.to_dict())

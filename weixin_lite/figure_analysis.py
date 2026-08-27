@@ -10,7 +10,7 @@ from .models import AnalysisClaim, FigureAnalysis, PaperAnalysis, PaperInput
 from .pdf_reader import compact_text, figure_key
 
 
-FIGURE_ANALYSIS_PROMPT_VERSION = "figure-analysis-v2"
+FIGURE_ANALYSIS_PROMPT_VERSION = "figure-analysis-v3"
 ROLE_LABELS = {
     "lead": "论文首页",
     "mechanism": "机制图",
@@ -25,7 +25,9 @@ FIGURE_ANALYSIS_SYSTEM_PROMPT = """你是严谨的科研论文配图解读助手
 每张图的 note 必须包含四个清晰部分：图展示什么、实验或比较如何设计、关键数据或趋势、该图支持的结论与证据边界。
 没有提供图像时，绝不声称看到了曲线、坐标轴、显著性标记或多面板细节；必须标明为“图注/文本证据级解读（未完成视觉复核）”。
 提供图像且完成视觉复核时，也只能描述可见内容和给定证据共同支持的结论，不得补造数值。
-每张图必须返回 figure_id、heading、note、evidence_text、page。没有证据的图不要编造。
+每张图必须返回 figure_id、heading、note、evidence_text、page、visible_elements、visual_evidence。没有证据的图不要编造。
+当 asset_kind 为 table 时，额外返回 table_headers、table_rows、table_confidence；只能转录确实看得清的单元格，不能猜测缺失数字。
+当 asset_kind 为 scheme 或 flowchart 时，note 必须明确流程步骤、箭头关系、输入和输出；看不清时写明证据边界。
 只返回 JSON，不要返回 Markdown 代码块。"""
 
 
@@ -144,6 +146,8 @@ def _build_prompt(
                 "evidence_text": evidence,
                 "confidence": figure.confidence,
                 "needs_manual_crop": figure.needs_manual_crop,
+                "asset_kind": figure.asset_kind,
+                "editable_table": figure.editable_table.to_dict() if figure.editable_table else None,
             }
         )
     return f"""
@@ -155,7 +159,7 @@ DOI：{paper.doi}
 输出 JSON Schema：
 {{
   "figures": [
-    {{"figure_id":"Fig. 1", "heading":"图文小标题", "note":"中文图解分析", "evidence_text":"可核对证据", "page":"1"}}
+    {{"figure_id":"Fig. 1", "heading":"图文小标题", "note":"中文图解分析", "evidence_text":"可核对证据", "visible_elements":"可见的曲线、坐标轴、箭头或表格结构", "visual_evidence":"图像中可直接观察到的趋势或数值", "page":"1", "table_headers":["列名"], "table_rows":[["单元格"]], "table_confidence":0.0}}
   ]
 }}
 
@@ -194,6 +198,32 @@ def _apply_payload(
         heading = str(item.get("heading") or "").strip()
         if heading:
             figure.why_selected = heading
+        figure.visual_evidence = compact_text(
+            "\n".join(
+                value
+                for value in (
+                    str(item.get("visible_elements") or "").strip(),
+                    str(item.get("visual_evidence") or "").strip(),
+                )
+                if value
+            ),
+            1200,
+        )
+        if figure.asset_kind == "table" and figure.editable_table:
+            headers = item.get("table_headers")
+            rows = item.get("table_rows")
+            confidence = item.get("table_confidence")
+            if isinstance(headers, list) and isinstance(rows, list) and isinstance(confidence, (int, float)) and confidence >= 0.7:
+                normalized_headers = [str(value).strip() for value in headers if str(value).strip()]
+                normalized_rows = [
+                    [str(value).strip() for value in row][: len(normalized_headers)]
+                    for row in rows
+                    if isinstance(row, list) and normalized_headers
+                ]
+                if normalized_headers and normalized_rows:
+                    figure.editable_table.headers = normalized_headers
+                    figure.editable_table.rows = normalized_rows
+                    figure.editable_table.confidence = float(confidence)
         figure.interpretation = _four_part_note(
             figure,
             analysis,
@@ -243,33 +273,38 @@ def analyze_confirmed_figures(
     assets = image_assets if isinstance(image_assets, Mapping) else {}
     images = _image_inputs(confirmed, assets)
     visual_review_available = bool(images) and _is_gemini_vision(config, model, base_url)
-    if api_key.strip():
-        try:
-            call_kwargs = {
-                "api_key": api_key,
-                "base_url": base_url,
-                "model": model,
-                "system_prompt": FIGURE_ANALYSIS_SYSTEM_PROMPT,
-                "user_prompt": _build_prompt(
-                    paper,
-                    analysis,
-                    confirmed,
-                    visual_review_available=visual_review_available,
-                ),
-                "temperature": 0.1,
-            }
-            raw = (
-                call_openai_compatible_with_images(images=images, **call_kwargs)
-                if visual_review_available
-                else call_openai_compatible(**call_kwargs)
-            )
-            payload = parse_json_object(raw)
-            _apply_payload(confirmed, payload, analysis, visual_reviewed=visual_review_available)
-        except Exception:
-            # A failed vision/text request must not masquerade as image review.
-            visual_review_available = False
-
+    if not visual_review_available or not api_key.strip():
+        for figure in confirmed:
+            figure.vision_status = "blocked"
+            figure.vision_error = "最终图表分析需要配置支持视觉输入的 Gemini 模型，并提供确认截图。"
+        return []
+    try:
+        call_kwargs = {
+            "api_key": api_key,
+            "base_url": base_url,
+            "model": model,
+            "system_prompt": FIGURE_ANALYSIS_SYSTEM_PROMPT,
+            "user_prompt": _build_prompt(
+                paper,
+                analysis,
+                confirmed,
+                visual_review_available=visual_review_available,
+            ),
+            "temperature": 0.1,
+        }
+        raw = call_openai_compatible_with_images(images=images, **call_kwargs)
+        payload = parse_json_object(raw)
+        _apply_payload(confirmed, payload, analysis, visual_reviewed=True)
+    except Exception as exc:
+        for figure in confirmed:
+            figure.vision_status = "failed"
+            figure.vision_error = f"Gemini 视觉复核失败：{type(exc).__name__}: {exc}"
+        return []
     for figure in confirmed:
-        if not figure.interpretation:
-            _fallback_figure_note(figure, analysis)
-    return [figure for figure in confirmed if figure.interpretation]
+        if figure.interpretation:
+            figure.vision_status = "reviewed"
+            figure.vision_error = ""
+        else:
+            figure.vision_status = "failed"
+            figure.vision_error = "Gemini 未返回可追溯的图表解读。"
+    return [figure for figure in confirmed if figure.vision_status == "reviewed"]

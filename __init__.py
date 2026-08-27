@@ -1,13 +1,6 @@
-"""WeChat literature radar and Chinese quick-read generation toolkit."""
+"""Repository marker for test discovery.
 
-from .models import BatchProject, DownloadedPaper, EvidenceItem, FigureAnalysis, PaperInput, QuickReadArticle, SearchRun
-
-__all__ = [
-    "BatchProject",
-    "DownloadedPaper",
-    "EvidenceItem",
-    "FigureAnalysis",
-    "PaperInput",
-    "QuickReadArticle",
-    "SearchRun",
-]
+The application package lives in :mod:`weixin_lite`.  Keeping this module
+side-effect free prevents pytest from importing the repository directory as a
+package and looking for non-existent root-level modules.
+"""

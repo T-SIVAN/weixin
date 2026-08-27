@@ -253,10 +253,17 @@ class FigureAnalysis:
     role: str = ""
     selected: bool = False
     order: int = 0
+    asset_kind: str = "figure"
+    vision_status: str = "pending"
+    vision_error: str = ""
+    visual_evidence: str = ""
+    editable_table: "EditableTable | None" = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["evidence"] = [item.to_dict() for item in self.evidence]
+        if self.editable_table:
+            data["editable_table"] = self.editable_table.to_dict()
         return data
 
     @classmethod
@@ -271,7 +278,34 @@ class FigureAnalysis:
         bbox = data.get("crop_bbox")
         if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
             values["crop_bbox"] = tuple(float(value) for value in bbox)
+        if isinstance(data.get("editable_table"), dict):
+            values["editable_table"] = EditableTable.from_dict(data["editable_table"])
         return cls(**values)
+
+
+@dataclass
+class EditableTable:
+    headers: list[str] = field(default_factory=list)
+    rows: list[list[str]] = field(default_factory=list)
+    source_page: str = ""
+    confidence: float = 0.0
+    warning: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "EditableTable":
+        return cls(
+            headers=[str(value or "") for value in data.get("headers") or []],
+            rows=[[str(cell or "") for cell in row] for row in data.get("rows") or [] if isinstance(row, list)],
+            source_page=str(data.get("source_page") or ""),
+            confidence=float(data.get("confidence") or 0.0),
+            warning=str(data.get("warning") or ""),
+        )
+
+
+AnalysisAsset = FigureAnalysis
 
 
 @dataclass

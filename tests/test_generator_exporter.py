@@ -388,7 +388,7 @@ def test_article_places_screenshot_before_short_note():
     assert note_pos > image_pos
 
 
-def test_confirmed_figure_analysis_falls_back_to_caption_evidence():
+def test_confirmed_figure_analysis_requires_gemini_visual_review():
     paper = PaperInput(title_en="A test paper")
     figure = FigureAnalysis(
         figure_id="Fig. 2",
@@ -413,9 +413,8 @@ def test_confirmed_figure_analysis_falls_back_to_caption_evidence():
 
     figures = analyze_confirmed_figures(paper, analysis, [figure])
 
-    assert figures == [figure]
-    assert figure.interpretation
-    assert "工程菌株提高了转化效率" in figure.interpretation
+    assert figures == []
+    assert figure.vision_status == "blocked"
 
 
 def test_confirmed_figures_ignore_unconfirmed_model_figure_notes(monkeypatch):
@@ -435,23 +434,6 @@ def test_confirmed_figures_ignore_unconfirmed_model_figure_notes(monkeypatch):
         )
 
     monkeypatch.setattr("weixin_lite.generator.call_openai_compatible", fake_call)
-    monkeypatch.setattr(
-        "weixin_lite.figure_analysis.call_openai_compatible",
-        lambda **kwargs: json.dumps(
-            {
-                "figures": [
-                    {
-                        "figure_id": "Fig. 2",
-                        "heading": "Fig. 2：关键结果图",
-                        "note": "确认图解。",
-                        "evidence_text": "caption evidence",
-                        "page": "4",
-                    }
-                ]
-            },
-            ensure_ascii=False,
-        ),
-    )
     paper = PaperInput(title_en="A test paper")
     figure = FigureAnalysis(
         figure_id="Fig. 2",
@@ -461,6 +443,8 @@ def test_confirmed_figures_ignore_unconfirmed_model_figure_notes(monkeypatch):
         role="key_result",
         selected=True,
         order=1,
+        vision_status="reviewed",
+        interpretation="确认图解。",
     )
     pdf = PdfContent(
         text="Fig. 2 Result.",
@@ -701,7 +685,7 @@ def test_quality_generation_uses_one_call_without_hidden_length_repair(monkeypat
     assert "实验设计与验证" in article.body_markdown
     assert "关键数据与结果" in article.body_markdown
     assert "局限性与解读边界" in article.body_markdown
-    assert any("显式补写/精简" in warning for warning in article.warnings)
+    assert not any("显式补写/精简" in warning for warning in article.warnings)
 
 
 def test_project_zip_contains_paywalled_and_download_status():

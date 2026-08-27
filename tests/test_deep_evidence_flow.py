@@ -21,12 +21,13 @@ def _analysis() -> PaperAnalysis:
     )
 
 
-def test_deep_prompts_use_one_evidence_supported_length_target_and_sections():
+def test_deep_prompts_use_full_evidence_without_a_product_length_cap():
     paper = PaperInput(title_en="Traceable paper")
     basic_prompt = build_prompt(paper, None, 1200)
     analysis_prompt = build_analysis_prompt(paper, PdfContent(text="[Page 1] evidence"))
 
-    assert "2800-4200" in basic_prompt
+    assert "不设置人为字数上限" in basic_prompt
+    assert "2800-4200" not in basic_prompt
     assert "500-1500" not in basic_prompt
     assert "产业发展有什么重要意义" in analysis_prompt
     assert "实验是如何设计的？实验数据和结果如何？" in analysis_prompt
@@ -80,7 +81,7 @@ def test_analysis_rejects_missing_industry_or_source_evidence():
         paper_analysis_from_payload(payload, source_hash="hash", model="model")
 
 
-def test_only_confirmed_figures_with_evidence_render_and_fallback_is_labeled():
+def test_confirmed_assets_require_gemini_visual_review_before_rendering():
     paper = PaperInput(title_en="Traceable paper")
     no_evidence = FigureAnalysis("Fig. 99", "", page="2", image_name="no-evidence.png", selected=True)
     confirmed = FigureAnalysis(
@@ -93,10 +94,9 @@ def test_only_confirmed_figures_with_evidence_render_and_fallback_is_labeled():
 
     figures = analyze_confirmed_figures(paper, _analysis(), [no_evidence, confirmed])
 
-    assert figures == [confirmed]
-    assert "图注/文本证据级解读（未完成视觉复核）" in confirmed.interpretation
-    for label in ("图展示什么", "实验或比较如何设计", "关键数据或趋势", "该图支持的结论与证据边界"):
-        assert label in confirmed.interpretation
+    assert figures == []
+    assert confirmed.vision_status == "blocked"
+    assert "Gemini" in confirmed.vision_error
 
 
 def test_gemini_vision_receives_only_confirmed_image_bytes(monkeypatch):
