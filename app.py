@@ -3,19 +3,24 @@ from __future__ import annotations
 import json
 import os
 import re
+from io import BytesIO
 from pathlib import Path
 
 import streamlit as st
+from PIL import Image
 
 from weixin_lite.downloader import download_open_access
+from weixin_lite.article_analysis import analyze_paper
 from weixin_lite.docx_exporter import DocxExportError
 from weixin_lite.exporter import (
+    export_article_docx_bytes,
     export_article_html,
     export_article_markdown,
     project_zip,
     unavailable_dois_csv,
 )
-from weixin_lite.generator import generate_article
+from weixin_lite.figure_analysis import analyze_confirmed_figures
+from weixin_lite.generator import ArticleGenerationError, generate_article
 from weixin_lite.llm import (
     PROVIDERS,
     default_api_key,
@@ -57,6 +62,26 @@ st.set_page_config(page_title="微信文献快读工具", page_icon="🧬", layo
 LATEST_PATH = Path("data/latest_papers.json")
 
 
+def crop_image_bytes(data: bytes, horizontal: tuple[int, int], vertical: tuple[int, int]) -> bytes:
+    with Image.open(BytesIO(data)) as image:
+        width, height = image.size
+        left = round(width * horizontal[0] / 100)
+        right = round(width * horizontal[1] / 100)
+        top = round(height * vertical[0] / 100)
+        bottom = round(height * vertical[1] / 100)
+        cropped = image.crop((left, top, max(left + 1, right), max(top + 1, bottom)))
+        output = BytesIO()
+        cropped.save(output, format="PNG")
+        return output.getvalue()
+
+
+def invalidate_asset_review(figure, message: str) -> None:
+    figure.vision_status = "pending"
+    figure.vision_error = message
+    figure.visual_evidence = ""
+    figure.interpretation = ""
+
+
 def build_project_zip_download(
     project: BatchProject,
     image_assets: dict[str, bytes],
@@ -78,6 +103,9 @@ def init_state() -> None:
     st.session_state.setdefault("keywords", ", ".join(DEFAULT_KEYWORDS))
     st.session_state.setdefault("query_plan", None)
     st.session_state.setdefault("search_append", False)
+    st.session_state.setdefault("single_analysis", None)
+    st.session_state.setdefault("analysis_cache", {})
+    st.session_state.setdefault("vision_cache", {})
 
 
 def paper_key(paper: PaperInput) -> str:
@@ -366,7 +394,7 @@ def sidebar_settings() -> tuple[str, str, str, str, int, float]:
         format_func=lambda key: PROVIDERS[key].label,
     )
     defaults = provider_defaults(provider)
-    api_key = st.sidebar.text_input("API Key", value=default_api_key(), type="password")
+    api_key = st.sidebar.text_input("API Key", value=default_api_key(provider), type="password")
     base_url = st.sidebar.text_input("Base URL", value=default_base_url(provider) or defaults.base_url)
     model = st.sidebar.text_input("Model", value=default_model(provider) or defaults.default_model)
     batch_size = st.sidebar.slider("翻译批量", 1, 8, 3)
@@ -488,7 +516,7 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
         show_details(papers, "查看候选摘要和错误")
 
 
-def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
+def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: str) -> None:
     st.subheader("全文与生成")
     papers: list[PaperInput] = st.session_state.papers
     pdfs: dict[str, PdfContent] = st.session_state.pdfs
@@ -560,37 +588,87 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
 
     st.divider()
     ready = generation_ready_papers(st.session_state.papers, st.session_state.pdfs)
-    unavailable = unavailable_papers(st.session_state.papers, st.session_state.pdfs)
-    if unavailable:
-        st.warning(f"{len(unavailable)} 篇未下载或未解析到全文，已排除生成，只进入 DOI CSV。")
-        st.dataframe(paper_rows(unavailable), use_container_width=True, hide_index=True)
     if not ready:
         st.info("暂无可生成论文。需要先下载并解析开放 PDF，或上传 PDF。")
         return
-
     labels = [f"{idx}. {paper.display_title[:90]}" for idx, paper in enumerate(ready, start=1)]
-    selected = st.multiselect("选择生成论文", labels, default=labels[: min(10, len(labels))])
-    target_chars = st.slider("目标字数", 700, 1400, 1200, step=50)
-    if st.button("生成公众号稿", type="primary"):
-        chosen_indexes = [labels.index(label) for label in selected]
-        generated: list[QuickReadArticle] = []
-        progress = st.progress(0)
-        for run_idx, paper_idx in enumerate(chosen_indexes, start=1):
-            paper = ready[paper_idx]
-            pdf = st.session_state.pdfs[paper.pdf_name]
-            generated.append(
-                generate_article(
-                    paper=paper,
-                    pdf=pdf,
-                    api_key=api_key,
-                    base_url=base_url,
-                    model=model,
-                    target_chars=target_chars,
-                )
+    selected_label = st.selectbox("活动文章", labels)
+    paper = ready[labels.index(selected_label)]
+    pdf = st.session_state.pdfs[paper.pdf_name]
+    st.markdown("#### 单篇深度工作台")
+    st.caption("全文分段取证，不设置分析或成稿字数上限；确认图表后必须经 Gemini 视觉复核。")
+    if st.button("1. 执行结构化全文分析", type="primary"):
+        with st.spinner("正在按章节分析全文证据..."):
+            st.session_state.single_analysis = analyze_paper(
+                paper, pdf, {"api_key": api_key, "base_url": base_url, "model": model, "cache": st.session_state.analysis_cache}, st.session_state.single_analysis
             )
-            progress.progress(run_idx / len(chosen_indexes), text=f"已生成 {run_idx}/{len(chosen_indexes)}")
-        st.session_state.articles = generated
-        st.success(f"已生成 {len(generated)} 篇中文公众号稿。")
+    analysis = st.session_state.single_analysis
+    if analysis and analysis.complete:
+        st.success("全文结构化分析完成。")
+        st.dataframe([claim.to_dict() for claim in analysis.claims], use_container_width=True, hide_index=True)
+    elif analysis:
+        st.error(analysis.error or "分析未完成。")
+
+    st.markdown("##### 2. 确认关键图、表格与线路图")
+    for index, figure in enumerate(pdf.assets, start=1):
+        with st.expander(f"{index}. {figure.figure_id} | {figure.asset_kind} | p.{figure.page}", expanded=index <= 2):
+            figure.selected = st.checkbox("选入最终稿", value=figure.selected, key=f"asset-select-{paper_key(paper)}-{index}")
+            figure.order = st.number_input("顺序", 1, 4, int(figure.order or min(index, 4)), key=f"asset-order-{paper_key(paper)}-{index}")
+            st.caption(figure.caption[:900])
+            if figure.image_name in st.session_state.images:
+                st.image(st.session_state.images[figure.image_name], use_container_width=True)
+                with st.expander("微调裁剪", expanded=False):
+                    horizontal = st.slider(
+                        "水平保留范围",
+                        0,
+                        100,
+                        (0, 100),
+                        key=f"asset-crop-x-{paper_key(paper)}-{index}",
+                    )
+                    vertical = st.slider(
+                        "垂直保留范围",
+                        0,
+                        100,
+                        (0, 100),
+                        key=f"asset-crop-y-{paper_key(paper)}-{index}",
+                    )
+                    preview = crop_image_bytes(st.session_state.images[figure.image_name], horizontal, vertical)
+                    st.image(preview, caption="裁剪预览", use_container_width=True)
+                    if st.button("应用裁剪", key=f"asset-crop-apply-{paper_key(paper)}-{index}"):
+                        cropped_name = f"crop-{paper_key(paper)}-{index}.png"
+                        st.session_state.images[cropped_name] = preview
+                        figure.image_name = cropped_name
+                        figure.page_image_name = cropped_name
+                        figure.crop_bbox = (horizontal[0] / 100, vertical[0] / 100, horizontal[1] / 100, vertical[1] / 100)
+                        figure.needs_manual_crop = False
+                        invalidate_asset_review(figure, "截图已裁剪，请重新执行 Gemini 视觉复核后再生成。")
+                        st.rerun()
+            if figure.editable_table:
+                st.caption(f"可编辑表格候选：{len(figure.editable_table.rows)} 行；置信度 {figure.editable_table.confidence:.2f}")
+            if figure.vision_error:
+                st.warning(figure.vision_error)
+    selected_assets = [item for item in pdf.assets if item.selected]
+    if st.button("3. Gemini 视觉复核已选资产", type="primary"):
+        with st.spinner("正在复核图中曲线、表格、箭头关系与关键数据..."):
+            reviewed = analyze_confirmed_figures(
+                paper, analysis, selected_assets,
+                {"provider": provider, "api_key": api_key, "base_url": base_url, "model": model, "image_assets": st.session_state.images},
+            )
+        if reviewed:
+            st.success(f"已复核 {len(reviewed)} 项资产。")
+        else:
+            st.error("没有资产完成 Gemini 视觉复核；未复核资产不会进入最终稿。")
+
+    if st.button("4. 生成无字数上限公众号稿", type="primary"):
+        if not analysis or not analysis.complete:
+            st.error("请先完成结构化全文分析。")
+        else:
+            try:
+                article = generate_article(paper, pdf, api_key, base_url, model, analysis=analysis, confirmed_figures=selected_assets, image_assets=st.session_state.images, provider=provider)
+                st.session_state.articles = [article] + [item for item in st.session_state.articles if item.title != article.title]
+                st.success("深度稿已生成。")
+            except ArticleGenerationError as exc:
+                st.error(str(exc))
 
     for idx, article in enumerate(st.session_state.articles, start=1):
         with st.expander(f"{idx}. {article.title} | {article.word_count} 字", expanded=idx == 1):
@@ -618,22 +696,27 @@ def ingest_and_generate_tab(api_key: str, base_url: str, model: str) -> None:
                             article.body_html = article.body_html.replace(f"images/{current}", f"images/{new_name}")
                         figure.image_name = new_name
                         figure.page_image_name = new_name
+                        invalidate_asset_review(figure, "截图已替换，请重新执行 Gemini 视觉复核后再生成。")
             if article.warnings:
                 st.warning("；".join(article.warnings))
             render_article_preview(article)
             if article.evidence:
                 st.caption("证据追踪")
                 st.dataframe([item.to_dict() for item in article.evidence[:12]], use_container_width=True, hide_index=True)
-            col_a, col_b = st.columns(2)
-            col_a.download_button("Markdown", export_article_markdown(article), file_name=f"{idx:02d}-{article.title}.md")
+            col_a, col_b, col_c = st.columns(3)
             try:
-                col_b.download_button(
+                col_a.download_button("Word（可编辑）", export_article_docx_bytes(article, st.session_state.images), file_name=f"{idx:02d}-{article.title}.docx")
+            except DocxExportError as exc:
+                col_a.error(str(exc))
+            col_b.download_button("Markdown", export_article_markdown(article), file_name=f"{idx:02d}-{article.title}.md")
+            try:
+                col_c.download_button(
                     "HTML",
                     export_article_html(article, st.session_state.images),
                     file_name=f"{idx:02d}-{article.title}.html",
                 )
             except ValueError as exc:
-                col_b.error(f"HTML 暂不能导出：{exc}")
+                col_c.error(f"HTML 暂不能导出：{exc}")
 
 
 def export_and_publish_tab() -> None:
@@ -683,16 +766,20 @@ def export_and_publish_tab() -> None:
     selected = st.selectbox("选择文章", article_titles)
     article = articles[article_titles.index(selected)]
 
-    col_a, col_b, col_c = st.columns(3)
-    col_a.download_button("单篇 Markdown", export_article_markdown(article), file_name=f"{article.title}.md")
+    col_a, col_b, col_c, col_d = st.columns(4)
     try:
-        col_b.download_button(
+        col_a.download_button("单篇 Word（可编辑）", export_article_docx_bytes(article, st.session_state.images), file_name=f"{article.title}.docx")
+    except DocxExportError as exc:
+        col_a.error(str(exc))
+    col_b.download_button("单篇 Markdown", export_article_markdown(article), file_name=f"{article.title}.md")
+    try:
+        col_c.download_button(
             "单篇 HTML",
             export_article_html(article, st.session_state.images),
             file_name=f"{article.title}.html",
         )
     except ValueError as exc:
-        col_b.error(f"HTML 暂不能导出：{exc}")
+        col_c.error(f"HTML 暂不能导出：{exc}")
 
     st.markdown("#### 公众号草稿")
     app_id = st.text_input("APP_ID")
@@ -720,7 +807,7 @@ def export_and_publish_tab() -> None:
         need_open_comment=need_open_comment,
         only_fans_can_comment=only_fans_can_comment,
     )
-    col_c.download_button("草稿 Payload", export_wechat_payload(article, config), file_name=f"{article.title}-wechat-payload.json")
+    col_d.download_button("草稿 Payload", export_wechat_payload(article, config), file_name=f"{article.title}-wechat-payload.json")
     if st.button("创建公众号草稿"):
         if not dry_run and not confirmed:
             st.error("真实创建草稿前请勾选确认。")
@@ -744,7 +831,7 @@ def main() -> None:
     with tab_search:
         search_tab(provider, api_key, base_url, model, batch_size, delay_seconds)
     with tab_generate:
-        ingest_and_generate_tab(api_key, base_url, model)
+        ingest_and_generate_tab(provider, api_key, base_url, model)
     with tab_export:
         export_and_publish_tab()
 

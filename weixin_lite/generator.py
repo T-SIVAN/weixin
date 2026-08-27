@@ -4,16 +4,10 @@ import html
 import re
 from typing import Any
 
-from .figure_analysis import analyze_confirmed_figures, figure_heading
+from .figure_analysis import figure_heading
 from .llm import LLMError, call_openai_compatible, parse_json_object
 from .models import FigureAnalysis, PaperAnalysis, PaperInput, QuickReadArticle
 from .pdf_reader import PdfContent, compact_text
-
-
-TARGET_MIN = 2800
-TARGET_MAX = 4200
-ANALYSIS_TARGET_MIN = TARGET_MIN
-ANALYSIS_TARGET_MAX = TARGET_MAX
 
 
 class ArticleGenerationError(RuntimeError):
@@ -29,17 +23,12 @@ SYSTEM_PROMPT = """你是一个严谨、克制、面向中文读者的公众号�
 4. 数字、结论、机构、作者和技术细节只能来自题录、摘要、全文、图注、证据或用户提供材料，不得编造。
 5. 有确认配图时，正文图解由系统另行插入；不要自行增加未确认图片或虚构图中细节。
 6. 标题不超过 32 个中文字符，digest 不超过 120 字。
-7. 当全文证据足够时，目标正文为 2800-4200 个中文字符；每个章节都要使用提供材料中可追溯的细节。证据不足时，明确说明无法展开的原因，不用泛泛常识填充。
+7. 为完整解释证据而写，不设置正文或分析字数上限；每个章节都要使用提供材料中可追溯的细节，避免重复。
 只返回 JSON，不要返回 Markdown 代码块。"""
 
 
 def chineseish_len(text: str) -> int:
     return len(re.sub(r"\s+", "", text or ""))
-
-
-def normalized_target_chars(target_chars: int) -> int:
-    """Keep every generation path on the same evidence-first length contract."""
-    return max(TARGET_MIN, min(TARGET_MAX, int(target_chars or 3200)))
 
 
 def _clean_text(text: str) -> str:
@@ -68,11 +57,10 @@ def source_level(pdf: PdfContent | None = None, source_text: str = "", extra_tex
 def build_prompt(
     paper: PaperInput,
     pdf: PdfContent | None,
-    target_chars: int,
+    target_chars: int | None = None,
     source_text: str = "",
     extra_text: str = "",
 ) -> str:
-    target_chars = normalized_target_chars(target_chars)
     authors = ", ".join(paper.authors[:6])
     metadata = f"""
 英文题名：{paper.title_en or paper.title}
@@ -104,7 +92,7 @@ PMID：{paper.pmid}
     return f"""
 请为下面这篇文章生成可直接发布到微信公众号的中文单篇解读。
 生成层级：{depth}
-目标长度：约 {target_chars} 个中文字符，证据充分时建议控制在 {TARGET_MIN}-{TARGET_MAX}。
+篇幅：完整覆盖可用证据，不设置人为字数上限。
 
 输出 JSON Schema：
 {{
@@ -152,16 +140,15 @@ def build_analysis_article_prompt(
     paper: PaperInput,
     analysis: PaperAnalysis,
     figures: list[FigureAnalysis],
-    target_chars: int,
+    target_chars: int | None = None,
 ) -> str:
-    target_chars = normalized_target_chars(target_chars)
     figure_lines = [
         f"- {item.figure_id} | role={item.role} | page={item.page} | caption={item.caption}"
         for item in figures
     ]
     return f"""
 请根据已经审核为可追溯的结构化分析，生成一篇可直接排版为微信公众号正文的中文深度解读稿。
-目标长度：{target_chars} 个中文字符，允许范围 {ANALYSIS_TARGET_MIN}-{ANALYSIS_TARGET_MAX}。
+篇幅：完整覆盖结构化证据，不设置人为字数上限。
 不得加入结构化分析之外的事实、数字或结论。只使用确认配图，并按给定顺序生成图下注释。
 
 输出 JSON Schema：
@@ -326,6 +313,8 @@ def render_markdown(
         if note:
             lines.append("")
             lines.append(note)
+        if figure and figure.editable_table and figure.editable_table.headers and figure.editable_table.rows and figure.editable_table.confidence >= 0.7:
+            lines.extend(["", f"<!-- editable-table:{fig_id} -->"])
     add_section("文章的创新意义", data.get("innovation"), numbered=True)
     add_section("局限性与解读边界", data.get("limitations"), numbered=True)
     if data.get("take_home"):
@@ -370,8 +359,18 @@ def _wechat_inline(text: str) -> str:
     )
 
 
-def markdown_to_wechat_html(markdown: str) -> str:
+def _wechat_table_html(figure: FigureAnalysis) -> str:
+    table = figure.editable_table
+    if not table:
+        return ""
+    header = "".join(f'<th style="border:1px solid #d9d9d9;padding:7px;font-weight:800;">{html.escape(value)}</th>' for value in table.headers)
+    rows = "".join("<tr>" + "".join(f'<td style="border:1px solid #d9d9d9;padding:7px;">{html.escape(value)}</td>' for value in row) + "</tr>" for row in table.rows)
+    return f'<table style="width:100%;border-collapse:collapse;margin:16px 0 28px;font-size:14px;line-height:1.6;"><thead><tr>{header}</tr></thead><tbody>{rows}</tbody></table>'
+
+
+def markdown_to_wechat_html(markdown: str, figures: list[FigureAnalysis] | None = None) -> str:
     html_lines: list[str] = []
+    figure_map = {item.figure_id.lower(): item for item in figures or []}
     for raw in markdown.splitlines():
         line = raw.strip()
         if not line:
@@ -380,6 +379,10 @@ def markdown_to_wechat_html(markdown: str) -> str:
             # The WeChat platform owns the article title. Export and local preview
             # add the title back outside the rich-text body to avoid draft duplicates.
             continue
+        elif line.startswith("<!-- editable-table:") and line.endswith(" -->"):
+            figure = figure_map.get(line[len("<!-- editable-table:") : -len(" -->")].strip().lower())
+            if figure:
+                html_lines.append(_wechat_table_html(figure))
         elif line.startswith("## "):
             html_lines.append(f'<p style="{WECHAT_HEADING_STYLE}">{html.escape(line[3:])}</p>')
         elif line.startswith("!["):
@@ -429,17 +432,17 @@ def generate_article(
     api_key: str = "",
     base_url: str = "https://api.openai.com/v1",
     model: str = "gpt-4o-mini",
-    target_chars: int = 3200,
+    target_chars: int | None = None,
     source_text: str = "",
     extra_text: str = "",
     analysis: PaperAnalysis | None = None,
     confirmed_figures: list[FigureAnalysis] | None = None,
     target_profile: str = "adaptive",
     image_assets: dict[str, bytes] | None = None,
+    provider: str = "",
 ) -> QuickReadArticle:
     warnings: list[str] = []
     level = source_level(pdf, source_text, extra_text)
-    target_chars = normalized_target_chars(target_chars)
     quality_first = analysis is not None
     if quality_first and not analysis.complete:
         raise ArticleGenerationError(
@@ -456,12 +459,11 @@ def generate_article(
 
     using_confirmed_figures = confirmed_figures is not None
     if using_confirmed_figures:
-        figures = analyze_confirmed_figures(
-            paper,
-            analysis,
-            sorted(confirmed_figures or [], key=lambda item: (item.order or 999, item.figure_id))[:4],
-            {"api_key": api_key, "base_url": base_url, "model": model, "image_assets": image_assets or {}},
-        )
+        figures = [
+            figure
+            for figure in sorted(confirmed_figures or [], key=lambda item: (item.order or 999, item.figure_id))
+            if figure.selected and figure.vision_status == "reviewed"
+        ][:4]
     else:
         figures = list(pdf.legends[:4]) if pdf else []
 
@@ -515,10 +517,6 @@ def generate_article(
     else:
         markdown = render_markdown(paper, data, figures, lead_image=lead_image)
     count = chineseish_len(markdown)
-    minimum = TARGET_MIN
-    maximum = TARGET_MAX
-    if count < minimum or count > maximum:
-        warnings.append(f"当前字数 {count}，不在 {minimum}-{maximum} 发布目标内；请使用显式补写/精简操作，不会自动发起第二次模型调用。")
     evidence = pdf.evidence[:30] if pdf else []
     if not pdf or not pdf.legends:
         warnings.append(f"内容来源：{level}；未获得可靠图注，图例分析需开放全文或上传 PDF 后补充。")
@@ -526,8 +524,8 @@ def generate_article(
         paper=paper,
         title=str(data.get("title") or short_title(paper))[:32],
         digest=str(data.get("digest") or "")[:120],
-        body_markdown=compact_text(markdown, 9000),
-        body_html=markdown_to_wechat_html(markdown),
+        body_markdown=markdown,
+        body_html=markdown_to_wechat_html(markdown, figures),
         figures=figures,
         evidence=evidence,
         word_count=count,

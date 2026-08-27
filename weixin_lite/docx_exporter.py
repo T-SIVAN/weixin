@@ -17,7 +17,7 @@ from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
 from PIL import Image, UnidentifiedImageError
 
-from .models import QuickReadArticle
+from .models import EditableTable, QuickReadArticle
 
 
 _BOLD_RE = re.compile(r"(\*\*.+?\*\*)")
@@ -230,6 +230,31 @@ def _add_image(document: Document, article: QuickReadArticle, image_name: str, a
     doc_pr.set("title", alt or image_name)
 
 
+def _add_editable_table(document: Document, table: EditableTable | None) -> None:
+    if not table or not table.headers or not table.rows or table.confidence < 0.7:
+        return
+    native = document.add_table(rows=1, cols=len(table.headers))
+    native.style = "Table Grid"
+    for index, value in enumerate(table.headers):
+        native.rows[0].cells[index].text = value
+        for run in native.rows[0].cells[index].paragraphs[0].runs:
+            _set_font(run, size=10.5, bold=True)
+    for values in table.rows:
+        row = native.add_row()
+        for index, value in enumerate(values[: len(table.headers)]):
+            row.cells[index].text = value
+            for run in row.cells[index].paragraphs[0].runs:
+                _set_font(run, size=10.5)
+    document.add_paragraph()
+
+
+def _editable_table_for_image(article: QuickReadArticle, image_name: str) -> EditableTable | None:
+    for figure in article.figures:
+        if figure.image_name == image_name:
+            return figure.editable_table
+    return None
+
+
 def _word_image_bytes(data: bytes) -> bytes:
     """Return bytes Word can embed, converting only unsupported image formats."""
     try:
@@ -285,6 +310,7 @@ def export_article_docx(article: QuickReadArticle, image_assets: dict[str, bytes
             # an accidental duplicate reference.
             if name and not (name == lead and name in inserted_images):
                 _add_image(document, article, name, image_reference.alt, assets)
+                _add_editable_table(document, _editable_table_for_image(article, name))
                 inserted_images.add(name)
             continue
         heading_match = _HEADING_RE.match(line)

@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from .models import EvidenceItem, FigureAnalysis
+from .models import EditableTable, EvidenceItem, FigureAnalysis
 
 
 FIGURE_MARKER_RE = re.compile(
@@ -54,8 +54,25 @@ class PdfContent:
     coverage: list[str] = field(default_factory=list)
     all_figures: list[FigureAnalysis] = field(default_factory=list)
     lead_image: FigureAnalysis | None = None
+    editable_tables: list[EditableTable] = field(default_factory=list)
 
-    def prompt_text(self, max_chars: int = 24000) -> str:
+    @property
+    def assets(self) -> list[FigureAnalysis]:
+        return self.legends
+
+    def analysis_chunks(self, max_chars: int = 18000) -> list[str]:
+        """Cover all sections in bounded model requests without dropping later pages."""
+        prefix = f"Parser: {self.parser or self.parse_mode}\nQuality: {self.quality}; Pages: {self.page_count}"
+        captions = "\n".join(f"- {item.figure_id} p.{item.page}: {item.caption}" for item in self.all_figures)
+        sources = self.sections or {"full_text": self.text}
+        chunks: list[str] = []
+        for name, source in sources.items():
+            source = str(source or "").strip()
+            for offset in range(0, len(source), max_chars):
+                chunks.append(f"{prefix}\n\n## {name}\n{source[offset:offset + max_chars]}\n\nFigure/Table captions:\n{captions}")
+        return chunks or [prefix]
+
+    def prompt_text(self, max_chars: int | None = None) -> str:
         parts: list[str] = [
             f"Parser: {self.parser or self.parse_mode}",
             f"Quality: {self.quality}; Pages: {self.page_count}; Coverage: {', '.join(self.coverage)}",
@@ -73,15 +90,17 @@ class PdfContent:
                 parts.append(f"- {item.value} | {item.claim} | {item.label()}")
         if self.sections:
             parts.append("\nEvidence-balanced sections:")
-            section_budget = max(1200, (max_chars - 6000) // max(1, len(self.sections)))
+            section_budget = max(1200, ((max_chars or len(self.text) or 1) - 6000) // max(1, len(self.sections)))
             ordered = list(PROMPT_SECTION_ORDER) + [name for name in self.sections if name not in PROMPT_SECTION_ORDER]
             for name in ordered:
                 value = self.sections.get(name)
                 if value:
                     parts.append(f"\n## {name}\n{compact_text(value, section_budget)}")
         elif self.text:
-            parts.extend(["\nText:", compact_text(self.text, max_chars - 2000)])
-        return compact_text("\n".join(parts), max_chars)
+            text_budget = max(1, max_chars - 2000) if max_chars else max(1, len(self.text))
+            parts.extend(["\nText:", compact_text(self.text, text_budget)])
+        combined = "\n".join(parts)
+        return compact_text(combined, max_chars) if max_chars else combined
 
     def to_dict(self, include_images: bool = False) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -98,6 +117,7 @@ class PdfContent:
             "coverage": list(self.coverage),
             "all_figures": [item.to_dict() for item in self.all_figures],
             "lead_image": self.lead_image.to_dict() if self.lead_image else None,
+            "editable_tables": [item.to_dict() for item in self.editable_tables],
         }
         if include_images:
             data["rendered_images"] = dict(self.rendered_images)
@@ -120,6 +140,7 @@ class PdfContent:
             coverage=[str(item) for item in data.get("coverage") or []],
             all_figures=[FigureAnalysis.from_dict(item) for item in data.get("all_figures") or [] if isinstance(item, dict)],
             lead_image=(FigureAnalysis.from_dict(data["lead_image"]) if isinstance(data.get("lead_image"), dict) else None),
+            editable_tables=[EditableTable.from_dict(item) for item in data.get("editable_tables") or [] if isinstance(item, dict)],
         )
 
 
@@ -200,7 +221,7 @@ def extract_figure_legends(text: str, max_items: int = 80) -> list[FigureAnalysi
     return legends
 
 
-def extract_sections(text: str, max_chars_each: int = 16000) -> dict[str, str]:
+def extract_sections(text: str, max_chars_each: int | None = None) -> dict[str, str]:
     matches = list(SECTION_RE.finditer(text or ""))
     if not matches:
         return {}
@@ -210,7 +231,7 @@ def extract_sections(text: str, max_chars_each: int = 16000) -> dict[str, str]:
         name = SECTION_ALIASES.get(raw_name, raw_name)
         start = match.end()
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
-        body = compact_text(text[start:end], max_chars_each)
+        body = compact_text(text[start:end], max_chars_each) if max_chars_each else text[start:end].strip()
         if body and name not in sections:
             sections[name] = body
     return sections
@@ -258,6 +279,33 @@ def _figure_role(figure: FigureAnalysis, order: int) -> str:
     return "key_result" if order <= 2 else "validation"
 
 
+def classify_asset_kind(figure: FigureAnalysis) -> str:
+    label = f"{figure.figure_id} {figure.caption}".lower()
+    if re.search(r"\btable\b", label):
+        return "table"
+    if re.search(r"\b(workflow|flowchart|pipeline|circuit)\b", label):
+        return "flowchart"
+    if re.search(r"\b(scheme|pathway|mechanism)\b", label):
+        return "scheme"
+    return "figure"
+
+
+def extract_editable_tables(pdf_bytes: bytes) -> list[EditableTable]:
+    try:
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as document:
+            extracted: list[EditableTable] = []
+            for page_number, page in enumerate(document.pages, start=1):
+                for raw in page.extract_tables() or []:
+                    rows = [[str(cell or "").strip() for cell in row] for row in raw if row]
+                    rows = [row for row in rows if any(row)]
+                    if len(rows) >= 2 and len(rows[0]) >= 2 and all(len(row) == len(rows[0]) for row in rows):
+                        extracted.append(EditableTable(headers=rows[0], rows=rows[1:], source_page=str(page_number), confidence=0.78))
+            return extracted
+    except Exception:
+        return []
+
+
 def choose_key_figures(legends: list[FigureAnalysis], evidence: list[EvidenceItem], max_figures: int = 4) -> list[FigureAnalysis]:
     if not legends:
         return []
@@ -281,6 +329,7 @@ def choose_key_figures(legends: list[FigureAnalysis], evidence: list[EvidenceIte
         item.selected = True
         item.order = index
         item.role = _figure_role(item, index)
+        item.asset_kind = classify_asset_kind(item)
     return selected
 
 
@@ -539,11 +588,17 @@ def parse_pdf(pdf_bytes: bytes, mode: str = "auto") -> PdfContent:
             actual_mode = "pypdf"
         except Exception as exc:
             warning_parts.append(f"PDF text extraction failed: {exc}")
-    text = compact_text(text, 240000)
     sections = extract_sections(text)
     all_figures = extract_figure_legends(text)
     evidence = extract_numeric_evidence(text, all_figures)
     selected = choose_key_figures(all_figures, evidence, max_figures=4)
+    editable_tables = extract_editable_tables(pdf_bytes)
+    for figure in all_figures:
+        figure.asset_kind = classify_asset_kind(figure)
+        if figure.asset_kind == "table":
+            figure.editable_table = next((table for table in editable_tables if table.source_page == figure.page), None)
+            if not figure.editable_table:
+                figure.needs_manual_check = True
     lead_image: FigureAnalysis | None = None
     rendered: dict[str, bytes] = {}
     if pdf_bytes:
@@ -567,4 +622,9 @@ def parse_pdf(pdf_bytes: bytes, mode: str = "auto") -> PdfContent:
     coverage, quality = _coverage_and_quality(text, sections, page_count)
     if quality == "low":
         warning_parts.append("PDF text coverage is low; scanned pages may require OCR or visual review.")
-    return PdfContent(text=text, sections=sections, legends=selected, evidence=evidence, rendered_images=rendered, parser=parser, warning=" ".join(warning_parts), hash=digest, page_count=page_count, parse_mode=actual_mode, quality=quality, coverage=coverage, all_figures=all_figures, lead_image=lead_image)
+    for figure in selected:
+        figure.asset_kind = classify_asset_kind(figure)
+        if figure.asset_kind == "table" and not figure.editable_table:
+            source = next((item for item in all_figures if figure_key(item.figure_id) == figure_key(figure.figure_id)), None)
+            figure.editable_table = source.editable_table if source else None
+    return PdfContent(text=text, sections=sections, legends=selected, evidence=evidence, rendered_images=rendered, parser=parser, warning=" ".join(warning_parts), hash=digest, page_count=page_count, parse_mode=actual_mode, quality=quality, coverage=coverage, all_figures=all_figures, lead_image=lead_image, editable_tables=editable_tables)
