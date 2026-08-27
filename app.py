@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import os
 import re
+from io import BytesIO
 from pathlib import Path
 
 import streamlit as st
+from PIL import Image
 
 from weixin_lite.downloader import download_open_access
 from weixin_lite.article_analysis import analyze_paper
@@ -58,6 +60,26 @@ st.set_page_config(page_title="微信文献快读工具", page_icon="🧬", layo
 
 
 LATEST_PATH = Path("data/latest_papers.json")
+
+
+def crop_image_bytes(data: bytes, horizontal: tuple[int, int], vertical: tuple[int, int]) -> bytes:
+    with Image.open(BytesIO(data)) as image:
+        width, height = image.size
+        left = round(width * horizontal[0] / 100)
+        right = round(width * horizontal[1] / 100)
+        top = round(height * vertical[0] / 100)
+        bottom = round(height * vertical[1] / 100)
+        cropped = image.crop((left, top, max(left + 1, right), max(top + 1, bottom)))
+        output = BytesIO()
+        cropped.save(output, format="PNG")
+        return output.getvalue()
+
+
+def invalidate_asset_review(figure, message: str) -> None:
+    figure.vision_status = "pending"
+    figure.vision_error = message
+    figure.visual_evidence = ""
+    figure.interpretation = ""
 
 
 def build_project_zip_download(
@@ -595,6 +617,32 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
             st.caption(figure.caption[:900])
             if figure.image_name in st.session_state.images:
                 st.image(st.session_state.images[figure.image_name], use_container_width=True)
+                with st.expander("微调裁剪", expanded=False):
+                    horizontal = st.slider(
+                        "水平保留范围",
+                        0,
+                        100,
+                        (0, 100),
+                        key=f"asset-crop-x-{paper_key(paper)}-{index}",
+                    )
+                    vertical = st.slider(
+                        "垂直保留范围",
+                        0,
+                        100,
+                        (0, 100),
+                        key=f"asset-crop-y-{paper_key(paper)}-{index}",
+                    )
+                    preview = crop_image_bytes(st.session_state.images[figure.image_name], horizontal, vertical)
+                    st.image(preview, caption="裁剪预览", use_container_width=True)
+                    if st.button("应用裁剪", key=f"asset-crop-apply-{paper_key(paper)}-{index}"):
+                        cropped_name = f"crop-{paper_key(paper)}-{index}.png"
+                        st.session_state.images[cropped_name] = preview
+                        figure.image_name = cropped_name
+                        figure.page_image_name = cropped_name
+                        figure.crop_bbox = (horizontal[0] / 100, vertical[0] / 100, horizontal[1] / 100, vertical[1] / 100)
+                        figure.needs_manual_crop = False
+                        invalidate_asset_review(figure, "截图已裁剪，请重新执行 Gemini 视觉复核后再生成。")
+                        st.rerun()
             if figure.editable_table:
                 st.caption(f"可编辑表格候选：{len(figure.editable_table.rows)} 行；置信度 {figure.editable_table.confidence:.2f}")
             if figure.vision_error:
@@ -648,10 +696,7 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
                             article.body_html = article.body_html.replace(f"images/{current}", f"images/{new_name}")
                         figure.image_name = new_name
                         figure.page_image_name = new_name
-                        figure.vision_status = "pending"
-                        figure.vision_error = "截图已替换，请重新执行 Gemini 视觉复核后再生成。"
-                        figure.visual_evidence = ""
-                        figure.interpretation = ""
+                        invalidate_asset_review(figure, "截图已替换，请重新执行 Gemini 视觉复核后再生成。")
             if article.warnings:
                 st.warning("；".join(article.warnings))
             render_article_preview(article)
