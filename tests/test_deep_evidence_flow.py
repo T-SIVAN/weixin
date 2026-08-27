@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from weixin_lite.article_analysis import build_analysis_prompt, paper_analysis_from_payload
+from weixin_lite.article_analysis import analyze_paper, build_analysis_prompt, paper_analysis_from_payload
 from weixin_lite.figure_analysis import analyze_confirmed_figures
 from weixin_lite.generator import build_prompt, render_markdown
 from weixin_lite.models import AnalysisClaim, FigureAnalysis, PaperAnalysis, PaperInput
@@ -139,3 +139,21 @@ def test_gemini_vision_receives_only_confirmed_image_bytes(monkeypatch):
     assert figures == [selected]
     assert calls == [[(b"selected-image", "image/png")]]
     assert "视觉复核已完成（Gemini 图像输入）" in selected.interpretation
+
+
+def test_analysis_accepts_pdf_content_restored_from_before_analysis_chunks(monkeypatch):
+    class LegacyPdfContent:
+        text = "[Page 1] full evidence"
+        hash = "legacy-hash"
+        legends = []
+
+    payload = {
+        field: [{"statement": field, "page": "1", "evidence_text": "> source"}]
+        for field in ("research_question", "background", "methods", "key_results", "limitations", "conclusion")
+    }
+    payload["innovation"] = []
+    monkeypatch.setattr("weixin_lite.article_analysis.call_openai_compatible", lambda **kwargs: json.dumps(payload))
+
+    result = analyze_paper(PaperInput(title_en="Legacy paper"), LegacyPdfContent(), {"api_key": "key"})
+
+    assert result.complete

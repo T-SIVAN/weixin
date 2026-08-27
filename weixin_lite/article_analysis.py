@@ -21,6 +21,28 @@ ANALYSIS_FIELDS = (
     "conclusion",
 )
 
+
+def _legacy_safe_analysis_chunks(pdf: PdfContent, max_chars: int = 18000) -> list[str]:
+    """Read every available section even when Streamlit restored an older PdfContent."""
+    chunk_builder = getattr(pdf, "analysis_chunks", None)
+    if callable(chunk_builder):
+        return list(chunk_builder(max_chars=max_chars))
+
+    text = str(getattr(pdf, "text", "") or "")
+    sections = getattr(pdf, "sections", {}) or {}
+    sources = sections if isinstance(sections, dict) and sections else {"full_text": text}
+    legends = getattr(pdf, "all_figures", None) or getattr(pdf, "legends", []) or []
+    captions = "\n".join(
+        f"- {getattr(item, 'figure_id', '')} p.{getattr(item, 'page', '')}: {getattr(item, 'caption', '')}"
+        for item in legends
+    )
+    chunks: list[str] = []
+    for name, source in sources.items():
+        value = str(source or "").strip()
+        for offset in range(0, len(value), max_chars):
+            chunks.append(f"## {name}\n{value[offset:offset + max_chars]}\n\nFigure/Table captions:\n{captions}")
+    return chunks or ["未能从 PDF 中提取正文。"]
+
 ANALYSIS_SYSTEM_PROMPT = """你是该领域的世界顶级学术专家，正在详细阅读并深入解读一篇论文。
 你必须只根据提供的全文、图注和证据提取结论，多引用论文中的细节内容、关键数据和实验结果，帮助中文读者理解论文主线。
 遇到相对新颖或专业的技术概念，首次出现时在 statement 中用 **术语** 标出，并给出通俗解释；学术名词可保留英文补充。
@@ -67,12 +89,12 @@ def analysis_cache_key(
     config = model_config or {}
     payload = {
         "version": ANALYSIS_PROMPT_VERSION,
-        "source_hash": pdf.hash or hashlib.sha256(pdf.text.encode("utf-8")).hexdigest(),
+        "source_hash": getattr(pdf, "hash", "") or hashlib.sha256(str(getattr(pdf, "text", "")).encode("utf-8")).hexdigest(),
         "paper_key": paper.paper_key,
         "model": str(config.get("model") or "gpt-4o-mini"),
         "base_url": str(config.get("base_url") or "https://api.openai.com/v1").rstrip("/"),
-        "quality": pdf.quality,
-        "coverage": pdf.coverage,
+        "quality": getattr(pdf, "quality", "unknown"),
+        "coverage": getattr(pdf, "coverage", []),
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -211,7 +233,7 @@ def analyze_paper(
     cached = _cached_analysis(cache_mapping, key)
     if cached and cached.complete:
         return cached
-    source_hash = pdf.hash or hashlib.sha256(pdf.text.encode("utf-8")).hexdigest()
+    source_hash = getattr(pdf, "hash", "") or hashlib.sha256(str(getattr(pdf, "text", "")).encode("utf-8")).hexdigest()
     if not api_key.strip():
         return PaperAnalysis(
             status="failed",
@@ -222,7 +244,7 @@ def analyze_paper(
         )
     try:
         partials: list[PaperAnalysis] = []
-        for chunk in pdf.analysis_chunks():
+        for chunk in _legacy_safe_analysis_chunks(pdf):
             raw = call_openai_compatible(
                 api_key=api_key,
                 base_url=base_url,

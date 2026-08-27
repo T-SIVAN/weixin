@@ -82,6 +82,12 @@ def invalidate_asset_review(figure, message: str) -> None:
     figure.interpretation = ""
 
 
+def pdf_assets(pdf: PdfContent) -> list:
+    """Support Streamlit sessions restored from PdfContent versions before assets."""
+    assets = getattr(pdf, "assets", None)
+    return list(assets if assets is not None else getattr(pdf, "legends", []) or [])
+
+
 def build_project_zip_download(
     project: BatchProject,
     image_assets: dict[str, bytes],
@@ -610,7 +616,8 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
         st.error(analysis.error or "分析未完成。")
 
     st.markdown("##### 2. 确认关键图、表格与线路图")
-    for index, figure in enumerate(pdf.assets, start=1):
+    assets = pdf_assets(pdf)
+    for index, figure in enumerate(assets, start=1):
         with st.expander(f"{index}. {figure.figure_id} | {figure.asset_kind} | p.{figure.page}", expanded=index <= 2):
             figure.selected = st.checkbox("选入最终稿", value=figure.selected, key=f"asset-select-{paper_key(paper)}-{index}")
             figure.order = st.number_input("顺序", 1, 4, int(figure.order or min(index, 4)), key=f"asset-order-{paper_key(paper)}-{index}")
@@ -647,7 +654,7 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
                 st.caption(f"可编辑表格候选：{len(figure.editable_table.rows)} 行；置信度 {figure.editable_table.confidence:.2f}")
             if figure.vision_error:
                 st.warning(figure.vision_error)
-    selected_assets = [item for item in pdf.assets if item.selected]
+    selected_assets = [item for item in assets if item.selected]
     if st.button("3. Gemini 视觉复核已选资产", type="primary"):
         with st.spinner("正在复核图中曲线、表格、箭头关系与关键数据..."):
             reviewed = analyze_confirmed_figures(
