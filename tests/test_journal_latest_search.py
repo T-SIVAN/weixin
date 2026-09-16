@@ -8,10 +8,18 @@ from weixin_lite.search import (
     JournalFilter,
     build_europe_pmc_journal_query,
     build_pubmed_journal_query,
+    filter_records_by_date_range,
     filter_records_by_keywords,
     journal_latest_search,
     load_journal_filters,
     run_journal_latest_search,
+    recent_year_months,
+    search_crossref_latest,
+    search_europe_pmc_latest,
+    search_openalex_latest,
+    search_pubmed_latest,
+    year_month_label,
+    year_month_range,
     years_months_to_since_days,
     should_keep_article_type,
     suggest_filter_keywords,
@@ -23,6 +31,29 @@ def test_year_month_lookback_preserves_calendar_month_boundaries():
 
     assert years_months_to_since_days(0, 1, end_date=end) == (end - date(2026, 2, 28)).days
     assert years_months_to_since_days(1, 2, end_date=end) == (end - date(2025, 1, 31)).days
+
+
+def test_explicit_year_month_label_and_range_are_calendar_exact():
+    assert year_month_label(2026, 2) == "2026年2月"
+    assert year_month_range(2026, 2, today=date(2026, 9, 16)) == ("2026-02-01", "2026-02-28")
+    assert year_month_range(2026, 9, today=date(2026, 9, 16)) == ("2026-09-01", "2026-09-16")
+    assert recent_year_months(3, today=date(2026, 1, 20)) == [
+        ("2026年1月", 2026, 1),
+        ("2025年12月", 2025, 12),
+        ("2025年11月", 2025, 11),
+    ]
+
+
+def test_month_filter_excludes_cross_month_and_missing_publication_dates():
+    records = [
+        PaperInput(title_en="February", publication_date="2026-02-17"),
+        PaperInput(title_en="March", publication_date="2026-03-01"),
+        PaperInput(title_en="Unknown"),
+    ]
+
+    filtered = filter_records_by_date_range(records, "2026-02-01", "2026-02-28")
+
+    assert [record.title_en for record in filtered] == ["February"]
 
 
 def test_load_journal_filters_skips_disabled_and_sorts(tmp_path):
@@ -55,12 +86,62 @@ def test_journal_query_builders_include_journal_issn_and_date():
 
     pubmed = build_pubmed_journal_query(journal)
     epmc = build_europe_pmc_journal_query(journal, since_days=7)
+    epmc_month = build_europe_pmc_journal_query(
+        journal,
+        date_from="2026-02-01",
+        date_to="2026-02-28",
+    )
 
     assert '"Nature Biotechnology"[Journal]' in pubmed
     assert '"1087-0156"[ISSN]' in pubmed
     assert 'JOURNAL:"Nature Biotechnology"' in epmc
     assert 'ISSN:"1546-1696"' in epmc
     assert "FIRST_PDATE" in epmc
+    assert "FIRST_PDATE:[2026-02-01 TO 2026-02-28]" in epmc_month
+
+
+def test_all_latest_sources_receive_exact_month_bounds(monkeypatch):
+    journal = JournalFilter(name="Nature", issn="0028-0836")
+    captured = {}
+
+    def fake_pubmed(query, limit, since_days=None):
+        captured["pubmed"] = (query, since_days)
+        return []
+
+    def fake_epmc(query, limit, since_days=None):
+        captured["epmc"] = (query, since_days)
+        return []
+
+    def fake_json(url, params=None):
+        captured[url] = dict(params or {})
+        if "crossref" in url:
+            return {"message": {"items": []}}
+        return {"results": []}
+
+    monkeypatch.setattr("weixin_lite.search.search_pubmed", fake_pubmed)
+    monkeypatch.setattr("weixin_lite.search.search_europe_pmc", fake_epmc)
+    monkeypatch.setattr("weixin_lite.search.http_json", fake_json)
+    search_pubmed_latest([journal], 5, since_days=None, date_from="2026-02-01", date_to="2026-02-28")
+    search_europe_pmc_latest([journal], 5, since_days=None, date_from="2026-02-01", date_to="2026-02-28")
+    search_openalex_latest(
+        [journal],
+        5,
+        since_days=None,
+        api_key="key",
+        date_from="2026-02-01",
+        date_to="2026-02-28",
+    )
+    search_crossref_latest([journal], 5, since_days=None, date_from="2026-02-01", date_to="2026-02-28")
+
+    assert '"2026-02-01"[Date - Publication]' in captured["pubmed"][0]
+    assert '"2026-02-28"[Date - Publication]' in captured["pubmed"][0]
+    assert captured["pubmed"][1] is None
+    assert "FIRST_PDATE:[2026-02-01 TO 2026-02-28]" in captured["epmc"][0]
+    assert captured["epmc"][1] is None
+    assert "from_publication_date:2026-02-01" in captured["https://api.openalex.org/works"]["filter"]
+    assert "to_publication_date:2026-02-28" in captured["https://api.openalex.org/works"]["filter"]
+    crossref_params = captured["https://api.crossref.org/journals/0028-0836/works"]
+    assert crossref_params["filter"] == "from-pub-date:2026-02-01,until-pub-date:2026-02-28"
 
 
 def test_article_type_filter_keeps_research_and_review_but_drops_noise():
@@ -140,6 +221,44 @@ def test_journal_latest_search_merges_sources_filters_types_and_sorts(monkeypatc
     assert "Europe PMC" in records[1].source
 
 
+def test_journal_latest_search_passes_explicit_month_and_rechecks_dates(monkeypatch):
+    seen = {}
+
+    def fake_pubmed(journals_arg, limit, since_days=None, *, date_from="", date_to=""):
+        seen.update(since_days=since_days, date_from=date_from, date_to=date_to)
+        return [
+            PaperInput(
+                title_en="In month",
+                doi="10.1000/in-month",
+                journal="Nature",
+                publication_date="2026-02-14",
+                article_type="Journal Article",
+            ),
+            PaperInput(
+                title_en="Wrong month",
+                doi="10.1000/wrong-month",
+                journal="Nature",
+                publication_date="2026-03-01",
+                article_type="Journal Article",
+            ),
+        ]
+
+    monkeypatch.setattr("weixin_lite.search.search_pubmed_latest", fake_pubmed)
+
+    records, errors = journal_latest_search(
+        [JournalFilter(name="Nature", priority=10)],
+        limit=10,
+        sources=["PubMed"],
+        since_days=None,
+        date_from="2026-02-01",
+        date_to="2026-02-28",
+    )
+
+    assert errors == {}
+    assert seen == {"since_days": None, "date_from": "2026-02-01", "date_to": "2026-02-28"}
+    assert [record.doi for record in records] == ["10.1000/in-month"]
+
+
 def test_keyword_filtering_is_applied_after_latest_search_results_are_kept():
     papers = [
         PaperInput(
@@ -179,11 +298,21 @@ def test_journal_latest_search_skips_openalex_without_key(monkeypatch):
 
 
 def test_run_journal_latest_search_serializes_compatible_metadata():
-    run = run_journal_latest_search([JournalFilter(name="Nature", priority=10, enabled=True)], sources=[], limit=5)
+    run = run_journal_latest_search(
+        [JournalFilter(name="Nature", priority=10, enabled=True)],
+        sources=[],
+        limit=5,
+        since_days=None,
+        date_from="2026-02-01",
+        date_to="2026-02-28",
+        period_label="2026年2月",
+    )
     round_tripped = SearchRun.from_dict(run.to_dict())
 
     assert round_tripped.search_kind == "journal_latest"
     assert round_tripped.journal_filters[0]["name"] == "Nature"
+    assert round_tripped.period_label == "2026年2月"
+    assert (round_tripped.date_from, round_tripped.date_to) == ("2026-02-01", "2026-02-28")
 
 
 def test_daily_search_defaults_to_journal_latest_with_seven_days(monkeypatch, tmp_path):

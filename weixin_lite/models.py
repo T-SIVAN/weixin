@@ -149,6 +149,9 @@ class SearchRun:
     warnings: list[str] = field(default_factory=list)
     search_kind: str = "keyword"
     journal_filters: list[dict[str, Any]] = field(default_factory=list)
+    date_from: str = ""
+    date_to: str = ""
+    period_label: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -165,6 +168,9 @@ class SearchRun:
             "warnings": self.warnings,
             "search_kind": self.search_kind,
             "journal_filters": self.journal_filters,
+            "date_from": self.date_from,
+            "date_to": self.date_to,
+            "period_label": self.period_label,
         }
 
     @classmethod
@@ -193,6 +199,9 @@ class SearchRun:
             journal_filters=[
                 dict(item) for item in data.get("journal_filters") or [] if isinstance(item, dict)
             ],
+            date_from=str(data.get("date_from") or ""),
+            date_to=str(data.get("date_to") or ""),
+            period_label=str(data.get("period_label") or ""),
         )
 
 

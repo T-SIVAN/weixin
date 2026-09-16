@@ -10,7 +10,7 @@
 
 公众号正文采用“原文截图在上、短说明在下”的图文模板：系统会从 PDF 渲染关键图所在页面截图，网页预览中可直接查看并手动替换截图；导出的 Markdown、HTML 和草稿 payload 保持同一版式。
 
-检索结果显示正式发表日期；Crossref 只读取 `published`、`published-online`、`published-print`、`issued`、`posted` 等发表字段，不把 `created`、`indexed`、`deposited` 这类入库日期当作发表日期。未下载到全文、下载失败、只拿到题录或只拿到 HTML 的论文不会生成公众号内容，会进入 `unavailable_dois.csv`，字段包括 DOI、题名、期刊、发表日期、年份、链接、全文状态和错误原因。导出包里也保留兼容文件名 `paywalled_dois.csv`。
+检索月份使用 `2026年2月` 这样的明确年月格式，并按该自然月的起止日期查询和复核结果。检索结果显示正式发表日期；Crossref 只读取 `published`、`published-online`、`published-print`、`issued`、`posted` 等发表字段，不把 `created`、`indexed`、`deposited` 这类入库日期当作发表日期。未下载到全文、下载失败、只拿到题录或只拿到 HTML 的论文不会生成公众号内容，会进入 `unavailable_dois.csv`，字段包括 DOI、题名、期刊、发表日期、年份、链接、全文状态和错误原因。导出包里也保留兼容文件名 `paywalled_dois.csv`。
 
 ## 翻译/生成模型
 

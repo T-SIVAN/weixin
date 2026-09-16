@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+from datetime import date
 from io import BytesIO
 from pathlib import Path
 
@@ -51,8 +52,9 @@ from weixin_lite.search import (
     parse_manual_inputs,
     resolve_doi,
     resolve_keyword_plan,
+    recent_year_months,
     run_journal_latest_search,
-    years_months_to_since_days,
+    year_month_range,
 )
 from weixin_lite.translate import translate_records
 from weixin_lite.wechat_publish import WechatDraftConfig, export_wechat_payload, publish_draft
@@ -473,6 +475,11 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
         with st.expander(f"每日历史结果：{latest.finished_at or latest.started_at}"):
             label = "期刊：" if latest.search_kind == "journal_latest" else "关键词："
             st.caption(label + ", ".join(latest.keywords[:12]) + (" ..." if len(latest.keywords) > 12 else ""))
+            if latest.period_label:
+                st.caption(
+                    f"抓取月份：{latest.period_label}"
+                    + (f"（{latest.date_from} 至 {latest.date_to}）" if latest.date_from and latest.date_to else "")
+                )
             st.dataframe(paper_rows(latest.records), use_container_width=True, hide_index=True)
             show_search_run_diagnostics(latest, wrapped=False)
             if st.button("加入每日结果"):
@@ -486,17 +493,19 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
         default_journals = []
         st.error(f"期刊配置读取失败：{type(exc).__name__}: {exc}")
 
-    col_a, col_b, col_c, col_d, col_e = st.columns([0.8, 0.8, 0.9, 1.3, 1.4])
+    col_a, col_b, col_c, col_d = st.columns([0.8, 1.0, 1.4, 1.4])
     limit = col_a.slider("结果数量", 10, 200, 100, step=10)
-    lookback_years = int(col_b.number_input("抓取年数", min_value=0, max_value=20, value=0, step=1))
-    lookback_months = int(col_c.number_input("附加月数", min_value=1, max_value=11, value=1, step=1))
-    since_days = years_months_to_since_days(lookback_years, lookback_months)
-    selected_sources = col_d.multiselect(
+    month_choices = recent_year_months(today=date.today())
+    month_labels = [item[0] for item in month_choices]
+    selected_month_label = col_b.selectbox("抓取月份", month_labels, index=0)
+    selected_month = month_choices[month_labels.index(selected_month_label)]
+    date_from, date_to = year_month_range(selected_month[1], selected_month[2], today=date.today())
+    selected_sources = col_c.multiselect(
         "数据源",
         ["PubMed", "Europe PMC", "Crossref", "OpenAlex"],
         default=["PubMed", "Europe PMC", "Crossref"] + (["OpenAlex"] if os.getenv("OPENALEX_API_KEY") else []),
     )
-    openalex_api_key = col_e.text_input(
+    openalex_api_key = col_d.text_input(
         "OpenAlex API Key",
         value=os.getenv("OPENALEX_API_KEY", ""),
         type="password",
@@ -517,7 +526,10 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
     )
     journals = rows_to_journals(edited_journals)
     enabled_count = len([journal for journal in journals if journal.enabled])
-    st.caption(f"已启用 {enabled_count} 本期刊；抓取近 {lookback_years} 年 {lookback_months} 个月的文章，按期刊优先级和发表日期排序。")
+    st.caption(
+        f"已启用 {enabled_count} 本期刊；抓取月份：{selected_month_label}"
+        f"（{date_from} 至 {date_to}），按期刊优先级和发表日期排序。"
+    )
 
     if st.button("抓取最新文章并翻译标题", type="primary"):
         with st.spinner("正在按期刊检索 PubMed、Europe PMC、OpenAlex、Crossref，并翻译标题..."):
@@ -525,8 +537,11 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
                 journals,
                 limit=limit,
                 sources=selected_sources,
-                since_days=since_days,
+                since_days=None,
                 openalex_api_key=openalex_api_key,
+                date_from=date_from,
+                date_to=date_to,
+                period_label=selected_month_label,
             )
             report = None
             if run.records:

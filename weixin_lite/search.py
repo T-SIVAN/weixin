@@ -529,11 +529,19 @@ def build_pubmed_journal_query(journal: JournalFilter) -> str:
     return " OR ".join(clauses)
 
 
-def build_europe_pmc_journal_query(journal: JournalFilter, since_days: int | None = None) -> str:
+def build_europe_pmc_journal_query(
+    journal: JournalFilter,
+    since_days: int | None = None,
+    *,
+    date_from: str = "",
+    date_to: str = "",
+) -> str:
     clauses = [f"JOURNAL:{_quoted(name)}" for name in journal.names if clean_text(name)]
     clauses.extend(f"ISSN:{_quoted(issn)}" for issn in journal.issns)
     query = "(" + " OR ".join(clauses) + ")"
-    if since_days:
+    if date_from and date_to:
+        query += f" AND FIRST_PDATE:[{date_from} TO {date_to}]"
+    elif since_days:
         start, end = since_dates(since_days)
         query += f" AND FIRST_PDATE:[{start} TO {end}]"
     return query
@@ -959,6 +967,53 @@ def years_months_to_since_days(years: int, months: int, *, end_date: date | None
     return (end - start).days
 
 
+def year_month_label(year: int, month: int) -> str:
+    if not 1 <= int(month) <= 12:
+        raise ValueError("month must be between 1 and 12")
+    return f"{int(year):04d}年{int(month)}月"
+
+
+def year_month_range(year: int, month: int, *, today: date | None = None) -> tuple[str, str]:
+    """Return the exact calendar range for a selectable year/month."""
+    year = int(year)
+    month = int(month)
+    if not 1 <= month <= 12:
+        raise ValueError("month must be between 1 and 12")
+    start = date(year, month, 1)
+    end = date(year, month, monthrange(year, month)[1])
+    current = today or date.today()
+    if start > current:
+        raise ValueError("selected month cannot be in the future")
+    return start.isoformat(), min(end, current).isoformat()
+
+
+def recent_year_months(count: int = 241, *, today: date | None = None) -> list[tuple[str, int, int]]:
+    """Newest-first month choices using an explicit Chinese year/month label."""
+    current = today or date.today()
+    current_index = current.year * 12 + current.month - 1
+    choices: list[tuple[str, int, int]] = []
+    for offset in range(max(1, int(count))):
+        year, month_index = divmod(current_index - offset, 12)
+        month = month_index + 1
+        choices.append((year_month_label(year, month), year, month))
+    return choices
+
+
+def filter_records_by_date_range(
+    records: list[PaperInput],
+    date_from: str = "",
+    date_to: str = "",
+) -> list[PaperInput]:
+    """Keep only records whose formal publication date is inside the chosen range."""
+    if not date_from or not date_to:
+        return list(records)
+    return [
+        record
+        for record in records
+        if date_from <= str(record.publication_date or "")[:10] <= date_to
+    ]
+
+
 def element_text(node: ET.Element | None) -> str:
     return clean_text("".join(node.itertext())) if node is not None else ""
 
@@ -1207,14 +1262,40 @@ def filter_latest_records(records: list[PaperInput], journals: list[JournalFilte
     return filtered
 
 
-def search_pubmed_latest(journals: list[JournalFilter], limit: int, since_days: int | None = 7) -> list[PaperInput]:
+def search_pubmed_latest(
+    journals: list[JournalFilter],
+    limit: int,
+    since_days: int | None = 7,
+    *,
+    date_from: str = "",
+    date_to: str = "",
+) -> list[PaperInput]:
     query = "(" + " OR ".join(build_pubmed_journal_query(journal) for journal in journals) + ")"
-    return filter_latest_records(search_pubmed(query, limit, since_days=since_days), journals)
+    if date_from and date_to:
+        query += f' AND ("{date_from}"[Date - Publication] : "{date_to}"[Date - Publication])'
+    records = search_pubmed(query, limit, since_days=None if date_from and date_to else since_days)
+    return filter_latest_records(filter_records_by_date_range(records, date_from, date_to), journals)
 
 
-def search_europe_pmc_latest(journals: list[JournalFilter], limit: int, since_days: int | None = 7) -> list[PaperInput]:
-    query = "(" + " OR ".join(build_europe_pmc_journal_query(journal) for journal in journals) + ")"
-    return filter_latest_records(search_europe_pmc(query, limit, since_days=None), journals)
+def search_europe_pmc_latest(
+    journals: list[JournalFilter],
+    limit: int,
+    since_days: int | None = 7,
+    *,
+    date_from: str = "",
+    date_to: str = "",
+) -> list[PaperInput]:
+    query = "(" + " OR ".join(
+        build_europe_pmc_journal_query(
+            journal,
+            since_days=None if date_from and date_to else since_days,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        for journal in journals
+    ) + ")"
+    records = search_europe_pmc(query, limit, since_days=None)
+    return filter_latest_records(filter_records_by_date_range(records, date_from, date_to), journals)
 
 
 def search_openalex_latest(
@@ -1222,13 +1303,18 @@ def search_openalex_latest(
     limit: int,
     since_days: int | None = 7,
     api_key: str = "",
+    *,
+    date_from: str = "",
+    date_to: str = "",
 ) -> list[PaperInput]:
     api_key = clean_text(api_key or os.getenv("OPENALEX_API_KEY"))
     if not api_key:
         return []
     params: dict[str, Any] = {"per-page": limit, "sort": "publication_date:desc", "api_key": api_key}
     filters: list[str] = []
-    if since_days:
+    if date_from and date_to:
+        filters.extend([f"from_publication_date:{date_from}", f"to_publication_date:{date_to}"])
+    elif since_days:
         start, _ = since_dates(since_days)
         filters.append(f"from_publication_date:{start}")
     issns = list(dict.fromkeys(issn for journal in journals for issn in journal.issns))
@@ -1271,10 +1357,18 @@ def search_openalex_latest(
                 article_type=clean_text(item.get("type") or item.get("type_crossref")),
             )
         )
-    return filter_latest_records([record for record in records if record.title], journals)
+    dated = filter_records_by_date_range([record for record in records if record.title], date_from, date_to)
+    return filter_latest_records(dated, journals)
 
 
-def search_crossref_latest(journals: list[JournalFilter], limit: int, since_days: int | None = 7) -> list[PaperInput]:
+def search_crossref_latest(
+    journals: list[JournalFilter],
+    limit: int,
+    since_days: int | None = 7,
+    *,
+    date_from: str = "",
+    date_to: str = "",
+) -> list[PaperInput]:
     records: list[PaperInput] = []
     if not journals:
         return records
@@ -1285,7 +1379,9 @@ def search_crossref_latest(journals: list[JournalFilter], limit: int, since_days
             params: dict[str, Any] = {"rows": per_journal, "sort": "published", "order": "desc"}
             if not journal.issns:
                 params["query.container-title"] = journal.name
-            if since_days:
+            if date_from and date_to:
+                params["filter"] = f"from-pub-date:{date_from},until-pub-date:{date_to}"
+            elif since_days:
                 start, _ = since_dates(since_days)
                 params["filter"] = f"from-pub-date:{start}"
             data = http_json(url, params)
@@ -1294,7 +1390,8 @@ def search_crossref_latest(journals: list[JournalFilter], limit: int, since_days
                 if record:
                     records.append(record)
             time.sleep(0.05)
-    return filter_latest_records(dedupe(records), journals)[:limit]
+    dated = filter_records_by_date_range(dedupe(records), date_from, date_to)
+    return filter_latest_records(dated, journals)[:limit]
 
 
 def dedupe(records: list[PaperInput]) -> list[PaperInput]:
@@ -1483,6 +1580,8 @@ def journal_latest_search(
     *,
     openalex_api_key: str = "",
     diagnostics: SearchDiagnostics | None = None,
+    date_from: str = "",
+    date_to: str = "",
 ) -> tuple[list[PaperInput], dict[str, str]]:
     active_journals = sorted([journal for journal in journals if journal.enabled], key=lambda item: item.priority)
     openalex_key = clean_text(openalex_api_key or os.getenv("OPENALEX_API_KEY"))
@@ -1504,18 +1603,33 @@ def journal_latest_search(
         diag.warnings.append("未启用任何期刊，已跳过检索。")
         return [], {}
 
-    functions: dict[str, Callable[[], list[PaperInput]]] = {
-        "PubMed": lambda: search_pubmed_latest(active_journals, per_source, since_days=since_days),
-        "Europe PMC": lambda: search_europe_pmc_latest(active_journals, per_source, since_days=since_days),
-        "Crossref": lambda: search_crossref_latest(active_journals, per_source, since_days=since_days),
-    }
+    if date_from and date_to:
+        functions: dict[str, Callable[[], list[PaperInput]]] = {
+            "PubMed": lambda: search_pubmed_latest(
+                active_journals, per_source, since_days=None, date_from=date_from, date_to=date_to
+            ),
+            "Europe PMC": lambda: search_europe_pmc_latest(
+                active_journals, per_source, since_days=None, date_from=date_from, date_to=date_to
+            ),
+            "Crossref": lambda: search_crossref_latest(
+                active_journals, per_source, since_days=None, date_from=date_from, date_to=date_to
+            ),
+        }
+    else:
+        functions = {
+            "PubMed": lambda: search_pubmed_latest(active_journals, per_source, since_days=since_days),
+            "Europe PMC": lambda: search_europe_pmc_latest(active_journals, per_source, since_days=since_days),
+            "Crossref": lambda: search_crossref_latest(active_journals, per_source, since_days=since_days),
+        }
     if "OpenAlex" in selected:
         if openalex_key:
             functions["OpenAlex"] = lambda: search_openalex_latest(
                 active_journals,
                 per_source,
-                since_days=since_days,
+                since_days=None if date_from and date_to else since_days,
                 api_key=openalex_key,
+                date_from=date_from,
+                date_to=date_to,
             )
         else:
             diag.warnings.append("OpenAlex 未配置 OPENALEX_API_KEY，已跳过且未发起网络请求。")
@@ -1551,6 +1665,13 @@ def journal_latest_search(
     diag.errors.update(errors)
     diag.raw_count = len(records)
     merged = mark_paywalled(dedupe(records))
+    if date_from and date_to:
+        before_date_check = len(merged)
+        merged = filter_records_by_date_range(merged, date_from, date_to)
+        removed = before_date_check - len(merged)
+        diag.warnings.append(f"已按发表日期 {date_from} 至 {date_to} 完成月份校验。")
+        if removed:
+            diag.warnings.append(f"已排除 {removed} 条日期缺失或不在所选月份内的记录。")
     merged.sort(
         key=lambda item: (
             -(item.journal_priority or 9999),
@@ -1574,6 +1695,9 @@ def run_journal_latest_search(
     since_days: int | None = 7,
     *,
     openalex_api_key: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    period_label: str = "",
 ) -> SearchRun:
     started = utc_now()
     diagnostics = SearchDiagnostics()
@@ -1584,6 +1708,8 @@ def run_journal_latest_search(
         since_days=since_days,
         openalex_api_key=openalex_api_key,
         diagnostics=diagnostics,
+        date_from=date_from,
+        date_to=date_to,
     )
     return SearchRun(
         run_id=started.replace(":", "").replace("-", "").split(".")[0],
@@ -1598,6 +1724,9 @@ def run_journal_latest_search(
         warnings=list(dict.fromkeys(diagnostics.warnings)),
         search_kind="journal_latest",
         journal_filters=[journal.to_dict() for journal in journals if journal.enabled],
+        date_from=date_from,
+        date_to=date_to,
+        period_label=period_label,
     )
 
 
