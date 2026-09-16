@@ -11,6 +11,7 @@ import xml.etree.ElementTree as ET
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
+from calendar import monthrange
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -943,6 +944,19 @@ def since_dates(days: int | None) -> tuple[str, str]:
     end = date.today()
     start = end - timedelta(days=max(1, int(days or 365)))
     return start.isoformat(), end.isoformat()
+
+
+def years_months_to_since_days(years: int, months: int, *, end_date: date | None = None) -> int:
+    """Convert a user-facing year/month lookback into the existing date filter."""
+    total_months = max(0, int(years)) * 12 + max(0, int(months))
+    if total_months <= 0:
+        return 0
+    end = end_date or date.today()
+    month_index = end.year * 12 + (end.month - 1) - total_months
+    start_year, start_month_index = divmod(month_index, 12)
+    start_month = start_month_index + 1
+    start = date(start_year, start_month, min(end.day, monthrange(start_year, start_month)[1]))
+    return (end - start).days
 
 
 def element_text(node: ET.Element | None) -> str:

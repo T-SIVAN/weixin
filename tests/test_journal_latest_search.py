@@ -1,4 +1,5 @@
 import json
+from datetime import date
 import sys
 from pathlib import Path
 
@@ -11,9 +12,17 @@ from weixin_lite.search import (
     journal_latest_search,
     load_journal_filters,
     run_journal_latest_search,
+    years_months_to_since_days,
     should_keep_article_type,
     suggest_filter_keywords,
 )
+
+
+def test_year_month_lookback_preserves_calendar_month_boundaries():
+    end = date(2026, 3, 31)
+
+    assert years_months_to_since_days(0, 1, end_date=end) == (end - date(2026, 2, 28)).days
+    assert years_months_to_since_days(1, 2, end_date=end) == (end - date(2025, 1, 31)).days
 
 
 def test_load_journal_filters_skips_disabled_and_sorts(tmp_path):

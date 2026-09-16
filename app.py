@@ -51,6 +51,7 @@ from weixin_lite.search import (
     resolve_doi,
     resolve_keyword_plan,
     run_journal_latest_search,
+    years_months_to_since_days,
 )
 from weixin_lite.translate import translate_records
 from weixin_lite.wechat_publish import WechatDraftConfig, export_wechat_payload, publish_draft
@@ -447,15 +448,17 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
         default_journals = []
         st.error(f"期刊配置读取失败：{type(exc).__name__}: {exc}")
 
-    col_a, col_b, col_c, col_d = st.columns([1, 1, 1.3, 1.4])
+    col_a, col_b, col_c, col_d, col_e = st.columns([0.8, 0.8, 0.9, 1.3, 1.4])
     limit = col_a.slider("结果数量", 10, 200, 100, step=10)
-    since_days = col_b.slider("抓取天数", 1, 30, 7)
-    selected_sources = col_c.multiselect(
+    lookback_years = int(col_b.number_input("抓取年数", min_value=0, max_value=20, value=0, step=1))
+    lookback_months = int(col_c.number_input("附加月数", min_value=1, max_value=11, value=1, step=1))
+    since_days = years_months_to_since_days(lookback_years, lookback_months)
+    selected_sources = col_d.multiselect(
         "数据源",
         ["PubMed", "Europe PMC", "Crossref", "OpenAlex"],
         default=["PubMed", "Europe PMC", "Crossref"] + (["OpenAlex"] if os.getenv("OPENALEX_API_KEY") else []),
     )
-    openalex_api_key = col_d.text_input(
+    openalex_api_key = col_e.text_input(
         "OpenAlex API Key",
         value=os.getenv("OPENALEX_API_KEY", ""),
         type="password",
@@ -476,7 +479,7 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
     )
     journals = rows_to_journals(edited_journals)
     enabled_count = len([journal for journal in journals if journal.enabled])
-    st.caption(f"已启用 {enabled_count} 本期刊；默认抓取最近 {since_days} 天，按期刊优先级和发表日期排序。")
+    st.caption(f"已启用 {enabled_count} 本期刊；抓取近 {lookback_years} 年 {lookback_months} 个月的文章，按期刊优先级和发表日期排序。")
 
     if st.button("抓取最新文章并翻译标题", type="primary"):
         with st.spinner("正在按期刊检索 PubMed、Europe PMC、OpenAlex、Crossref，并翻译标题..."):
