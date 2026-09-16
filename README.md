@@ -44,9 +44,9 @@ $env:LLM_MODEL="your-model"
 
 ## 每日顶刊检索
 
-页面默认显示“每日顶刊最新文章”检索入口。可以调整抓取天数、结果数量、数据源，并启用或停用期刊清单中的条目。检索不再依赖固定关键词，也不再使用合成生物 strict 相关性过滤。
+页面默认显示“每日顶刊最新文章”检索入口。可以调整抓取月份、结果数量、数据源，并选择本次要检索的期刊。期刊表按 2024 JIF 从高到低排列，首次进入页面默认全部未选。检索不再依赖固定关键词，也不再使用合成生物 strict 相关性过滤。
 
-期刊清单位于 `config/journals.json`，每项包含 `name`、`aliases`、`issn/eissn`、`publisher_family`、`priority` 和 `enabled`。结果按期刊优先级和发表日期排序。
+期刊清单位于 `config/journals.json`，每项包含 `name`、`aliases`、`issn/eissn`、`publisher_family`、`impact_factor`、`impact_factor_year`、`priority` 和 `enabled`。结果按影响因子和发表日期排序。
 
 OpenAlex 已改用 API Key。未配置时会跳过 OpenAlex，PubMed、Europe PMC 和 Crossref 仍会继续检索。
 

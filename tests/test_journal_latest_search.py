@@ -3,6 +3,8 @@ from datetime import date
 import sys
 from pathlib import Path
 
+import app
+
 from weixin_lite.models import PaperInput, SearchRun
 from weixin_lite.search import (
     JournalFilter,
@@ -56,15 +58,15 @@ def test_month_filter_excludes_cross_month_and_missing_publication_dates():
     assert [record.title_en for record in filtered] == ["February"]
 
 
-def test_load_journal_filters_skips_disabled_and_sorts(tmp_path):
+def test_load_journal_filters_retains_disabled_and_sorts_by_impact_factor(tmp_path):
     config = tmp_path / "journals.json"
     config.write_text(
         json.dumps(
             {
                 "journals": [
-                    {"name": "Late", "priority": 20, "enabled": True},
-                    {"name": "Disabled", "priority": 1, "enabled": False},
-                    {"name": "Early", "priority": 10, "enabled": True},
+                    {"name": "Low", "priority": 1, "impact_factor": 5.0, "enabled": True},
+                    {"name": "Disabled", "priority": 2, "impact_factor": 20.0, "enabled": False},
+                    {"name": "High", "priority": 3, "impact_factor": 30.0, "enabled": True},
                 ]
             }
         ),
@@ -73,7 +75,28 @@ def test_load_journal_filters_skips_disabled_and_sorts(tmp_path):
 
     journals = load_journal_filters(config)
 
-    assert [journal.name for journal in journals] == ["Early", "Late"]
+    assert [journal.name for journal in journals] == ["High", "Disabled", "Low"]
+    assert journals[1].enabled is False
+
+
+def test_journal_picker_is_sorted_by_impact_factor_and_defaults_to_unchecked():
+    rows = app.journal_to_rows(
+        [
+            JournalFilter(name="Lower", impact_factor=8.0, impact_factor_year=2024),
+            JournalFilter(name="Higher", impact_factor=40.0, impact_factor_year=2024),
+        ],
+        default_enabled=False,
+    )
+
+    assert [row["期刊"] for row in rows] == ["Higher", "Lower"]
+    assert [row["影响因子"] for row in rows] == [40.0, 8.0]
+    assert all(row["启用"] is False for row in rows)
+
+    rows[0]["启用"] = True
+    journals = app.rows_to_journals(rows)
+    assert journals[0].enabled is True
+    assert journals[1].enabled is False
+    assert journals[0].impact_factor == 40.0
 
 
 def test_journal_query_builders_include_journal_issn_and_date():
@@ -155,8 +178,8 @@ def test_article_type_filter_keeps_research_and_review_but_drops_noise():
 
 def test_journal_latest_search_merges_sources_filters_types_and_sorts(monkeypatch):
     journals = [
-        JournalFilter(name="Nature", priority=10),
-        JournalFilter(name="Cell", priority=40),
+        JournalFilter(name="Nature", priority=10, impact_factor=48.5),
+        JournalFilter(name="Cell", priority=40, impact_factor=42.5),
     ]
 
     def fake_pubmed(journals_arg, limit, since_days=None):
@@ -170,6 +193,7 @@ def test_journal_latest_search_merges_sources_filters_types_and_sorts(monkeypatc
                 source="PubMed",
                 article_type="Journal Article",
                 journal_priority=40,
+                journal_impact_factor=42.5,
             ),
             PaperInput(
                 title_en="Editorial item",
@@ -179,6 +203,7 @@ def test_journal_latest_search_merges_sources_filters_types_and_sorts(monkeypatc
                 source="PubMed",
                 article_type="Editorial",
                 journal_priority=10,
+                journal_impact_factor=48.5,
             ),
         ]
 
@@ -193,6 +218,7 @@ def test_journal_latest_search_merges_sources_filters_types_and_sorts(monkeypatc
                 source="Europe PMC",
                 article_type="research-article",
                 journal_priority=40,
+                journal_impact_factor=42.5,
             ),
             PaperInput(
                 title_en="Nature review",
@@ -202,6 +228,7 @@ def test_journal_latest_search_merges_sources_filters_types_and_sorts(monkeypatc
                 source="Europe PMC",
                 article_type="Review",
                 journal_priority=10,
+                journal_impact_factor=48.5,
             ),
         ]
 

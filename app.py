@@ -366,18 +366,26 @@ def show_search_run_diagnostics(run: SearchRun, *, wrapped: bool = True) -> None
         render()
 
 
-def journal_to_rows(journals: list[JournalFilter]) -> list[dict[str, object]]:
+def journal_to_rows(
+    journals: list[JournalFilter],
+    *,
+    default_enabled: bool | None = None,
+) -> list[dict[str, object]]:
     return [
         {
-            "启用": journal.enabled,
+            "启用": journal.enabled if default_enabled is None else default_enabled,
             "期刊": journal.name,
+            "影响因子": journal.impact_factor,
+            "JIF年度": journal.impact_factor_year,
             "别名": ", ".join(journal.aliases),
             "ISSN": journal.issn,
             "EISSN": journal.eissn,
             "出版集团": journal.publisher_family,
-            "优先级": journal.priority,
         }
-        for journal in journals
+        for journal in sorted(
+            journals,
+            key=lambda item: (-item.impact_factor, item.priority, item.name.lower()),
+        )
     ]
 
 
@@ -387,7 +395,7 @@ def rows_to_journals(rows: object) -> list[JournalFilter]:
     else:
         row_items = rows if isinstance(rows, list) else []
     journals: list[JournalFilter] = []
-    for row in row_items:
+    for index, row in enumerate(row_items, start=1):
         if not isinstance(row, dict):
             continue
         name = str(row.get("期刊") or "").strip()
@@ -400,8 +408,10 @@ def rows_to_journals(rows: object) -> list[JournalFilter]:
                 issn=str(row.get("ISSN") or "").strip(),
                 eissn=str(row.get("EISSN") or "").strip(),
                 publisher_family=str(row.get("出版集团") or "").strip(),
-                priority=int(row.get("优先级") or 9999),
-                enabled=bool(row.get("启用", True)),
+                priority=index,
+                impact_factor=float(row.get("影响因子") or 0),
+                impact_factor_year=int(row.get("JIF年度") or 0),
+                enabled=bool(row.get("启用", False)),
             )
         )
     return journals
@@ -515,23 +525,27 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
     st.session_state.search_append = append_results
 
     edited_journals = st.data_editor(
-        journal_to_rows(default_journals),
+        journal_to_rows(default_journals, default_enabled=False),
         use_container_width=True,
         hide_index=True,
-        disabled=["期刊", "别名", "ISSN", "EISSN", "出版集团"],
+        disabled=["期刊", "影响因子", "JIF年度", "别名", "ISSN", "EISSN", "出版集团"],
         column_config={
             "启用": st.column_config.CheckboxColumn("启用"),
-            "优先级": st.column_config.NumberColumn("优先级", min_value=1, step=1),
+            "影响因子": st.column_config.NumberColumn("影响因子", format="%.1f"),
+            "JIF年度": st.column_config.NumberColumn("JIF年度", format="%d"),
         },
+        key="journal_picker",
     )
     journals = rows_to_journals(edited_journals)
     enabled_count = len([journal for journal in journals if journal.enabled])
     st.caption(
         f"已启用 {enabled_count} 本期刊；抓取月份：{selected_month_label}"
-        f"（{date_from} 至 {date_to}），按期刊优先级和发表日期排序。"
+        f"（{date_from} 至 {date_to}）；期刊按 2024 JIF 从高到低排列，进入页面默认全部未选。"
     )
 
-    if st.button("抓取最新文章并翻译标题", type="primary"):
+    if not enabled_count:
+        st.info("请至少勾选一本期刊后再开始检索。")
+    if st.button("抓取最新文章并翻译标题", type="primary", disabled=not enabled_count):
         with st.spinner("正在按期刊检索 PubMed、Europe PMC、OpenAlex、Crossref，并翻译标题..."):
             run = run_journal_latest_search(
                 journals,

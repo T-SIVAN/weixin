@@ -157,6 +157,8 @@ class JournalFilter:
     eissn: str = ""
     publisher_family: str = ""
     priority: int = 9999
+    impact_factor: float = 0.0
+    impact_factor_year: int = 0
     enabled: bool = True
 
     @property
@@ -179,6 +181,8 @@ class JournalFilter:
             eissn=clean_text(data.get("eissn")),
             publisher_family=clean_text(data.get("publisher_family")),
             priority=int(data.get("priority") or 9999),
+            impact_factor=float(data.get("impact_factor") or 0),
+            impact_factor_year=int(data.get("impact_factor_year") or 0),
             enabled=bool(data.get("enabled", True)),
         )
 
@@ -296,7 +300,10 @@ def load_journal_filters(path: str | Path = DEFAULT_JOURNALS_PATH) -> list[Journ
         for item in raw_items
         if isinstance(item, dict) and clean_text(item.get("name"))
     ]
-    return sorted([journal for journal in journals if journal.enabled], key=lambda item: item.priority)
+    return sorted(
+        journals,
+        key=lambda item: (-item.impact_factor, item.priority, item.name.lower()),
+    )
 
 
 def journal_matches_name(record_journal: str, journal: JournalFilter) -> bool:
@@ -314,6 +321,7 @@ def decorate_journal_record(record: PaperInput, journal: JournalFilter) -> Paper
     if not record.journal:
         record.journal = journal.name
     record.journal_priority = journal.priority
+    record.journal_impact_factor = journal.impact_factor
     return record
 
 
@@ -1428,6 +1436,11 @@ def dedupe(records: list[PaperInput]) -> list[PaperInput]:
         if record.is_open_access:
             existing.is_open_access = True
             existing.access_status = "open"
+        existing.journal_impact_factor = max(
+            existing.journal_impact_factor,
+            record.journal_impact_factor,
+        )
+        existing.journal_priority = min(existing.journal_priority, record.journal_priority)
         if record.source not in existing.source:
             existing.source = f"{existing.source}, {record.source}"
     return list(by_key.values())
@@ -1583,7 +1596,10 @@ def journal_latest_search(
     date_from: str = "",
     date_to: str = "",
 ) -> tuple[list[PaperInput], dict[str, str]]:
-    active_journals = sorted([journal for journal in journals if journal.enabled], key=lambda item: item.priority)
+    active_journals = sorted(
+        [journal for journal in journals if journal.enabled],
+        key=lambda item: (-item.impact_factor, item.priority, item.name.lower()),
+    )
     openalex_key = clean_text(openalex_api_key or os.getenv("OPENALEX_API_KEY"))
     default_sources = ["PubMed", "Europe PMC", "Crossref"]
     if openalex_key:
@@ -1674,6 +1690,7 @@ def journal_latest_search(
             diag.warnings.append(f"已排除 {removed} 条日期缺失或不在所选月份内的记录。")
     merged.sort(
         key=lambda item: (
+            item.journal_impact_factor or 0,
             -(item.journal_priority or 9999),
             item.publication_date or item.year or "",
             bool(item.abstract_en),

@@ -42,6 +42,7 @@ class PaperInput:
     download_error: str = ""
     article_type: str = ""
     journal_priority: int = 9999
+    journal_impact_factor: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.title and self.title_en:
