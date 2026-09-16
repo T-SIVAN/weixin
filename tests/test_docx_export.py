@@ -10,7 +10,7 @@ from PIL import Image
 import app
 from weixin_lite.docx_exporter import DocxExportError, export_article_docx
 from weixin_lite.exporter import export_article_html, project_zip
-from weixin_lite.models import BatchProject, PaperInput, QuickReadArticle
+from weixin_lite.models import BatchProject, DownloadedPaper, PaperInput, QuickReadArticle
 
 
 def _png_bytes(color: str = "white") -> bytes:
@@ -52,6 +52,29 @@ def test_docx_embeds_images_and_keeps_text_editable_with_single_lead():
     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
         media = [name for name in archive.namelist() if name.startswith("word/media/")]
     assert len(media) == 2
+
+
+def test_docx_clears_personal_author_metadata():
+    payload = export_article_docx(_article("正文"), {"lead.png": _png_bytes()})
+    document = Document(io.BytesIO(payload))
+
+    assert document.core_properties.author in {"", None}
+    assert document.core_properties.last_modified_by in {"", None}
+    assert document.core_properties.comments in {"", None}
+
+
+def test_download_selection_returns_only_checked_papers_and_merges_results():
+    papers = [PaperInput(title_en="Paper A"), PaperInput(title_en="Paper B")]
+    rows = app.paper_download_rows(papers, {app.paper_key(papers[1])})
+
+    selected = app.selected_papers_from_rows(papers, rows)
+    merged = app.merge_download_records(
+        [DownloadedPaper(paper_key="Paper A", status="open", file_name="a.pdf")],
+        [DownloadedPaper(paper_key="Paper B", status="open", file_name="b.pdf")],
+    )
+
+    assert selected == [papers[1]]
+    assert {item.file_name for item in merged} == {"a.pdf", "b.pdf"}
 
 
 def test_docx_rejects_missing_image_by_name():

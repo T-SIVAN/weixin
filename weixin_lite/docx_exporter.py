@@ -280,6 +280,10 @@ def export_article_docx(article: QuickReadArticle, image_assets: dict[str, bytes
     _validate_standalone_image_references(article.body_markdown)
     assets = image_assets or {}
     document = Document()
+    properties = document.core_properties
+    properties.author = ""
+    properties.last_modified_by = ""
+    properties.comments = ""
     _configure_document(document)
 
     title = document.add_paragraph()

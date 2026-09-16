@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -111,6 +112,8 @@ def init_state() -> None:
     st.session_state.setdefault("query_plan", None)
     st.session_state.setdefault("search_append", False)
     st.session_state.setdefault("single_analysis", None)
+    st.session_state.setdefault("paper_analyses", {})
+    st.session_state.setdefault("selected_download_keys", [])
     st.session_state.setdefault("analysis_cache", {})
     st.session_state.setdefault("vision_cache", {})
 
@@ -225,6 +228,41 @@ def paper_rows(papers: list[PaperInput]) -> list[dict[str, str]]:
             }
         )
     return rows
+
+
+def paper_download_rows(papers: list[PaperInput], selected_keys: set[str] | None = None) -> list[dict[str, object]]:
+    """Build editable selection rows without changing the paper records."""
+    selected = selected_keys or set()
+    rows: list[dict[str, object]] = []
+    for paper, row in zip(papers, paper_rows(papers)):
+        rows.append({"下载解析": paper_key(paper) in selected, **row})
+    return rows
+
+
+def selected_papers_from_rows(papers: list[PaperInput], rows: object) -> list[PaperInput]:
+    """Return only papers checked in a Streamlit data editor result."""
+    if hasattr(rows, "to_dict"):
+        records = rows.to_dict("records")
+    elif isinstance(rows, list):
+        records = rows
+    else:
+        records = []
+    return [
+        paper
+        for paper, row in zip(papers, records)
+        if isinstance(row, dict) and bool(row.get("下载解析"))
+    ]
+
+
+def merge_download_records(
+    existing: list[DownloadedPaper],
+    incoming: list[DownloadedPaper],
+) -> list[DownloadedPaper]:
+    """Replace only reprocessed papers while retaining earlier downloads."""
+    merged = {item.paper_key: item for item in existing}
+    for item in incoming:
+        merged[item.paper_key] = item
+    return list(merged.values())
 
 
 def show_details(papers: list[PaperInput], title: str = "查看摘要和错误") -> None:
@@ -531,11 +569,32 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
     pdfs: dict[str, PdfContent] = st.session_state.pdfs
 
     if papers:
-        st.dataframe(paper_rows(papers), use_container_width=True, hide_index=True)
-        if st.button("下载并解析开放全文"):
+        paper_keys = [paper_key(paper) for paper in papers]
+        selected_keys = set(st.session_state.selected_download_keys) & set(paper_keys)
+        selector_version = hashlib.sha256("|".join(paper_keys).encode("utf-8")).hexdigest()[:12]
+        st.markdown("##### 选择需要下载并解析的文章")
+        st.caption("只处理勾选的文章；未勾选的检索结果仍保留在列表中，不会下载全文。")
+        edited_rows = st.data_editor(
+            paper_download_rows(papers, selected_keys),
+            use_container_width=True,
+            hide_index=True,
+            disabled=["#", "标题", "期刊", "发表日期", "DOI", "全文状态", "PDF", "来源"],
+            column_config={
+                "下载解析": st.column_config.CheckboxColumn(
+                    "下载解析",
+                    help="仅勾选需要下载 PDF、截取首页与关键图表的文章。",
+                    default=False,
+                )
+            },
+            key=f"download-paper-selector-{selector_version}",
+        )
+        selected_papers = selected_papers_from_rows(papers, edited_rows)
+        st.session_state.selected_download_keys = [paper_key(paper) for paper in selected_papers]
+        st.caption(f"已选择 {len(selected_papers)} / {len(papers)} 篇。")
+        if st.button("下载并解析已选全文", disabled=not selected_papers):
             progress = st.progress(0)
             downloads: list[DownloadedPaper] = []
-            for idx, paper in enumerate(papers, start=1):
+            for idx, paper in enumerate(selected_papers, start=1):
                 downloaded = download_open_access(paper)
                 downloads.append(downloaded)
                 if downloaded.status == "open" and downloaded.content_bytes and "pdf" in downloaded.content_type.lower():
@@ -553,9 +612,9 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
                 else:
                     paper.access_status = downloaded.status
                     paper.download_error = downloaded.error or "未下载到 PDF 全文。"
-                progress.progress(idx / len(papers), text=f"已处理 {idx}/{len(papers)}")
-            st.session_state.downloads = downloads
-            st.success("开放全文下载和解析完成。未成功解析的论文只会进入 DOI CSV。")
+                progress.progress(idx / len(selected_papers), text=f"已处理 {idx}/{len(selected_papers)}")
+            st.session_state.downloads = merge_download_records(st.session_state.downloads, downloads)
+            st.success(f"已完成 {len(selected_papers)} 篇已选文章的下载与解析。未成功解析的论文只会进入 DOI CSV。")
     else:
         st.info("先检索文献、粘贴 DOI，或直接上传 PDF。")
 
@@ -593,6 +652,9 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
         st.session_state.pdfs = {}
         st.session_state.images = {}
         st.session_state.downloads = []
+        st.session_state.selected_download_keys = []
+        st.session_state.paper_analyses = {}
+        st.session_state.single_analysis = None
         st.info("已清空当前批次。")
 
     st.divider()
@@ -604,14 +666,28 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
     selected_label = st.selectbox("活动文章", labels)
     paper = ready[labels.index(selected_label)]
     pdf = st.session_state.pdfs[paper.pdf_name]
+    active_key = paper_key(paper)
+    analyses = st.session_state.paper_analyses
+    analysis = analyses.get(active_key)
+    legacy_analysis = st.session_state.single_analysis
+    if analysis is None and legacy_analysis is not None:
+        legacy_hash = str(getattr(legacy_analysis, "source_hash", "") or "")
+        pdf_hash = str(getattr(pdf, "hash", "") or "")
+        if legacy_hash and legacy_hash == pdf_hash:
+            analysis = legacy_analysis
+            analyses[active_key] = legacy_analysis
     st.markdown("#### 单篇深度工作台")
     st.caption("全文分段取证，不设置分析或成稿字数上限；确认图表后必须经 Gemini 视觉复核。")
     if st.button("1. 执行结构化全文分析", type="primary"):
         with st.spinner("正在按章节分析全文证据..."):
-            st.session_state.single_analysis = analyze_paper(
-                paper, pdf, {"api_key": api_key, "base_url": base_url, "model": model, "cache": st.session_state.analysis_cache}, st.session_state.single_analysis
+            analysis = analyze_paper(
+                paper,
+                pdf,
+                {"api_key": api_key, "base_url": base_url, "model": model, "cache": st.session_state.analysis_cache},
+                analysis,
             )
-    analysis = st.session_state.single_analysis
+            analyses[active_key] = analysis
+            st.session_state.single_analysis = analysis
     if analysis and analysis.complete:
         st.success("全文结构化分析完成。")
         st.dataframe([claim.to_dict() for claim in analysis.claims], use_container_width=True, hide_index=True)
@@ -655,9 +731,15 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
                         st.rerun()
             if figure.editable_table:
                 st.caption(f"可编辑表格候选：{len(figure.editable_table.rows)} 行；置信度 {figure.editable_table.confidence:.2f}")
+            if figure.vision_status == "reviewed" and figure.interpretation:
+                st.success("Gemini 视觉复核完成")
+                st.markdown(figure.interpretation)
             if figure.vision_error:
                 st.warning(figure.vision_error)
-    selected_assets = [item for item in assets if item.selected]
+    selected_assets = sorted(
+        [item for item in assets if item.selected],
+        key=lambda item: (item.order or 999, item.figure_id),
+    )[:4]
     if st.button("3. Gemini 视觉复核已选资产", type="primary"):
         with st.spinner("正在复核图中曲线、表格、箭头关系与关键数据..."):
             reviewed = analyze_confirmed_figures(
@@ -672,6 +754,11 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
     if st.button("4. 生成无字数上限公众号稿", type="primary"):
         if not analysis or not analysis.complete:
             st.error("请先完成结构化全文分析。")
+        elif not selected_assets:
+            st.error("请至少选择 1 张关键图、表格或线路图，并完成 Gemini 视觉复核。")
+        elif any(item.vision_status != "reviewed" for item in selected_assets):
+            pending = "、".join(item.figure_id for item in selected_assets if item.vision_status != "reviewed")
+            st.error(f"以下已选资产尚未完成 Gemini 视觉复核：{pending}。请先执行第 3 步。")
         else:
             try:
                 article = generate_article(paper, pdf, api_key, base_url, model, analysis=analysis, confirmed_figures=selected_assets, image_assets=st.session_state.images, provider=provider)
@@ -794,7 +881,7 @@ def export_and_publish_tab() -> None:
     st.markdown("#### 公众号草稿")
     app_id = st.text_input("APP_ID")
     app_secret = st.text_input("APP_SECRET", type="password")
-    author = st.text_input("作者", value="")
+    st.caption("公众号名称、运营作者、日期和阅读量由平台管理，不写入正文；草稿作者字段保持为空。")
     cover = st.file_uploader("草稿封面图", type=["png", "jpg", "jpeg"], key="draft-cover")
     cover_name = ""
     if cover:
@@ -810,7 +897,7 @@ def export_and_publish_tab() -> None:
     config = WechatDraftConfig(
         app_id=app_id,
         app_secret=app_secret,
-        author=author,
+        author="",
         cover_image_name=cover_name or article.cover_image_name,
         show_cover_pic=show_cover_pic,
         content_source_url=source_url,

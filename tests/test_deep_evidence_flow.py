@@ -22,7 +22,7 @@ def _analysis() -> PaperAnalysis:
 
 
 def test_deep_prompts_use_full_evidence_without_a_product_length_cap():
-    paper = PaperInput(title_en="Traceable paper")
+    paper = PaperInput(title_en="Traceable paper", authors=["Personal Author"])
     basic_prompt = build_prompt(paper, None, 1200)
     analysis_prompt = build_analysis_prompt(paper, PdfContent(text="[Page 1] evidence"))
 
@@ -32,6 +32,8 @@ def test_deep_prompts_use_full_evidence_without_a_product_length_cap():
     assert "产业发展有什么重要意义" in analysis_prompt
     assert "实验是如何设计的？实验数据和结果如何？" in analysis_prompt
     assert "局限性" in analysis_prompt
+    assert "Personal Author" not in basic_prompt
+    assert "公众号名称、运营作者" in basic_prompt
 
 
 def test_rendered_deep_article_has_all_distinct_evidence_sections():
