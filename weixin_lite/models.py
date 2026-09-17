@@ -349,6 +349,8 @@ class PaperAnalysis:
     limitations: list[AnalysisClaim] = field(default_factory=list)
     conclusion: list[AnalysisClaim] = field(default_factory=list)
     status: str = "pending"
+    completed_chunks: int = 0
+    total_chunks: int = 0
     error: str = ""
     warnings: list[str] = field(default_factory=list)
     source_hash: str = ""

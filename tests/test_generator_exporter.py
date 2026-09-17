@@ -611,7 +611,7 @@ def test_analysis_prompt_uses_expert_deep_reading_guide():
         PdfContent(text="[Page 1]\nAbstract\nKey result.", hash="pdf-hash"),
     )
 
-    assert ANALYSIS_PROMPT_VERSION == "paper-analysis-v3"
+    assert ANALYSIS_PROMPT_VERSION == "paper-analysis-v4-resumable"
     assert "世界顶级学术专家" in prompt
     assert "### 论文的研究目标是什么？想要解决什么实际问题？" in prompt
     assert "### 这个问题对于产业发展有什么重要意义？" in prompt
@@ -630,7 +630,7 @@ def test_analysis_failure_preserves_previous_complete_analysis(monkeypatch):
 
     result = analyze_paper(
         PaperInput(title_en="Paper"),
-        PdfContent(text="[Page 1] full text", hash="hash"),
+        PdfContent(text="[Page 1] full text", hash=previous.source_hash),
         {"api_key": "key", "model": "test-model"},
         previous_analysis=previous,
     )

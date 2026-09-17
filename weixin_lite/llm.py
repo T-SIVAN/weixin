@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import socket
@@ -114,6 +115,8 @@ def call_openai_compatible(
             if exc.quota_exhausted or not exc.transient or attempt + 1 >= attempts:
                 raise
             delay = exc.retry_after if exc.retry_after is not None else float(2**attempt)
+            if delay > 60:
+                raise
             time.sleep(max(0.0, delay))
     raise LLMError("LLM retry loop ended unexpectedly")
 
@@ -152,6 +155,8 @@ def call_openai_compatible_with_images(
             if exc.quota_exhausted or not exc.transient or attempt + 1 >= attempts:
                 raise
             delay = exc.retry_after if exc.retry_after is not None else float(2**attempt)
+            if delay > 60:
+                raise
             time.sleep(max(0.0, delay))
     raise LLMError("LLM vision retry loop ended unexpectedly")
 
@@ -205,6 +210,9 @@ def _call_openai_compatible_once(
     except urllib.error.HTTPError as exc:
         retry_after = _parse_retry_after(exc.headers.get("Retry-After") if exc.headers else None)
         detail, error_code = _read_http_error_detail(exc)
+        body_delay = _parse_body_retry_delay(detail)
+        if body_delay is not None:
+            retry_after = max(retry_after or 0, body_delay)
         quota_exhausted = _is_quota_exhaustion(detail, error_code)
         transient = (exc.code == 429 or exc.code >= 500) and not quota_exhausted
         message = f"LLM HTTP {exc.code} {exc.reason}: {detail}".strip()
@@ -237,7 +245,8 @@ def _parse_retry_after(value: str | None) -> float | None:
         return None
     value = value.strip()
     try:
-        return max(0.0, float(value))
+        seconds = float(value)
+        return max(0.0, seconds) if math.isfinite(seconds) else None
     except ValueError:
         pass
     try:
@@ -253,6 +262,13 @@ def _parse_retry_after(value: str | None) -> float | None:
 
 def _is_quota_exhaustion(message: str, error_code: str = "") -> bool:
     value = f"{error_code} {message}".lower()
+    # Google uses the same message for RPM and RPD. The quota ID takes precedence.
+    if any(marker in value for marker in ("perday", "per_day", "per day", "insufficient_quota", "billing quota", "run out of credits", "no balance left")):
+        return True
+    if re.search(r'"quotaValue"\s*:\s*"?0(?:"|\s*[,}])', message) or re.search(r"limit:\s*0\b", value):
+        return True
+    if any(marker in value for marker in ("perminute", "per_minute", "per minute")) or _parse_body_retry_delay(message) is not None:
+        return False
     return any(
         marker in value
         for marker in (
@@ -266,6 +282,29 @@ def _is_quota_exhaustion(message: str, error_code: str = "") -> bool:
     )
 
 
+def _parse_body_retry_delay(message: str) -> float | None:
+    matches = re.findall(r'(?:"retryDelay"\s*:\s*"|retry in\s+)(\d+(?:\.\d+)?)s', message, re.I)
+    delays = [float(value) for value in matches if math.isfinite(float(value))]
+    return max(delays) if delays else None
+
+
+def friendly_llm_error(exc: Exception) -> str:
+    if isinstance(exc, LLMError):
+        if exc.quota_exhausted:
+            return "模型配额已耗尽或未开通。请在供应商控制台核对每日额度与计费状态，额度恢复后继续；重复点击无法恢复额度。"
+        if exc.status_code == 429:
+            wait = f"建议至少等待 {math.ceil(exc.retry_after)} 秒后继续。" if exc.retry_after else "请稍后继续。"
+            return "模型请求受限，已暂停本次操作。" + wait + "如仍受限，请核对项目配额。"
+        if exc.status_code in {401, 403}:
+            return "模型鉴权失败，请检查 API Key、接口地址和模型权限。"
+        if exc.transient:
+            return "模型服务暂时不可用，请稍后继续。"
+        return "模型请求失败，请检查接口地址、模型名称或服务状态。"
+    if isinstance(exc, (ValueError, TypeError, KeyError)):
+        return "模型返回的内容不完整或格式无效，请重试当前阶段。"
+    return "当前操作未完成，请稍后重试。"
+
+
 def _read_http_error_detail(exc: urllib.error.HTTPError) -> tuple[str, str]:
     try:
         raw = exc.read().decode("utf-8", errors="replace")
@@ -276,11 +315,13 @@ def _read_http_error_detail(exc: urllib.error.HTTPError) -> tuple[str, str]:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        return raw[:500], ""
+        return raw[:16000], ""
+    if isinstance(data, list):
+        data = next((item for item in data if isinstance(item, dict) and "error" in item), {})
     if isinstance(data, dict):
         error = data.get("error")
         if isinstance(error, dict):
-            return str(error.get("message") or error), str(error.get("code") or error.get("type") or "")
+            return json.dumps(error, ensure_ascii=False), str(error.get("type") or error.get("status") or error.get("code") or "")
         if error:
             return str(error), ""
         if data.get("message"):

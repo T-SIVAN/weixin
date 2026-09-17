@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .llm import LLMError, call_openai_compatible, default_api_key, default_base_url, default_model, default_provider, parse_json_array
+from .llm import LLMError, call_openai_compatible, default_api_key, default_base_url, default_model, default_provider, friendly_llm_error, parse_json_array
 from .models import PaperInput, utc_now
 
 
@@ -150,7 +150,7 @@ def _sleep_for_retry(exc: Exception, attempt: int, delay_seconds: float) -> None
 
 def _is_transient_error(exc: Exception) -> bool:
     if isinstance(exc, LLMError):
-        return exc.transient
+        return exc.transient and not exc.quota_exhausted and (exc.retry_after is None or exc.retry_after <= 60)
     status_code = getattr(exc, "status_code", None)
     if isinstance(status_code, int) and (status_code == 429 or status_code >= 500):
         return True
@@ -180,6 +180,7 @@ def _call_translation_batch(
                 user_prompt=json.dumps(payload, ensure_ascii=False),
                 temperature=0.1,
                 timeout=120,
+                max_attempts=1,
             )
             return parse_json_array(raw)
         except Exception as exc:
@@ -234,6 +235,7 @@ def _call_translation_title(
                 user_prompt=candidate.title,
                 temperature=0.1,
                 timeout=120,
+                max_attempts=1,
             )
             title_zh = _extract_title_translation(raw)
             if not title_zh:
@@ -294,7 +296,7 @@ def _translate_chunk(
     model: str,
     delay_seconds: float,
     max_retries: int,
-) -> None:
+) -> bool:
     try:
         translated = _call_translation_batch(
             chunk,
@@ -304,43 +306,16 @@ def _translate_chunk(
             delay_seconds=delay_seconds,
             max_retries=max_retries,
         )
-    except Exception:
-        for candidate in chunk:
-            try:
-                item = _call_translation_title(
-                    candidate,
-                    api_key=api_key,
-                    base_url=base_url,
-                    model=model,
-                    delay_seconds=delay_seconds,
-                    max_retries=max_retries,
-                )
-                if not _apply_translation(report, cache, candidate, item):
-                    _mark_failed(report, candidate, "模型未返回有效 title_zh")
-            except Exception as single_exc:
-                message = f"{type(single_exc).__name__}: {single_exc}"
-                report.errors.append(message)
-                _mark_failed(report, candidate, message)
-        return
+    except Exception as exc:
+        if isinstance(exc, LLMError) and (exc.quota_exhausted or exc.status_code in {401, 403, 429}):
+            report.errors.append(friendly_llm_error(exc))
+            for candidate in chunk:
+                _mark_failed(report, candidate, friendly_llm_error(exc))
+            return False
+        translated = []
 
     if len(translated) != len(chunk):
-        for candidate in chunk:
-            try:
-                item = _call_translation_title(
-                    candidate,
-                    api_key=api_key,
-                    base_url=base_url,
-                    model=model,
-                    delay_seconds=delay_seconds,
-                    max_retries=max_retries,
-                )
-                if not _apply_translation(report, cache, candidate, item):
-                    _mark_failed(report, candidate, "模型未返回有效 title_zh")
-            except Exception as single_exc:
-                message = f"{type(single_exc).__name__}: {single_exc}"
-                report.errors.append(message)
-                _mark_failed(report, candidate, message)
-        return
+        translated = [{} for _ in chunk]
     for idx, candidate in enumerate(chunk):
         item = translated[idx] if idx < len(translated) else {}
         if not _apply_translation(report, cache, candidate, item):
@@ -356,9 +331,17 @@ def _translate_chunk(
                 if not _apply_translation(report, cache, candidate, item):
                     _mark_failed(report, candidate, "模型未返回有效 title_zh")
             except Exception as single_exc:
-                message = f"{type(single_exc).__name__}: {single_exc}"
+                message = friendly_llm_error(single_exc)
                 report.errors.append(message)
                 _mark_failed(report, candidate, message)
+                if isinstance(single_exc, LLMError) and (
+                    single_exc.quota_exhausted or single_exc.status_code in {401, 403, 429}
+                ):
+                    for remaining in chunk[idx + 1:]:
+                        remaining.record.translation_status = "pending"
+                        report.pending_count += 1
+                    return False
+    return True
 
 
 def translate_records(
@@ -427,7 +410,7 @@ def translate_records(
             total=len(candidates),
             report=report,
         )
-        _translate_chunk(
+        can_continue = _translate_chunk(
             report,
             cache,
             chunk,
@@ -438,6 +421,12 @@ def translate_records(
             max_retries=max_retries,
         )
         completed += len(chunk)
+        if can_continue is False:
+            for remaining in batches[batch_no:]:
+                for candidate in remaining:
+                    candidate.record.translation_status = "pending"
+                    report.pending_count += 1
+            break
         _emit_progress(
             progress_callback,
             stage="batch_done",

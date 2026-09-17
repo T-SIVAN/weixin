@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping, MutableMapping
 from typing import Any
 
-from .llm import call_openai_compatible, parse_json_object
+from .llm import call_openai_compatible, friendly_llm_error, parse_json_object
 from .models import AnalysisClaim, PaperAnalysis, PaperInput
 from .pdf_reader import PdfContent
 
 
-ANALYSIS_PROMPT_VERSION = "paper-analysis-v3"
+ANALYSIS_PROMPT_VERSION = "paper-analysis-v4-resumable"
 ANALYSIS_FIELDS = (
     "research_question",
     "background",
@@ -30,7 +31,7 @@ def _legacy_safe_analysis_chunks(pdf: PdfContent, max_chars: int = 18000) -> lis
 
     text = str(getattr(pdf, "text", "") or "")
     sections = getattr(pdf, "sections", {}) or {}
-    sources = sections if isinstance(sections, dict) and sections else {"full_text": text}
+    sources = {"full_text": text} if text.strip() else (sections if isinstance(sections, dict) else {})
     legends = getattr(pdf, "all_figures", None) or getattr(pdf, "legends", []) or []
     captions = "\n".join(
         f"- {getattr(item, 'figure_id', '')} p.{getattr(item, 'page', '')}: {getattr(item, 'caption', '')}"
@@ -55,7 +56,7 @@ ANALYSIS_SYSTEM_PROMPT = """你是该领域的世界顶级学术专家，正在�
 ANALYSIS_READING_GUIDE = """
 深度解读要求：
 你现在作为该领域的世界顶级学术专家，想详细阅读并深入这篇论文。
-首先，请用约 1000-3000 字信息量的深度来阅读论文；在 JSON 的各字段中分散承载这些内容，而不是另起 Markdown 正文。
+充分阅读当前证据，不设置人为字数上限；在 JSON 的各字段中分散承载内容。当前分段没有的证据返回空数组，由后续分段合并。
 讲述过程中，请多引用论文中的细节内容、关键数据和实验结果；如果技术概念相对新颖，请给出通俗解释。
 
 请围绕以下六个三级标题式问题组织分析，但仍按下方 JSON Schema 输出：
@@ -95,6 +96,7 @@ def analysis_cache_key(
         "base_url": str(config.get("base_url") or "https://api.openai.com/v1").rstrip("/"),
         "quality": getattr(pdf, "quality", "unknown"),
         "coverage": getattr(pdf, "coverage", []),
+        "evidence_hash": hashlib.sha256(json.dumps(_legacy_safe_analysis_chunks(pdf), ensure_ascii=False).encode("utf-8")).hexdigest(),
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -234,6 +236,9 @@ def analyze_paper(
     if cached and cached.complete:
         return cached
     source_hash = getattr(pdf, "hash", "") or hashlib.sha256(str(getattr(pdf, "text", "")).encode("utf-8")).hexdigest()
+    readable_text = str(getattr(pdf, "text", "") or "") or " ".join(str(value) for value in (getattr(pdf, "sections", {}) or {}).values())
+    if not re.sub(r"\[Page\s+\d+\]", "", readable_text).strip():
+        return PaperAnalysis(status="failed", error="未提取到可分析正文，请上传文字型 PDF 或先完成 OCR。", source_hash=source_hash, model=model)
     if not api_key.strip():
         return PaperAnalysis(
             status="failed",
@@ -242,9 +247,23 @@ def analyze_paper(
             model=model,
             version=ANALYSIS_PROMPT_VERSION,
         )
+    chunks: list[str] = []
+    for chunk in _legacy_safe_analysis_chunks(pdf):
+        if chunks and len(chunks[-1]) + len(chunk) + 2 <= 18000:
+            chunks[-1] += "\n\n" + chunk
+        else:
+            chunks.append(chunk)
+    partials: list[PaperAnalysis] = []
+    progress = config.get("progress_callback")
     try:
-        partials: list[PaperAnalysis] = []
-        for chunk in _legacy_safe_analysis_chunks(pdf):
+        for index, chunk in enumerate(chunks):
+            chunk_key = key + f":chunk:{index}:" + hashlib.sha256(chunk.encode("utf-8")).hexdigest()
+            partial = _cached_analysis(cache_mapping, chunk_key)
+            if partial is not None:
+                partials.append(partial)
+                if callable(progress):
+                    progress(index + 1, len(chunks))
+                continue
             raw = call_openai_compatible(
                 api_key=api_key,
                 base_url=base_url,
@@ -253,16 +272,26 @@ def analyze_paper(
                 user_prompt=build_analysis_prompt(paper, pdf, chunk),
                 temperature=0.1,
             )
-            partials.append(paper_analysis_from_payload(parse_json_object(raw), source_hash=source_hash, model=model, require_core=False))
+            partial = paper_analysis_from_payload(parse_json_object(raw), source_hash=source_hash, model=model, require_core=False)
+            partials.append(partial)
+            if cache_mapping is not None:
+                cache_mapping[chunk_key] = partial.to_dict()
+            if callable(progress):
+                progress(index + 1, len(chunks))
         analysis = merge_analyses(partials, source_hash=source_hash, model=model)
+        analysis.completed_chunks = len(chunks)
+        analysis.total_chunks = len(chunks)
     except Exception as exc:
-        if previous_analysis and previous_analysis.complete:
+        if previous_analysis and previous_analysis.complete and previous_analysis.source_hash == source_hash:
             preserved = PaperAnalysis.from_dict(previous_analysis.to_dict())
-            preserved.warnings.append(f"重新分析失败，已保留上一次完整分析：{exc}")
+            preserved.warnings.append("重新分析失败，已保留上一次完整分析：" + friendly_llm_error(exc))
             return preserved
         return PaperAnalysis(
             status="failed",
-            error=f"论文分析失败：{exc}",
+            error="论文分析暂停：" + friendly_llm_error(exc),
+            completed_chunks=len(partials),
+            total_chunks=len(chunks),
+            **{name: [claim for partial in partials for claim in getattr(partial, name)] for name in ANALYSIS_FIELDS},
             source_hash=source_hash,
             model=model,
             version=ANALYSIS_PROMPT_VERSION,

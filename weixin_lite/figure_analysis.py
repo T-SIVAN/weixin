@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import mimetypes
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from typing import Any
 
-from .llm import call_openai_compatible, call_openai_compatible_with_images, parse_json_object
+from .llm import call_openai_compatible, call_openai_compatible_with_images, friendly_llm_error, parse_json_object
 from .models import AnalysisClaim, FigureAnalysis, PaperAnalysis, PaperInput
 from .pdf_reader import compact_text, figure_key
 
@@ -106,7 +107,7 @@ def _four_part_note(
     if model_note.strip():
         # Keep a model's useful prose, but make the required evidence frame
         # explicit so readers can distinguish observation from text evidence.
-        shown = f"{shown}。补充解读：{compact_text(model_note, 700)}"
+        shown = f"{shown}。补充解读：{model_note.strip()}"
     return (
         f"**证据级别：{source_label}**\n\n"
         f"**图展示什么：**{shown}\n\n"
@@ -251,6 +252,18 @@ def _image_inputs(figures: list[FigureAnalysis], image_assets: Mapping[str, Any]
     return inputs
 
 
+def _review_cache_key(paper, analysis, figure, assets, model, base_url) -> str:
+    fingerprint = json.dumps({
+        "version": FIGURE_ANALYSIS_PROMPT_VERSION,
+        "model": model,
+        "base_url": base_url,
+        "crop": figure.crop_bbox,
+        "prompt": _build_prompt(paper, analysis, [figure], visual_review_available=True),
+        "image": hashlib.sha256(assets[figure.image_name]).hexdigest(),
+    }, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+
+
 def analyze_confirmed_figures(
     paper: PaperInput,
     analysis: PaperAnalysis | None,
@@ -278,6 +291,25 @@ def analyze_confirmed_figures(
             figure.vision_status = "blocked"
             figure.vision_error = "最终图表分析需要配置支持视觉输入的 Gemini 模型，并提供确认截图。"
         return []
+    cache = config.get("cache")
+    cache = cache if isinstance(cache, MutableMapping) else {}
+    keys = {}
+    pending = []
+    for figure in confirmed:
+        key = _review_cache_key(paper, analysis, figure, assets, model, base_url)
+        keys[figure.figure_id] = key
+        if key in cache:
+            _apply_payload([figure], cache[key], analysis, visual_reviewed=True)
+            figure.vision_status = "reviewed"
+            figure.vision_error = ""
+        else:
+            # Old interpretations must not certify a changed image or an empty response.
+            figure.interpretation = ""
+            figure.visual_evidence = ""
+            figure.vision_status = "pending"
+            pending.append(figure)
+    if not pending:
+        return confirmed
     try:
         call_kwargs = {
             "api_key": api_key,
@@ -287,23 +319,28 @@ def analyze_confirmed_figures(
             "user_prompt": _build_prompt(
                 paper,
                 analysis,
-                confirmed,
+                pending,
                 visual_review_available=visual_review_available,
             ),
             "temperature": 0.1,
         }
-        raw = call_openai_compatible_with_images(images=images, **call_kwargs)
+        raw = call_openai_compatible_with_images(images=_image_inputs(pending, assets), **call_kwargs)
         payload = parse_json_object(raw)
-        _apply_payload(confirmed, payload, analysis, visual_reviewed=True)
+        _apply_payload(pending, payload, analysis, visual_reviewed=True)
     except Exception as exc:
-        for figure in confirmed:
+        for figure in pending:
             figure.vision_status = "failed"
-            figure.vision_error = f"Gemini 视觉复核失败：{type(exc).__name__}: {exc}"
-        return []
-    for figure in confirmed:
+            figure.vision_error = "Gemini 视觉复核暂停：" + friendly_llm_error(exc)
+        return [figure for figure in confirmed if figure not in pending]
+    for figure in pending:
         if figure.interpretation:
             figure.vision_status = "reviewed"
             figure.vision_error = ""
+            cache[keys[figure.figure_id]] = {"figures": [
+                item for item in payload.get("figures", [])
+                if isinstance(item, dict) and figure_key(item.get("figure_id")) == figure_key(figure.figure_id)
+            ]}
+            cache[_review_cache_key(paper, analysis, figure, assets, model, base_url)] = cache[keys[figure.figure_id]]
         else:
             figure.vision_status = "failed"
             figure.vision_error = "Gemini 未返回可追溯的图表解读。"

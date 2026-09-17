@@ -64,12 +64,17 @@ class PdfContent:
         """Cover all sections in bounded model requests without dropping later pages."""
         prefix = f"Parser: {self.parser or self.parse_mode}\nQuality: {self.quality}; Pages: {self.page_count}"
         captions = "\n".join(f"- {item.figure_id} p.{item.page}: {item.caption}" for item in self.all_figures)
-        sources = self.sections or {"full_text": self.text}
+        # Raw text preserves preambles, repeated section headings and page markers.
+        sources = {"full_text": self.text} if self.text.strip() else dict(self.sections)
+        if captions:
+            sources["figure_table_captions"] = captions
         chunks: list[str] = []
         for name, source in sources.items():
             source = str(source or "").strip()
             for offset in range(0, len(source), max_chars):
-                chunks.append(f"{prefix}\n\n## {name}\n{source[offset:offset + max_chars]}\n\nFigure/Table captions:\n{captions}")
+                pages = re.findall(r"\[Page\s+(\d+)\]", source[:offset], re.I)
+                locator = f"\n[Page {pages[-1]} continued]" if pages else ""
+                chunks.append(f"{prefix}{locator}\n\n## {name}\n{source[offset:offset + max_chars]}")
         return chunks or [prefix]
 
     def prompt_text(self, max_chars: int | None = None) -> str:
@@ -232,8 +237,8 @@ def extract_sections(text: str, max_chars_each: int | None = None) -> dict[str, 
         start = match.end()
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         body = compact_text(text[start:end], max_chars_each) if max_chars_each else text[start:end].strip()
-        if body and name not in sections:
-            sections[name] = body
+        if body:
+            sections[name] = "\n\n".join(part for part in (sections.get(name, ""), body) if part)
     return sections
 
 
@@ -588,6 +593,8 @@ def parse_pdf(pdf_bytes: bytes, mode: str = "auto") -> PdfContent:
             actual_mode = "pypdf"
         except Exception as exc:
             warning_parts.append(f"PDF text extraction failed: {exc}")
+    if not page_count and not text.strip():
+        raise ValueError("无法读取 PDF 页面，请检查文件是否损坏或加密。")
     sections = extract_sections(text)
     all_figures = extract_figure_legends(text)
     evidence = extract_numeric_evidence(text, all_figures)
