@@ -152,6 +152,7 @@ class SearchDiagnostics:
 @dataclass
 class JournalFilter:
     name: str
+    description_zh: str = ""
     aliases: list[str] = field(default_factory=list)
     issn: str = ""
     eissn: str = ""
@@ -176,6 +177,7 @@ class JournalFilter:
     def from_dict(cls, data: dict[str, Any]) -> "JournalFilter":
         return cls(
             name=clean_text(data.get("name")),
+            description_zh=clean_text(data.get("description_zh")),
             aliases=[clean_text(item) for item in data.get("aliases") or [] if clean_text(item)],
             issn=clean_text(data.get("issn")),
             eissn=clean_text(data.get("eissn")),
@@ -293,10 +295,15 @@ def load_journal_filters(path: str | Path = DEFAULT_JOURNALS_PATH) -> list[Journ
     config_path = Path(path)
     data = json.loads(config_path.read_text(encoding="utf-8"))
     raw_items = data.get("journals") if isinstance(data, dict) else data
+    descriptions = data.get("descriptions_zh") if isinstance(data, dict) else {}
+    descriptions = descriptions if isinstance(descriptions, dict) else {}
     if not isinstance(raw_items, list):
         raise SearchError(f"Journal config must contain a list: {config_path}")
     journals = [
-        JournalFilter.from_dict(item)
+        JournalFilter.from_dict({
+            **item,
+            "description_zh": item.get("description_zh") or descriptions.get(clean_text(item.get("name")), ""),
+        })
         for item in raw_items
         if isinstance(item, dict) and clean_text(item.get("name"))
     ]

@@ -66,7 +66,7 @@ def test_load_journal_filters_retains_disabled_and_sorts_by_impact_factor(tmp_pa
                 "journals": [
                     {"name": "Low", "priority": 1, "impact_factor": 5.0, "enabled": True},
                     {"name": "Disabled", "priority": 2, "impact_factor": 20.0, "enabled": False},
-                    {"name": "High", "priority": 3, "impact_factor": 30.0, "enabled": True},
+                    {"name": "High", "description_zh": "综合前沿研究。", "priority": 3, "impact_factor": 30.0, "enabled": True},
                 ]
             }
         ),
@@ -76,6 +76,7 @@ def test_load_journal_filters_retains_disabled_and_sorts_by_impact_factor(tmp_pa
     journals = load_journal_filters(config)
 
     assert [journal.name for journal in journals] == ["High", "Disabled", "Low"]
+    assert journals[0].description_zh == "综合前沿研究。"
     assert journals[1].enabled is False
 
 
@@ -83,13 +84,14 @@ def test_journal_picker_is_sorted_by_impact_factor_and_defaults_to_unchecked():
     rows = app.journal_to_rows(
         [
             JournalFilter(name="Lower", impact_factor=8.0, impact_factor_year=2024),
-            JournalFilter(name="Higher", impact_factor=40.0, impact_factor_year=2024),
+            JournalFilter(name="Higher", description_zh="高影响力综合期刊。", impact_factor=40.0, impact_factor_year=2024),
         ],
         default_enabled=False,
     )
 
     assert [row["期刊"] for row in rows] == ["Higher", "Lower"]
     assert [row["影响因子"] for row in rows] == [40.0, 8.0]
+    assert rows[0]["中文简述"] == "高影响力综合期刊。"
     assert all(row["启用"] is False for row in rows)
 
     rows[0]["启用"] = True
@@ -97,6 +99,15 @@ def test_journal_picker_is_sorted_by_impact_factor_and_defaults_to_unchecked():
     assert journals[0].enabled is True
     assert journals[1].enabled is False
     assert journals[0].impact_factor == 40.0
+    assert journals[0].description_zh == "高影响力综合期刊。"
+
+
+def test_default_journals_all_have_short_chinese_descriptions():
+    journals = load_journal_filters("config/journals.json")
+
+    assert len(journals) == 30
+    assert all(journal.description_zh for journal in journals)
+    assert max(len(journal.description_zh) for journal in journals) <= 40
 
 
 def test_journal_query_builders_include_journal_issn_and_date():

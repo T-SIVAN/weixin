@@ -343,6 +343,7 @@ def journal_to_rows(
         {
             "启用": journal.enabled if default_enabled is None else default_enabled,
             "期刊": journal.name,
+            "中文简述": journal.description_zh,
             "影响因子": journal.impact_factor,
             "JIF年度": journal.impact_factor_year,
             "别名": ", ".join(journal.aliases),
@@ -372,6 +373,7 @@ def rows_to_journals(rows: object) -> list[JournalFilter]:
         journals.append(
             JournalFilter(
                 name=name,
+                description_zh=str(row.get("中文简述") or "").strip(),
                 aliases=[item.strip() for item in str(row.get("别名") or "").split(",") if item.strip()],
                 issn=str(row.get("ISSN") or "").strip(),
                 eissn=str(row.get("EISSN") or "").strip(),
@@ -497,10 +499,11 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
         journal_to_rows(default_journals, default_enabled=False),
         use_container_width=True,
         hide_index=True,
-        column_order=["启用", "期刊", "影响因子", "JIF年度"],
-        disabled=["期刊", "影响因子", "JIF年度", "别名", "ISSN", "EISSN", "出版集团"],
+        column_order=["启用", "期刊", "中文简述", "影响因子", "JIF年度"],
+        disabled=["期刊", "中文简述", "影响因子", "JIF年度", "别名", "ISSN", "EISSN", "出版集团"],
         column_config={
             "启用": st.column_config.CheckboxColumn("启用"),
+            "中文简述": st.column_config.TextColumn("中文简述", width="large"),
             "影响因子": st.column_config.NumberColumn("影响因子", format="%.1f"),
             "JIF年度": st.column_config.NumberColumn("JIF年度", format="%d"),
         },
