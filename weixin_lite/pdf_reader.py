@@ -331,7 +331,9 @@ def choose_key_figures(legends: list[FigureAnalysis], evidence: list[EvidenceIte
         item.why_selected = "该图包含流程、方法、关键结果或验证信息，是支撑单篇解读的高信号图。"
         item.evidence = [ev for ev in evidence if figure_key(ev.figure_id) == figure_key(item.figure_id)][:6]
         item.needs_manual_check = not bool(item.evidence)
-        item.selected = True
+        # Recommendation is not confirmation: only an explicit user action may
+        # send an asset to Gemini or include it in the final article.
+        item.selected = False
         item.order = index
         item.role = _figure_role(item, index)
         item.asset_kind = classify_asset_kind(item)

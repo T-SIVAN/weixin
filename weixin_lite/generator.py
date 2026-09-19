@@ -4,7 +4,7 @@ import html
 import re
 from typing import Any
 
-from .figure_analysis import figure_heading
+from .figure_analysis import FIGURE_ANALYSIS_PROMPT_VERSION, figure_heading
 from .llm import LLMError, call_openai_compatible, parse_json_object
 from .models import FigureAnalysis, PaperAnalysis, PaperInput, QuickReadArticle
 from .pdf_reader import PdfContent, compact_text
@@ -19,9 +19,9 @@ SYSTEM_PROMPT = """你是一个严谨、克制、面向中文读者的公众号�
 写作要求：
 1. 正文只写中文，不做中英对照，不输出 Markdown 代码块。
 2. 按证据强度写作：有全文时可做深度解读；只有题录、摘要或粘贴材料时，只做摘要级/材料级解读，并明确边界。
-3. 必须形成完整长文结构：文章核心要点简述、研究问题与现实意义、方法路径与比较优势、实验设计与验证、关键数据与结果、关键图证据解读、文章的创新意义、局限性与解读边界、总结。
+3. 必须形成清晰结构：文章核心要点简述、研究问题与现实意义、研究方法概述、用户选中图片的关键图解读、文章的创新意义、局限性与解读边界、总结。
 4. 数字、结论、机构、作者和技术细节只能来自题录、摘要、全文、图注、证据或用户提供材料，不得编造。
-5. 有确认配图时，正文图解由系统另行插入；不要自行增加未确认图片或虚构图中细节。
+5. 详细实验数据、趋势和结果只由系统针对用户确认配图另行插入；不要生成独立实验设计或全量数据章节，也不要自行增加未确认图片或虚构图中细节。
 6. 标题不超过 32 个中文字符，digest 不超过 120 字。
 7. 为完整解释证据而写，不设置正文或分析字数上限；每个章节都要使用提供材料中可追溯的细节，避免重复。
 8. 不得写入公众号名称、运营作者、编辑姓名、发布日期、阅读量、联系方式等平台个人或运营信息；论文作者也不作为正文介绍内容。
@@ -99,11 +99,9 @@ PMID：{paper.pmid}
   "title": "不超过32个中文字符的公众号标题",
   "digest": "不超过120字摘要",
   "intro": "导语，交代解读依据和研究主线",
+  "core_points": ["2至4条论文主线要点，不展开具体实验数据"],
   "research_question": "研究目标、现实问题和产业/应用意义",
-  "approach_advantage": ["方法路径、新思路及相对既有方案的优势，每条基于材料"],
-  "experiment_validation": ["实验或验证设计、对照和样本信息"],
-  "quantitative_findings": ["关键定量数据、趋势和结果，每条基于材料"],
-  "figure_notes": [],
+  "method_overview": ["简述方法核心原理、主要流程及相对优势，合计1至3条"],
   "innovation": ["创新意义、启发或价值"],
   "limitations": ["局限性与证据边界"],
   "take_home": "一句话总结"
@@ -122,7 +120,6 @@ def _analysis_claims(analysis: PaperAnalysis) -> str:
         "research_question": "研究问题",
         "background": "背景",
         "methods": "方法",
-        "key_results": "关键结果",
         "innovation": "创新点",
         "limitations": "局限性",
         "conclusion": "结论",
@@ -149,7 +146,7 @@ def build_analysis_article_prompt(
     return f"""
 请根据已经审核为可追溯的结构化分析，生成一篇可直接排版为微信公众号正文的中文深度解读稿。
 篇幅：完整覆盖结构化证据，不设置人为字数上限。
-不得加入结构化分析之外的事实、数字或结论。只使用确认配图，并按给定顺序生成图下注释。
+不得加入结构化分析之外的事实、数字或结论。用户确认配图及其图解由系统按给定顺序插入，不要在 JSON 中生成图下注释。
 不得写入公众号名称、运营作者、编辑姓名、发布日期、阅读量或联系方式；不要生成论文作者介绍。
 
 输出 JSON Schema：
@@ -157,17 +154,15 @@ def build_analysis_article_prompt(
   "title": "不超过32个中文字符的公众号标题",
   "digest": "不超过120字摘要",
   "intro": "导语，交代问题和研究价值",
+  "core_points": ["2至4条研究主线要点，不重复逐图数据"],
   "research_question": "完整说明研究问题、现实痛点与产业/转化意义，必须关联结构化分析证据",
-  "approach_advantage": ["方法、模型或机制及其相对优势，每条用可追溯证据展开"],
-  "experiment_validation": ["实验设计、对照、样本和验证路径，每条用可追溯证据展开"],
-  "quantitative_findings": ["关键数字、趋势、结果及其含义，每条用可追溯证据展开"],
-  "figure_notes": [],
+  "method_overview": ["用1至3条简述方法、模型或机制的核心原理、主要流程及相对优势"],
   "innovation": ["创新意义"],
   "limitations": ["论文局限性和解读边界"],
   "take_home": "总结"
 }}
 
-写作要求：每一节都要写成面向读者的完整段落，而不是一句泛泛概括。可用“p.X”或“Fig. X”标记已有证据位置；没有证据的章节必须说明边界。关键图由系统在对应的“关键图证据解读”部分插入，你无需另行编造图解。
+写作要求：每一节都要写成面向读者的完整段落。方法只做简要概述，不展开实验设计、对照、样本和参数。可用“p.X”标记已有证据位置；没有证据的章节必须说明边界。关键数据、趋势和结果只在系统插入的用户确认图片图解中出现，你无需另行编造图解。
 
 论文：{paper.title_zh or paper.title_en or paper.title}
 期刊：{paper.journal}
@@ -195,8 +190,6 @@ def fallback_article(
     source_text: str = "",
     extra_text: str = "",
 ) -> dict[str, Any]:
-    figures = pdf.legends[:3] if pdf else []
-    evidence = pdf.evidence[:6] if pdf else []
     title = paper.title_zh or paper.title_en or paper.title or paper.doi or paper.pmid or "这篇文章"
     level = source_level(pdf, source_text, extra_text)
     has_manual = bool(source_text.strip() or extra_text.strip())
@@ -213,20 +206,8 @@ def fallback_article(
     else:
         points.append("当前没有摘要、全文或额外正文，因此只能形成题录级导语，不能展开为可靠的深度分析。")
 
-    if evidence:
-        values = "、".join(item.value for item in evidence[:4])
-        points.append(f"全文或图注中可追踪到的关键数据包括：{values}；这些数字应在发布前逐项核对来源。")
-    elif not pdf:
+    if not pdf:
         points.append("当前没有解析到全文证据，文中的判断应限定在题录、摘要或用户粘贴材料范围内。")
-
-    figure_notes = [
-        {
-            "figure_id": fig.figure_id,
-            "heading": f"{fig.figure_id}：原文关键信息截图",
-            "note": "原文截图置于上方，正文只围绕图中可见流程、比较或趋势做简短说明。",
-        }
-        for fig in figures
-    ]
 
     innovation = [
         "把文章中的问题、方法或观察结果整理成中文读者更容易把握的主线。",
@@ -242,10 +223,8 @@ def fallback_article(
         "intro": f"本文解读 {title}。当前依据为{level}；若未提供全文，以下内容属于摘要级或材料级整理，发布前建议核对原文。",
         "core_points": points[:3],
         "research_question": summary,
-        "approach_advantage": ["当前材料不足以可靠展开方法路径和比较优势；需要全文方法与结果部分支持。"],
-        "experiment_validation": ["当前未获得完整实验设计、对照或样本信息，不能把摘要级材料写成实验验证结论。"],
-        "quantitative_findings": points[2:3] or ["当前没有可核对的关键定量数据。"],
-        "figure_notes": figure_notes,
+        "method_overview": ["当前材料仅支持概括研究方法的基本思路，不能展开实验步骤、对照和参数。"],
+        "figure_notes": [],
         "innovation": innovation[:3],
         "limitations": [f"证据边界：当前仅基于{level}，未获得或未完整解析全文时，不应延伸为全文级判断。"],
         "take_home": "这是一篇可开放生成的中文解读稿；材料越完整，结论和图文分析越可靠。",
@@ -280,9 +259,10 @@ def render_markdown(
     # research-question section when the evidence-driven schema has no summary.
     add_section("文章核心要点简述", data.get("core_points"), numbered=True)
     add_section("研究问题与现实意义", data.get("research_question"))
-    add_section("方法路径与比较优势", data.get("approach_advantage"), numbered=True)
-    add_section("实验设计与验证", data.get("experiment_validation"), numbered=True)
-    add_section("关键数据与结果", data.get("quantitative_findings") or data.get("core_points"), numbered=True)
+    method_overview = data.get("method_overview") or data.get("approach_advantage")
+    if isinstance(method_overview, list):
+        method_overview = method_overview[:3]
+    add_section("研究方法概述", method_overview, numbered=True)
     figure_map = {figure.figure_id.lower(): figure for figure in figures}
     if confirmed_figure_notes:
         figure_items = [
@@ -463,7 +443,11 @@ def generate_article(
         figures = [
             figure
             for figure in sorted(confirmed_figures or [], key=lambda item: (item.order or 999, item.figure_id))
-            if figure.selected and figure.vision_status == "reviewed"
+            if (
+                figure.selected
+                and figure.vision_status == "reviewed"
+                and getattr(figure, "review_version", "") == FIGURE_ANALYSIS_PROMPT_VERSION
+            )
         ][:4]
     else:
         figures = list(pdf.legends[:4]) if pdf else []
@@ -485,14 +469,15 @@ def generate_article(
                 ),
             )
             data = parse_json_object(raw)
+            if not data.get("method_overview") and data.get("approach_advantage"):
+                data["method_overview"] = data["approach_advantage"]
             if analysis and not all(
                 data.get(field)
                 for field in (
                     "intro",
+                    "core_points",
                     "research_question",
-                    "approach_advantage",
-                    "experiment_validation",
-                    "quantitative_findings",
+                    "method_overview",
                     "innovation",
                     "limitations",
                     "take_home",

@@ -13,7 +13,7 @@ import streamlit as st
 from PIL import Image
 
 from weixin_lite.downloader import download_open_access
-from weixin_lite.article_analysis import analyze_paper
+from weixin_lite.article_analysis import ANALYSIS_PROMPT_VERSION, analyze_paper
 from weixin_lite.docx_exporter import DocxExportError
 from weixin_lite.exporter import (
     export_article_docx_bytes,
@@ -22,7 +22,7 @@ from weixin_lite.exporter import (
     project_zip,
     unavailable_dois_csv,
 )
-from weixin_lite.figure_analysis import analyze_confirmed_figures
+from weixin_lite.figure_analysis import FIGURE_ANALYSIS_PROMPT_VERSION, analyze_confirmed_figures
 from weixin_lite.generator import ArticleGenerationError, chineseish_len, generate_article, markdown_to_wechat_html
 from weixin_lite.llm import (
     PROVIDERS,
@@ -87,6 +87,7 @@ def crop_image_bytes(data: bytes, horizontal: tuple[int, int], vertical: tuple[i
 
 def invalidate_asset_review(figure, message: str) -> None:
     figure.vision_status = "pending"
+    figure.review_version = ""
     figure.vision_error = message
     figure.visual_evidence = ""
     figure.interpretation = ""
@@ -681,14 +682,17 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
     active_key = paper_key(paper)
     analyses = st.session_state.paper_analyses
     analysis = analyses.get(active_key)
-    if analysis is not None and analysis.source_hash != getattr(pdf, "hash", ""):
+    if analysis is not None and (
+        analysis.source_hash != getattr(pdf, "hash", "")
+        or analysis.version != ANALYSIS_PROMPT_VERSION
+    ):
         analysis = None
         analyses.pop(active_key, None)
     legacy_analysis = st.session_state.single_analysis
     if analysis is None and legacy_analysis is not None:
         legacy_hash = str(getattr(legacy_analysis, "source_hash", "") or "")
         pdf_hash = str(getattr(pdf, "hash", "") or "")
-        if legacy_hash and legacy_hash == pdf_hash:
+        if legacy_hash and legacy_hash == pdf_hash and legacy_analysis.version == ANALYSIS_PROMPT_VERSION:
             analysis = legacy_analysis
             analyses[active_key] = legacy_analysis
     st.caption(f"{getattr(pdf, 'page_count', 0)} 页 · {len(pdf_assets(pdf))} 个候选图表 · {getattr(pdf, 'quality', 'unknown')}")
@@ -698,10 +702,11 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
     if lead and lead.image_name in st.session_state.images:
         with st.expander("论文首页"):
             st.image(st.session_state.images[lead.image_name], width="stretch")
-    st.markdown("#### 1. 全文分析")
-    if st.button("继续分析" if analysis and not analysis.complete else "分析全文", type="primary", disabled=not api_key.strip()):
+    st.markdown("#### 1. 论文概览分析")
+    st.caption("全文阶段只提炼研究主线和简要方法；详细数据与结果只分析您随后勾选的图片。")
+    if st.button("继续概览分析" if analysis and not analysis.complete else "分析论文概览", type="primary", disabled=not api_key.strip()):
         progress = st.progress(0, text="准备全文证据")
-        with st.spinner("正在按章节分析全文证据..."):
+        with st.spinner("正在提炼研究目标、方法概述与创新边界..."):
             analysis = analyze_paper(
                 paper,
                 pdf,
@@ -712,19 +717,26 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
             analyses[active_key] = analysis
             st.session_state.single_analysis = analysis
     if analysis and analysis.complete:
-        st.success("全文结构化分析完成。")
-        with st.expander("查看分析与原文证据"):
-            for field, label in (("research_question", "研究问题"), ("background", "背景与意义"), ("methods", "方法"), ("key_results", "关键结果"), ("innovation", "创新"), ("limitations", "局限性"), ("conclusion", "结论")):
+        st.success("论文概览分析完成。")
+        with st.expander("查看概览与原文证据"):
+            for field, label in (("research_question", "研究问题"), ("background", "背景与意义"), ("methods", "方法概述"), ("innovation", "创新"), ("limitations", "局限性"), ("conclusion", "结论")):
                 st.markdown(f"**{label}**")
                 for claim in getattr(analysis, field):
                     st.markdown(claim.statement)
                     st.caption(f"p.{claim.page} {claim.figure_id} · {claim.evidence_text}")
     elif analysis:
         st.error(analysis.error or "分析未完成。")
-        st.caption(f"已完成 {getattr(analysis, 'completed_chunks', 0)}/{getattr(analysis, 'total_chunks', 0)} 段；保留在本次会话，继续分析时复用。")
+        st.caption(f"已完成 {getattr(analysis, 'completed_chunks', 0)}/{getattr(analysis, 'total_chunks', 0)} 段；保留在本次会话，继续概览分析时复用。")
 
     st.markdown("##### 2. 确认关键图、表格与线路图")
     assets = pdf_assets(pdf)
+    stale_reviews = False
+    for figure in assets:
+        if figure.vision_status == "reviewed" and getattr(figure, "review_version", "") != FIGURE_ANALYSIS_PROMPT_VERSION:
+            invalidate_asset_review(figure, "图解规则已更新，请按三段式重新执行 Gemini 视觉复核。")
+            stale_reviews = True
+    if stale_reviews:
+        st.info("检测到旧版图解，已取消其复核状态；重新复核后才能进入稿件。")
     if not assets:
         st.warning(
             "没有识别到可选图表。常见原因是 PDF 为扫描件、图注排版特殊，或本次会话仍保留旧版解析结果。"
@@ -854,6 +866,7 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
             reviewed = analyze_confirmed_figures(
                 paper, analysis, selected_assets,
                 {**vision_config, "image_assets": st.session_state.images, "cache": st.session_state.vision_cache},
+                pdf=pdf,
             )
         if reviewed:
             st.success(f"已复核 {len(reviewed)} 项资产。")
@@ -861,14 +874,33 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
             st.error("没有资产完成 Gemini 视觉复核；未复核资产不会进入最终稿。")
 
     st.markdown("#### 3. 生成稿件")
-    can_generate = bool(api_key.strip() and analysis and analysis.complete and 1 <= len(selected_assets) <= 4 and all(item.vision_status == "reviewed" for item in selected_assets))
+    can_generate = bool(
+        api_key.strip()
+        and analysis
+        and analysis.complete
+        and 1 <= len(selected_assets) <= 4
+        and all(
+            item.vision_status == "reviewed"
+            and getattr(item, "review_version", "") == FIGURE_ANALYSIS_PROMPT_VERSION
+            for item in selected_assets
+        )
+    )
     if st.button("生成公众号稿", type="primary", disabled=not can_generate):
         if not analysis or not analysis.complete:
-            st.error("请先完成结构化全文分析。")
+            st.error("请先完成论文概览分析。")
         elif not selected_assets:
             st.error("请至少选择 1 张关键图、表格或线路图，并完成 Gemini 视觉复核。")
-        elif any(item.vision_status != "reviewed" for item in selected_assets):
-            pending = "、".join(item.figure_id for item in selected_assets if item.vision_status != "reviewed")
+        elif any(
+            item.vision_status != "reviewed"
+            or getattr(item, "review_version", "") != FIGURE_ANALYSIS_PROMPT_VERSION
+            for item in selected_assets
+        ):
+            pending = "、".join(
+                item.figure_id
+                for item in selected_assets
+                if item.vision_status != "reviewed"
+                or getattr(item, "review_version", "") != FIGURE_ANALYSIS_PROMPT_VERSION
+            )
             st.error(f"以下已选资产尚未完成 Gemini 视觉复核：{pending}。请先执行第 3 步。")
         else:
             try:

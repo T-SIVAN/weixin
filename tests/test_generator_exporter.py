@@ -370,7 +370,7 @@ def test_fallback_article_has_required_chinese_sections():
     assert article.evidence
 
 
-def test_article_places_screenshot_before_short_note():
+def test_article_does_not_render_unconfirmed_screenshot():
     paper = PaperInput(title_en="A test paper", journal="Nature", year="2025")
     figure = FigureAnalysis(
         figure_id="Fig. 3",
@@ -382,10 +382,8 @@ def test_article_places_screenshot_before_short_note():
 
     article = generate_article(paper, pdf=pdf)
 
-    image_pos = article.body_markdown.find("![Fig. 3](images/paper-page-3.png)")
-    note_pos = article.body_markdown.find("**Fig. 3：原文关键信息截图**")
-    assert image_pos >= 0
-    assert note_pos > image_pos
+    assert "![Fig. 3](images/paper-page-3.png)" not in article.body_markdown
+    assert "关键图证据解读" not in article.body_markdown
 
 
 def test_confirmed_figure_analysis_requires_gemini_visual_review():
@@ -444,6 +442,7 @@ def test_confirmed_figures_ignore_unconfirmed_model_figure_notes(monkeypatch):
         selected=True,
         order=1,
         vision_status="reviewed",
+        review_version="figure-analysis-v4-selected-three-part",
         interpretation="确认图解。",
     )
     pdf = PdfContent(
@@ -476,6 +475,24 @@ def test_untraceable_confirmed_figure_is_not_rendered():
     article = generate_article(paper, confirmed_figures=[figure])
 
     assert "fig5.png" not in article.body_markdown
+
+
+def test_old_four_part_review_is_not_rendered_without_rereview():
+    figure = FigureAnalysis(
+        figure_id="Fig. 2",
+        caption="Fig. 2 Result.",
+        page="4",
+        image_name="fig2.png",
+        selected=True,
+        vision_status="reviewed",
+        review_version="figure-analysis-v3",
+        interpretation="旧版四段式图解。",
+    )
+
+    article = generate_article(PaperInput(title_en="A test paper"), confirmed_figures=[figure])
+
+    assert "fig2.png" not in article.body_markdown
+    assert "旧版四段式图解" not in article.body_markdown
 
 
 def test_wechat_markdown_html_matches_reference_style_without_duplicate_title():
@@ -587,6 +604,7 @@ def _complete_analysis() -> PaperAnalysis:
         status="complete",
         source_hash="source-hash",
         model="test-model",
+        version=ANALYSIS_PROMPT_VERSION,
     )
 
 
@@ -611,11 +629,12 @@ def test_analysis_prompt_uses_expert_deep_reading_guide():
         PdfContent(text="[Page 1]\nAbstract\nKey result.", hash="pdf-hash"),
     )
 
-    assert ANALYSIS_PROMPT_VERSION == "paper-analysis-v4-resumable"
+    assert ANALYSIS_PROMPT_VERSION == "paper-analysis-v5-overview"
     assert "世界顶级学术专家" in prompt
     assert "### 论文的研究目标是什么？想要解决什么实际问题？" in prompt
     assert "### 这个问题对于产业发展有什么重要意义？" in prompt
-    assert "### 实验是如何设计的？实验数据和结果如何？" in prompt
+    assert "### 论文采用了什么方法？" in prompt
+    assert "不要整理完整实验清单" in prompt
     assert "blockquote" in prompt
     assert '"research_question"' in prompt
     assert "只返回符合要求的 JSON" in prompt
@@ -657,11 +676,9 @@ def test_quality_generation_uses_one_call_without_hidden_length_repair(monkeypat
                 "title": "可追溯解读",
                 "digest": "摘要",
                 "intro": "导语",
+                "core_points": ["论文主线。"],
                 "research_question": "研究问题来自第一页。",
-                "approach_advantage": ["方法优势来自第三页。"],
-                "experiment_validation": ["验证设计来自第四页。"],
-                "quantitative_findings": ["核心结果来自第五页。"],
-                "figure_notes": [],
+                "method_overview": ["方法概述来自第三页。"],
                 "innovation": ["创新点来自第六页。"],
                 "limitations": ["样本有限。"],
                 "take_home": "总结。",
@@ -679,11 +696,11 @@ def test_quality_generation_uses_one_call_without_hidden_length_repair(monkeypat
     )
 
     assert calls["count"] == 1
-    assert article.analysis_version == "paper-analysis-v3"
+    assert article.analysis_version == ANALYSIS_PROMPT_VERSION
     assert "研究问题与现实意义" in article.body_markdown
-    assert "方法路径与比较优势" in article.body_markdown
-    assert "实验设计与验证" in article.body_markdown
-    assert "关键数据与结果" in article.body_markdown
+    assert "研究方法概述" in article.body_markdown
+    assert "实验设计与验证" not in article.body_markdown
+    assert "关键数据与结果" not in article.body_markdown
     assert "局限性与解读边界" in article.body_markdown
     assert not any("显式补写/精简" in warning for warning in article.warnings)
 

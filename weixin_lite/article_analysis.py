@@ -11,7 +11,7 @@ from .models import AnalysisClaim, PaperAnalysis, PaperInput
 from .pdf_reader import PdfContent
 
 
-ANALYSIS_PROMPT_VERSION = "paper-analysis-v4-resumable"
+ANALYSIS_PROMPT_VERSION = "paper-analysis-v5-overview"
 ANALYSIS_FIELDS = (
     "research_question",
     "background",
@@ -44,40 +44,36 @@ def _legacy_safe_analysis_chunks(pdf: PdfContent, max_chars: int = 18000) -> lis
             chunks.append(f"## {name}\n{value[offset:offset + max_chars]}\n\nFigure/Table captions:\n{captions}")
     return chunks or ["未能从 PDF 中提取正文。"]
 
-ANALYSIS_SYSTEM_PROMPT = """你是该领域的世界顶级学术专家，正在详细阅读并深入解读一篇论文。
-你必须只根据提供的全文、图注和证据提取结论，多引用论文中的细节内容、关键数据和实验结果，帮助中文读者理解论文主线。
+ANALYSIS_SYSTEM_PROMPT = """你是该领域的世界顶级学术专家，正在为中文读者提炼一篇论文的可靠概览。
+你必须只根据提供的全文、图注和证据提取结论，帮助读者理解研究主线，但不要穷举实验、对照、样本、参数或全部定量结果。
 遇到相对新颖或专业的技术概念，首次出现时在 statement 中用 **术语** 标出，并给出通俗解释；学术名词可保留英文补充。
 每一条分析都必须给出原文页码 page 或图号 figure_id，并在 evidence_text 中放入可核对的原文短引文或原文细节；可引用时使用 blockquote 风格的 `> 原文`。
 没有可追溯来源的判断不得输出；材料不足时返回空数组，不得补写常识或生成占位结论。
-总体分析应足够深入，且每类必须至少覆盖一条可追溯证据：研究目标、方法路径、实验/对照设计、关键结果或定量数据、局限性与结论。背景字段要说明现实或产业意义；方法字段需包含方法或模型细节；关键结果字段需包含实验/验证结果，能关联图号时必须关联图号。
+概览必须覆盖研究目标、现实或产业意义、方法原理与主要流程、创新点、局限性和总体结论。methods 只保留 1 至 3 条简要方法概述；key_results 最多保留 1 至 2 条支撑论文总体结论的概括性结果，不展开具体实验和数据，详细结果留给用户选中的图片分析。
 只返回符合要求的 JSON，不要输出 Markdown 代码块。"""
 
 
 ANALYSIS_READING_GUIDE = """
-深度解读要求：
+论文概览要求：
 你现在作为该领域的世界顶级学术专家，想详细阅读并深入这篇论文。
-充分阅读当前证据，不设置人为字数上限；在 JSON 的各字段中分散承载内容。当前分段没有的证据返回空数组，由后续分段合并。
-讲述过程中，请多引用论文中的细节内容、关键数据和实验结果；如果技术概念相对新颖，请给出通俗解释。
+充分阅读当前证据，但输出只保留论文主线。当前分段没有的证据返回空数组，由后续分段合并。
+如果技术概念相对新颖，请给出通俗解释。不要整理完整实验清单，也不要逐项罗列关键数据。
 
-请围绕以下六个三级标题式问题组织分析，但仍按下方 JSON Schema 输出：
+请围绕以下问题组织概览，但仍按下方 JSON Schema 输出：
 ### 论文的研究目标是什么？想要解决什么实际问题？
 对应 research_question；说明论文要解决的核心科学/技术问题，以及现实痛点。
 ### 这个问题对于产业发展有什么重要意义？
 对应 background 或 innovation；分析其对产业、转化、生产、诊疗、平台化或工程应用的价值。
-### 论文提出了哪些新的思路、方法或模型？
-对应 methods 和 innovation；提炼新方法、新模型、新系统或新机制。
-### 跟之前的方法相比有什么特点和优势？
-对应 innovation 和 key_results；尽可能引用对照、性能、效率、成本、准确性、规模化等细节。
-### 论文通过什么实验来验证所提出方法的有效性？
-对应 methods 和 key_results；说明验证路径、关键实验、样本或对照设计。
-### 实验是如何设计的？实验数据和结果如何？
-对应 key_results、limitations 和 conclusion；引用关键数据、实验结果、页码和图号。
+### 论文采用了什么方法？
+对应 methods；只概述核心原理、主要流程和相对优势，不写逐步实验设计、对照、样本或参数清单。
+### 论文的创新、局限与总体结论是什么？
+对应 innovation、limitations 和 conclusion；key_results 只保留少量总体结论，不展开具体数字或全部结果。
 
 格式约束：
 - 使用中文书写，学术名词可以用英文补充。
 - 关键术语首次出现时用 **加粗**。
 - evidence_text 中引用原文时使用 blockquote 风格，例如 `> original sentence`，并保持短引文。
-- 适当关联可用图表；涉及图时必须填写 figure_id。
+- 概览不负责逐图分析；只有确实用于总体结论时才填写 figure_id。
 - 只返回符合要求的 JSON，不要输出 Markdown 代码块。
 """.strip()
 
@@ -104,7 +100,7 @@ def analysis_cache_key(
 
 def build_analysis_prompt(paper: PaperInput, pdf: PdfContent, evidence_chunk: str | None = None) -> str:
     return f"""
-请对下面单篇论文执行完整、可追溯的结构化分析。
+请对下面单篇论文执行简洁、可追溯的结构化概览分析。
 
 论文信息：
 题名：{paper.title_en or paper.title}
@@ -118,8 +114,8 @@ DOI：{paper.doi}
 {{
   "research_question": [{{"statement":"研究问题", "page":"1", "figure_id":"", "evidence_text":"原文证据", "confidence":"high"}}],
   "background": [{{"statement":"背景", "page":"1", "figure_id":"", "evidence_text":"原文证据", "confidence":"medium"}}],
-  "methods": [{{"statement":"方法", "page":"3", "figure_id":"Fig. 1", "evidence_text":"原文证据", "confidence":"high"}}],
-  "key_results": [{{"statement":"关键结果", "page":"5", "figure_id":"Fig. 2", "evidence_text":"原文证据", "confidence":"high"}}],
+  "methods": [{{"statement":"方法概述，不超过三条", "page":"3", "figure_id":"", "evidence_text":"原文证据", "confidence":"high"}}],
+  "key_results": [{{"statement":"支撑总体结论的概括性结果，最多两条", "page":"5", "figure_id":"", "evidence_text":"原文证据", "confidence":"high"}}],
   "innovation": [{{"statement":"创新点", "page":"7", "figure_id":"", "evidence_text":"原文证据", "confidence":"medium"}}],
   "limitations": [{{"statement":"局限性", "page":"8", "figure_id":"", "evidence_text":"原文证据", "confidence":"medium"}}],
   "conclusion": [{{"statement":"结论", "page":"8", "figure_id":"", "evidence_text":"原文证据", "confidence":"high"}}]
@@ -181,7 +177,7 @@ def paper_analysis_from_payload(
         "研究问题": analysis.research_question,
         "现实/产业意义": analysis.background,
         "方法": analysis.methods,
-        "实验设计与关键结果": analysis.key_results,
+        "创新点": analysis.innovation,
         "局限性": analysis.limitations,
         "结论": analysis.conclusion,
     }
@@ -201,8 +197,18 @@ def merge_analyses(analyses: list[PaperAnalysis], *, source_hash: str, model: st
                 if key not in seen:
                     seen.add(key)
                     values[name].append(claim)
+    limits = {
+        "research_question": 3,
+        "background": 3,
+        "methods": 3,
+        "key_results": 2,
+        "innovation": 3,
+        "limitations": 3,
+        "conclusion": 2,
+    }
+    values = {name: claims[: limits[name]] for name, claims in values.items()}
     merged = PaperAnalysis(**values, status="complete", source_hash=source_hash, model=model, version=ANALYSIS_PROMPT_VERSION)
-    required = (merged.research_question, merged.background, merged.methods, merged.key_results, merged.limitations, merged.conclusion)
+    required = (merged.research_question, merged.background, merged.methods, merged.innovation, merged.limitations, merged.conclusion)
     if not all(required):
         raise ValueError("结构化分析缺少完整的可追溯证据，无法生成最终稿。")
     return merged
@@ -242,7 +248,7 @@ def analyze_paper(
     if not api_key.strip():
         return PaperAnalysis(
             status="failed",
-            error="未配置模型 API Key，无法执行全文结构化分析。",
+            error="未配置模型 API Key，无法执行论文概览分析。",
             source_hash=source_hash,
             model=model,
             version=ANALYSIS_PROMPT_VERSION,
@@ -282,13 +288,18 @@ def analyze_paper(
         analysis.completed_chunks = len(chunks)
         analysis.total_chunks = len(chunks)
     except Exception as exc:
-        if previous_analysis and previous_analysis.complete and previous_analysis.source_hash == source_hash:
+        if (
+            previous_analysis
+            and previous_analysis.complete
+            and previous_analysis.source_hash == source_hash
+            and previous_analysis.version == ANALYSIS_PROMPT_VERSION
+        ):
             preserved = PaperAnalysis.from_dict(previous_analysis.to_dict())
             preserved.warnings.append("重新分析失败，已保留上一次完整分析：" + friendly_llm_error(exc))
             return preserved
         return PaperAnalysis(
             status="failed",
-            error="论文分析暂停：" + friendly_llm_error(exc),
+            error="论文概览分析暂停：" + friendly_llm_error(exc),
             completed_chunks=len(partials),
             total_chunks=len(chunks),
             **{name: [claim for partial in partials for claim in getattr(partial, name)] for name in ANALYSIS_FIELDS},

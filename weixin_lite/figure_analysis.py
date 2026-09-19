@@ -3,15 +3,16 @@ from __future__ import annotations
 import json
 import hashlib
 import mimetypes
+import re
 from collections.abc import Mapping, MutableMapping
 from typing import Any
 
 from .llm import call_openai_compatible, call_openai_compatible_with_images, friendly_llm_error, parse_json_object
 from .models import AnalysisClaim, FigureAnalysis, PaperAnalysis, PaperInput
-from .pdf_reader import compact_text, figure_key
+from .pdf_reader import PdfContent, compact_text, figure_key
 
 
-FIGURE_ANALYSIS_PROMPT_VERSION = "figure-analysis-v3"
+FIGURE_ANALYSIS_PROMPT_VERSION = "figure-analysis-v4-selected-three-part"
 ROLE_LABELS = {
     "lead": "论文首页",
     "mechanism": "机制图",
@@ -23,12 +24,12 @@ ROLE_LABELS = {
 
 FIGURE_ANALYSIS_SYSTEM_PROMPT = """你是严谨的科研论文配图解读助手。
 只根据用户提供的图号、页码、图注、全文证据、结构化分析，以及（仅当明确提供）实际图像，为已确认配图生成中文图解。
-每张图的 note 必须包含四个清晰部分：图展示什么、实验或比较如何设计、关键数据或趋势、该图支持的结论与证据边界。
+每张图只返回三个内容部分：overview 说明图展示什么并可用一句话交代必要的方法背景；key_findings 提炼图中可核对的关键数据或趋势；conclusion_boundary 说明图支持的结论和证据边界。不要单列或展开实验设计。
 没有提供图像时，绝不声称看到了曲线、坐标轴、显著性标记或多面板细节；必须标明为“图注/文本证据级解读（未完成视觉复核）”。
 提供图像且完成视觉复核时，也只能描述可见内容和给定证据共同支持的结论，不得补造数值。
-每张图必须返回 figure_id、heading、note、evidence_text、page、visible_elements、visual_evidence。没有证据的图不要编造。
+每张图必须返回 figure_id、heading、overview、key_findings、conclusion_boundary、evidence_text、page、visible_elements、visual_evidence。没有证据的图不要编造。
 当 asset_kind 为 table 时，额外返回 table_headers、table_rows、table_confidence；只能转录确实看得清的单元格，不能猜测缺失数字。
-当 asset_kind 为 scheme 或 flowchart 时，note 必须明确流程步骤、箭头关系、输入和输出；看不清时写明证据边界。
+当 asset_kind 为 scheme 或 flowchart 时，overview 必须明确流程步骤、箭头关系、输入和输出；看不清时写明证据边界。
 只返回 JSON，不要返回 Markdown 代码块。"""
 
 
@@ -69,7 +70,6 @@ def _has_figure_evidence(figure: FigureAnalysis, analysis: PaperAnalysis | None)
 
 def _evidence_parts(figure: FigureAnalysis, analysis: PaperAnalysis | None) -> tuple[str, str, str, str]:
     claims = _claims_for_figure(analysis, figure)
-    evidence = _evidence_text(figure, claims)
     caption = compact_text(figure.caption, 420)
     result_claims = [claim for claim in claims if claim in (analysis.key_results if analysis else [])]
     method_claims = [claim for claim in claims if claim in (analysis.methods if analysis else [])]
@@ -95,25 +95,28 @@ def _evidence_parts(figure: FigureAnalysis, analysis: PaperAnalysis | None) -> t
     return shown, design, trend, boundary
 
 
-def _four_part_note(
+def _three_part_note(
     figure: FigureAnalysis,
     analysis: PaperAnalysis | None,
     *,
     visual_reviewed: bool,
     model_note: str = "",
+    model_findings: str = "",
+    model_boundary: str = "",
 ) -> str:
-    shown, design, trend, boundary = _evidence_parts(figure, analysis)
+    shown, _design, trend, boundary = _evidence_parts(figure, analysis)
     source_label = "视觉复核已完成（Gemini 图像输入）" if visual_reviewed else "图注/文本证据级解读（未完成视觉复核）"
     if model_note.strip():
-        # Keep a model's useful prose, but make the required evidence frame
-        # explicit so readers can distinguish observation from text evidence.
-        shown = f"{shown}。补充解读：{model_note.strip()}"
+        shown = model_note.strip()
+    if model_findings.strip():
+        trend = model_findings.strip()
+    if model_boundary.strip():
+        boundary = model_boundary.strip()
     return (
         f"**证据级别：{source_label}**\n\n"
         f"**图展示什么：**{shown}\n\n"
-        f"**实验或比较如何设计：**{design}\n\n"
         f"**关键数据或趋势：**{trend}\n\n"
-        f"**该图支持的结论与证据边界：**{boundary}"
+        f"**结论与证据边界：**{boundary}"
     )
 
 
@@ -122,7 +125,7 @@ def _fallback_figure_note(figure: FigureAnalysis, analysis: PaperAnalysis | None
         figure.interpretation = ""
         figure.needs_manual_check = True
         return ""
-    figure.interpretation = _four_part_note(figure, analysis, visual_reviewed=False)
+    figure.interpretation = _three_part_note(figure, analysis, visual_reviewed=False)
     figure.needs_manual_check = True
     return figure.interpretation
 
@@ -133,6 +136,7 @@ def _build_prompt(
     figures: list[FigureAnalysis],
     *,
     visual_review_available: bool,
+    pdf: PdfContent | None = None,
 ) -> str:
     items = []
     for figure in figures:
@@ -149,6 +153,7 @@ def _build_prompt(
                 "needs_manual_crop": figure.needs_manual_crop,
                 "asset_kind": figure.asset_kind,
                 "editable_table": figure.editable_table.to_dict() if figure.editable_table else None,
+                "page_context": _page_context(pdf, figure),
             }
         )
     return f"""
@@ -160,13 +165,13 @@ DOI：{paper.doi}
 输出 JSON Schema：
 {{
   "figures": [
-    {{"figure_id":"Fig. 1", "heading":"图文小标题", "note":"中文图解分析", "evidence_text":"可核对证据", "visible_elements":"可见的曲线、坐标轴、箭头或表格结构", "visual_evidence":"图像中可直接观察到的趋势或数值", "page":"1", "table_headers":["列名"], "table_rows":[["单元格"]], "table_confidence":0.0}}
+    {{"figure_id":"Fig. 1", "heading":"图文小标题", "overview":"图展示什么及一句必要的方法背景", "key_findings":"可核对的关键数据或趋势", "conclusion_boundary":"图支持的结论与证据边界", "evidence_text":"可核对证据", "visible_elements":"可见的曲线、坐标轴、箭头或表格结构", "visual_evidence":"图像中可直接观察到的趋势或数值", "page":"1", "table_headers":["列名"], "table_rows":[["单元格"]], "table_confidence":0.0}}
   ]
 }}
 
 要求：
 1. 只分析下面 confirmed_figures 中列出的图。
-2. note 必须分为“图展示什么 / 实验或比较如何设计 / 关键数据或趋势 / 该图支持的结论与证据边界”四部分，每部分均须可由图像或文本证据追溯。
+2. 只填写 overview、key_findings、conclusion_boundary 三部分；不要单列实验设计，方法背景最多一句。
 3. 不要添加图注和证据中没有的数字或实验细节。
 4. 当前视觉复核状态：{'已提供确认图像，可结合图像复核' if visual_review_available else '未提供或不可使用图像；只能基于图注和文本证据，必须明确未完成视觉复核'}。
 5. confidence 低或 needs_manual_crop=true 时，提醒发布前人工核对截图。
@@ -174,6 +179,21 @@ DOI：{paper.doi}
 confirmed_figures：
 {json.dumps(items, ensure_ascii=False, indent=2)}
 """.strip()
+
+
+def _page_context(pdf: PdfContent | None, figure: FigureAnalysis, max_chars: int = 5000) -> str:
+    if pdf is None or not str(getattr(pdf, "text", "") or "").strip():
+        return ""
+    try:
+        page_number = int(figure.page)
+    except (TypeError, ValueError):
+        return ""
+    text = str(pdf.text)
+    match = re.search(
+        rf"(?is)\[Page\s+{page_number}\]\s*(.*?)(?=\[Page\s+\d+\]|\Z)",
+        text,
+    )
+    return compact_text(match.group(1), max_chars) if match else ""
 
 
 def _apply_payload(
@@ -191,7 +211,9 @@ def _apply_payload(
         figure = by_key.get(figure_key(item.get("figure_id")))
         if not figure:
             continue
-        note = str(item.get("note") or item.get("interpretation") or "").strip()
+        note = str(item.get("overview") or item.get("note") or item.get("interpretation") or "").strip()
+        findings = str(item.get("key_findings") or "").strip()
+        boundary = str(item.get("conclusion_boundary") or "").strip()
         page = str(item.get("page") or figure.page or "").strip()
         evidence = str(item.get("evidence_text") or item.get("evidence") or "").strip()
         if not note or not (page or figure.figure_id) or not evidence or not _has_figure_evidence(figure, analysis):
@@ -225,12 +247,15 @@ def _apply_payload(
                     figure.editable_table.headers = normalized_headers
                     figure.editable_table.rows = normalized_rows
                     figure.editable_table.confidence = float(confidence)
-        figure.interpretation = _four_part_note(
+        figure.interpretation = _three_part_note(
             figure,
             analysis,
             visual_reviewed=visual_reviewed,
             model_note=note,
+            model_findings=findings,
+            model_boundary=boundary,
         )
+        figure.review_version = FIGURE_ANALYSIS_PROMPT_VERSION
         figure.needs_manual_check = not visual_reviewed
         applied = True
     return applied
@@ -252,13 +277,13 @@ def _image_inputs(figures: list[FigureAnalysis], image_assets: Mapping[str, Any]
     return inputs
 
 
-def _review_cache_key(paper, analysis, figure, assets, model, base_url) -> str:
+def _review_cache_key(paper, analysis, figure, assets, model, base_url, pdf=None) -> str:
     fingerprint = json.dumps({
         "version": FIGURE_ANALYSIS_PROMPT_VERSION,
         "model": model,
         "base_url": base_url,
         "crop": figure.crop_bbox,
-        "prompt": _build_prompt(paper, analysis, [figure], visual_review_available=True),
+        "prompt": _build_prompt(paper, analysis, [figure], visual_review_available=True, pdf=pdf),
         "image": hashlib.sha256(assets[figure.image_name]).hexdigest(),
     }, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
@@ -269,6 +294,8 @@ def analyze_confirmed_figures(
     analysis: PaperAnalysis | None,
     figures: list[FigureAnalysis],
     model_config: Mapping[str, Any] | None = None,
+    *,
+    pdf: PdfContent | None = None,
 ) -> list[FigureAnalysis]:
     confirmed = [
         figure
@@ -296,16 +323,16 @@ def analyze_confirmed_figures(
     keys = {}
     pending = []
     for figure in confirmed:
-        key = _review_cache_key(paper, analysis, figure, assets, model, base_url)
+        key = _review_cache_key(paper, analysis, figure, assets, model, base_url, pdf)
         keys[figure.figure_id] = key
-        if key in cache:
-            _apply_payload([figure], cache[key], analysis, visual_reviewed=True)
+        if key in cache and _apply_payload([figure], cache[key], analysis, visual_reviewed=True):
             figure.vision_status = "reviewed"
             figure.vision_error = ""
         else:
             # Old interpretations must not certify a changed image or an empty response.
             figure.interpretation = ""
             figure.visual_evidence = ""
+            figure.review_version = ""
             figure.vision_status = "pending"
             pending.append(figure)
     if not pending:
@@ -321,6 +348,7 @@ def analyze_confirmed_figures(
                 analysis,
                 pending,
                 visual_review_available=visual_review_available,
+                pdf=pdf,
             ),
             "temperature": 0.1,
         }
@@ -340,7 +368,7 @@ def analyze_confirmed_figures(
                 item for item in payload.get("figures", [])
                 if isinstance(item, dict) and figure_key(item.get("figure_id")) == figure_key(figure.figure_id)
             ]}
-            cache[_review_cache_key(paper, analysis, figure, assets, model, base_url)] = cache[keys[figure.figure_id]]
+            cache[_review_cache_key(paper, analysis, figure, assets, model, base_url, pdf)] = cache[keys[figure.figure_id]]
         else:
             figure.vision_status = "failed"
             figure.vision_error = "Gemini 未返回可追溯的图表解读。"

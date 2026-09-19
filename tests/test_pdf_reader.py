@@ -37,6 +37,7 @@ def test_choose_key_figures_marks_manual_check_without_data():
 
     assert selected
     assert selected[0].needs_manual_check is True
+    assert selected[0].selected is False
 
 
 def test_extract_extended_supplementary_and_scheme_legends():

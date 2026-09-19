@@ -265,6 +265,7 @@ class FigureAnalysis:
     order: int = 0
     asset_kind: str = "figure"
     vision_status: str = "pending"
+    review_version: str = ""
     vision_error: str = ""
     visual_evidence: str = ""
     editable_table: "EditableTable | None" = None

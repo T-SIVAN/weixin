@@ -134,6 +134,31 @@ def test_visual_review_reuses_images_and_invalidates_changed_bytes(monkeypatch):
     assert len(calls) == 2
 
 
+def test_visual_review_cache_invalidates_changed_selected_page_context(monkeypatch):
+    calls = []
+    def call(**kwargs):
+        calls.append(kwargs["user_prompt"])
+        return json.dumps({"figures": [{
+            "figure_id": "Fig. 1",
+            "overview": "Visible comparison",
+            "key_findings": "Treatment is higher",
+            "conclusion_boundary": "Only this condition is supported",
+            "page": "1",
+            "evidence_text": "control",
+        }]})
+    monkeypatch.setattr("weixin_lite.figure_analysis.call_openai_compatible_with_images", call)
+    figure = FigureAnalysis("Fig. 1", "Treatment compared with control", page="1", selected=True, image_name="figure.png")
+    config = {"provider": "gemini", "api_key": "fake", "model": "gemini-test", "cache": {}, "image_assets": {"figure.png": b"image"}}
+    paper = PaperInput(title_en="Study")
+
+    assert analyze_confirmed_figures(paper, None, [figure], config, pdf=PdfContent(text="[Page 1]\nFIRST_CONTEXT"))
+    assert analyze_confirmed_figures(paper, None, [figure], config, pdf=PdfContent(text="[Page 1]\nFIRST_CONTEXT"))
+    assert len(calls) == 1
+    assert analyze_confirmed_figures(paper, None, [figure], config, pdf=PdfContent(text="[Page 1]\nUPDATED_CONTEXT"))
+    assert len(calls) == 2
+    assert "UPDATED_CONTEXT" in calls[-1]
+
+
 def test_translation_quota_stops_batch_fanout(monkeypatch, tmp_path):
     calls = []
     def call(**kwargs):
@@ -204,7 +229,7 @@ def test_paper_workspace_without_key_blocks_model_actions():
     at.session_state["workspace-page"] = "论文分析"
     at.run()
     assert not at.exception
-    for label in ("分析全文", "复核选中图表", "生成公众号稿"):
+    for label in ("分析论文概览", "复核选中图表", "生成公众号稿"):
         assert next(button for button in at.button if button.label == label).disabled
 
 
@@ -249,11 +274,10 @@ def simulated_article(monkeypatch):
     monkeypatch.setattr("weixin_lite.figure_analysis.call_openai_compatible_with_images", lambda **_: json.dumps({
         "figures": [{"figure_id": figure.figure_id, "note": detailed_note, "page": "2", "evidence_text": "90% conversion"}]}))
     confirmed = analyze_confirmed_figures(paper, analysis, [figure], {
-        "api_key": "fake", "provider": "gemini", "image_assets": pdf.rendered_images, "cache": {}})
+        "api_key": "fake", "provider": "gemini", "image_assets": pdf.rendered_images, "cache": {}}, pdf=pdf)
     assert confirmed and "最后一段仍保留" in figure.interpretation
     article_payload = {name: "有证据的测试内容。" for name in (
-        "intro", "research_question", "approach_advantage", "experiment_validation", "quantitative_findings",
-        "innovation", "limitations", "take_home")}
+        "intro", "research_question", "method_overview", "innovation", "limitations", "take_home")}
     article_payload.update(title="本地流程测试稿", digest="用于验证导出链路的合成测试样例。", core_points=["已核对数据。"])
     monkeypatch.setattr("weixin_lite.generator.call_openai_compatible", lambda **_: json.dumps(article_payload))
     article = generate_article(paper, pdf, api_key="fake", analysis=analysis, confirmed_figures=confirmed)
