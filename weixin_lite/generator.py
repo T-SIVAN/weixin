@@ -140,7 +140,11 @@ def build_analysis_article_prompt(
     target_chars: int | None = None,
 ) -> str:
     figure_lines = [
-        f"- {item.figure_id} | role={item.role} | page={item.page} | caption={item.caption}"
+        (
+            f"- {item.figure_id} | role={item.role} | page={item.page} | "
+            f"evidence_mode={'Gemini视觉复核' if item.vision_status == 'reviewed' else '图注/正文文本证据'} | "
+            f"caption={item.caption}"
+        )
         for item in figures
     ]
     return f"""
@@ -421,6 +425,7 @@ def generate_article(
     target_profile: str = "adaptive",
     image_assets: dict[str, bytes] | None = None,
     provider: str = "",
+    allow_text_evidence_figures: bool = False,
 ) -> QuickReadArticle:
     warnings: list[str] = []
     level = source_level(pdf, source_text, extra_text)
@@ -445,10 +450,22 @@ def generate_article(
             for figure in sorted(confirmed_figures or [], key=lambda item: (item.order or 999, item.figure_id))
             if (
                 figure.selected
-                and figure.vision_status == "reviewed"
                 and getattr(figure, "review_version", "") == FIGURE_ANALYSIS_PROMPT_VERSION
+                and (
+                    figure.vision_status == "reviewed"
+                    or (allow_text_evidence_figures and figure.vision_status == "text_evidence")
+                )
             )
         ][:4]
+        text_evidence_ids = [
+            figure.figure_id for figure in figures if figure.vision_status == "text_evidence"
+        ]
+        if text_evidence_ids:
+            warnings.append(
+                "以下图片跳过了 Gemini 视觉复核，仅按图注和正文证据生成图解，发布前请人工核对："
+                + "、".join(text_evidence_ids)
+                + "。"
+            )
     else:
         figures = list(pdf.legends[:4]) if pdf else []
 

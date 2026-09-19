@@ -495,6 +495,31 @@ def test_old_four_part_review_is_not_rendered_without_rereview():
     assert "旧版四段式图解" not in article.body_markdown
 
 
+def test_text_evidence_figure_is_rendered_only_with_explicit_opt_in():
+    figure = FigureAnalysis(
+        figure_id="Fig. 2",
+        caption="Fig. 2 Result.",
+        page="4",
+        image_name="fig2.png",
+        selected=True,
+        vision_status="text_evidence",
+        review_version="figure-analysis-v4-selected-three-part",
+        interpretation="图注/文本证据级解读（未完成视觉复核）。",
+    )
+
+    blocked = generate_article(PaperInput(title_en="A test paper"), confirmed_figures=[figure])
+    allowed = generate_article(
+        PaperInput(title_en="A test paper"),
+        confirmed_figures=[figure],
+        allow_text_evidence_figures=True,
+    )
+
+    assert "fig2.png" not in blocked.body_markdown
+    assert "![Fig. 2](images/fig2.png)" in allowed.body_markdown
+    assert "未完成视觉复核" in allowed.body_markdown
+    assert any("人工核对" in warning for warning in allowed.warnings)
+
+
 def test_wechat_markdown_html_matches_reference_style_without_duplicate_title():
     markdown = """# 平台标题
 

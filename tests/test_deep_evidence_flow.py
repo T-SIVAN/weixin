@@ -3,7 +3,7 @@ import json
 import pytest
 
 from weixin_lite.article_analysis import analyze_paper, build_analysis_prompt, paper_analysis_from_payload
-from weixin_lite.figure_analysis import analyze_confirmed_figures
+from weixin_lite.figure_analysis import analyze_confirmed_figures, prepare_text_evidence_figures
 from weixin_lite.generator import build_prompt, render_markdown
 from weixin_lite.models import AnalysisClaim, FigureAnalysis, PaperAnalysis, PaperInput
 from weixin_lite.pdf_reader import PdfContent
@@ -112,6 +112,31 @@ def test_confirmed_assets_require_gemini_visual_review_before_rendering():
     assert figures == []
     assert confirmed.vision_status == "blocked"
     assert "Gemini" in confirmed.vision_error
+
+
+def test_selected_asset_can_use_explicit_text_evidence_fallback():
+    selected = FigureAnalysis(
+        "Fig. 2",
+        "Fig. 2 reports 90% conversion for the treatment group.",
+        page="4",
+        image_name="selected.png",
+        selected=True,
+    )
+    skipped = FigureAnalysis(
+        "Fig. 3",
+        "Fig. 3 control.",
+        page="5",
+        image_name="skipped.png",
+        selected=False,
+    )
+
+    figures = prepare_text_evidence_figures(_analysis(), [selected, skipped])
+
+    assert figures == [selected]
+    assert selected.vision_status == "text_evidence"
+    assert "未完成视觉复核" in selected.interpretation
+    assert "图展示什么" in selected.interpretation
+    assert "人工核对" in selected.vision_error
 
 
 def test_gemini_vision_receives_only_confirmed_image_bytes(monkeypatch):

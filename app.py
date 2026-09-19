@@ -22,7 +22,11 @@ from weixin_lite.exporter import (
     project_zip,
     unavailable_dois_csv,
 )
-from weixin_lite.figure_analysis import FIGURE_ANALYSIS_PROMPT_VERSION, analyze_confirmed_figures
+from weixin_lite.figure_analysis import (
+    FIGURE_ANALYSIS_PROMPT_VERSION,
+    analyze_confirmed_figures,
+    prepare_text_evidence_figures,
+)
 from weixin_lite.generator import ArticleGenerationError, chineseish_len, generate_article, markdown_to_wechat_html
 from weixin_lite.llm import (
     PROVIDERS,
@@ -743,7 +747,11 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
             "请重新上传并解析 PDF，或在下方手动添加截图。"
         )
     for index, figure in enumerate(assets, start=1):
-        with st.expander(f"{figure.figure_id} · p.{figure.page} · {'已复核' if figure.vision_status == 'reviewed' else '待复核'}", expanded=False):
+        review_label = {
+            "reviewed": "已复核",
+            "text_evidence": "文本证据直出",
+        }.get(figure.vision_status, "待复核")
+        with st.expander(f"{figure.figure_id} · p.{figure.page} · {review_label}", expanded=False):
             figure.selected = st.checkbox("选入最终稿", value=figure.selected, key=f"asset-select-{paper_key(paper)}-{index}")
             figure.order = st.number_input("顺序", 1, max(4, len(assets)), min(max(1, int(figure.order or index)), max(4, len(assets))), key=f"asset-order-{paper_key(paper)}-{index}")
             st.caption(figure.caption[:900])
@@ -793,6 +801,9 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
                 st.caption(f"可编辑表格候选：{len(figure.editable_table.rows)} 行；置信度 {figure.editable_table.confidence:.2f}")
             if figure.vision_status == "reviewed" and figure.interpretation:
                 st.success("Gemini 视觉复核完成")
+                st.markdown(figure.interpretation)
+            elif figure.vision_status == "text_evidence" and figure.interpretation:
+                st.info("已按图注和正文证据生成，未完成视觉复核")
                 st.markdown(figure.interpretation)
             if figure.vision_error:
                 st.warning(figure.vision_error)
@@ -861,7 +872,8 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
     if len(selected_assets) > 4:
         st.warning("每篇最多确认 4 个关键图表，请取消多余选择。")
     vision_config = st.session_state.get("vision_config", {})
-    if st.button("复核选中图表", disabled=not analysis or not analysis.complete or not 1 <= len(selected_assets) <= 4 or not vision_config.get("api_key")):
+    review_col, direct_col = st.columns(2)
+    if review_col.button("复核选中图表", disabled=not analysis or not analysis.complete or not 1 <= len(selected_assets) <= 4 or not vision_config.get("api_key")):
         with st.spinner("正在复核图中曲线、表格、箭头关系与关键数据..."):
             reviewed = analyze_confirmed_figures(
                 paper, analysis, selected_assets,
@@ -878,6 +890,46 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
             st.success(f"已复核 {len(reviewed)} 项资产。")
         else:
             st.error("没有资产完成 Gemini 视觉复核；未复核资产不会进入最终稿。")
+
+    direct_ready = bool(
+        api_key.strip()
+        and analysis
+        and analysis.complete
+        and 1 <= len(selected_assets) <= 4
+    )
+    if direct_col.button(
+        "跳过复核，直接生成",
+        type="primary",
+        disabled=not direct_ready,
+        help="不调用 Gemini 视觉模型，仅依据图注、对应页正文和论文概览生成图解。",
+    ):
+        prepared = prepare_text_evidence_figures(analysis, selected_assets)
+        if len(prepared) != len(selected_assets):
+            missing = "、".join(item.figure_id for item in selected_assets if item not in prepared)
+            st.error(f"以下图片缺少图注或正文证据，无法直接生成：{missing}。")
+        else:
+            try:
+                article = generate_article(
+                    paper,
+                    pdf,
+                    api_key,
+                    base_url,
+                    model,
+                    analysis=analysis,
+                    confirmed_figures=prepared,
+                    image_assets=st.session_state.images,
+                    provider=provider,
+                    allow_text_evidence_figures=True,
+                )
+                article = deepcopy(article)
+                st.session_state.articles = [article] + [
+                    item for item in st.session_state.articles
+                    if paper_key(item.paper) != active_key
+                ]
+                st.success("已跳过 Gemini 视觉复核并生成稿件；发布前请人工核对图片细节。")
+            except ArticleGenerationError as exc:
+                st.error(str(exc))
+    st.caption("Gemini 不可用时可直接生成；直出图解只使用图注和正文证据，不会推测图片中的曲线、坐标或数值。")
 
     st.markdown("#### 3. 生成稿件")
     can_generate = bool(

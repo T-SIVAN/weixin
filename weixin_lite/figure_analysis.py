@@ -289,6 +289,34 @@ def _review_cache_key(paper, analysis, figure, assets, model, base_url, pdf=None
     return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
 
 
+def prepare_text_evidence_figures(
+    analysis: PaperAnalysis | None,
+    figures: list[FigureAnalysis],
+) -> list[FigureAnalysis]:
+    """Prepare selected figures from captions and text when vision is unavailable."""
+    prepared: list[FigureAnalysis] = []
+    selected = [figure for figure in figures if figure.selected and figure.image_name]
+    for figure in sorted(selected, key=lambda item: (item.order or 999, item.figure_id))[:4]:
+        if (
+            figure.vision_status == "reviewed"
+            and figure.review_version == FIGURE_ANALYSIS_PROMPT_VERSION
+            and figure.interpretation
+        ):
+            prepared.append(figure)
+            continue
+        if not _fallback_figure_note(figure, analysis):
+            figure.vision_status = "blocked"
+            figure.review_version = ""
+            figure.vision_error = "缺少可追溯的图注或正文证据，无法直接生成该图解。"
+            continue
+        figure.vision_status = "text_evidence"
+        figure.review_version = FIGURE_ANALYSIS_PROMPT_VERSION
+        figure.visual_evidence = ""
+        figure.vision_error = "已跳过 Gemini 视觉复核；图解仅基于图注和正文证据，图片细节需人工核对。"
+        prepared.append(figure)
+    return prepared
+
+
 def analyze_confirmed_figures(
     paper: PaperInput,
     analysis: PaperAnalysis | None,
