@@ -325,7 +325,7 @@ def test_provider_defaults_are_configured():
     assert default_base_url("gemini") == "https://generativelanguage.googleapis.com/v1beta/openai"
     assert default_model("gemini") == "gemini-2.5-flash"
     assert default_base_url("deepseek") == "https://api.deepseek.com/v1"
-    assert default_model("deepseek") == "deepseek-chat"
+    assert default_model("deepseek") == "deepseek-flash"
     assert default_base_url("siliconflow") == "https://api.siliconflow.cn/v1"
 
 

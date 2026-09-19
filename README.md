@@ -28,7 +28,7 @@
 $env:LLM_PROVIDER="deepseek"
 $env:OPENAI_API_KEY="your-key"
 $env:OPENAI_BASE_URL="https://api.deepseek.com/v1"
-$env:OPENAI_MODEL="deepseek-chat"
+$env:OPENAI_MODEL="deepseek-flash"
 ```
 
 也兼容：
@@ -46,6 +46,8 @@ $env:LLM_MODEL="your-model"
 全文分析按块保存成功结果，同一会话内可继续失败阶段；图表复核按图片、裁剪和模型缓存。刷新页面或重启服务可能清空这些会话缓存，并非持久化任务队列。模型失败时保留原文、已完成分析和图片，不把失败包装成完成稿。
 
 翻译只处理标题。摘要详情保留英文原文，不会发送给模型，也不会写入 `abstract_zh`。
+
+DeepSeek 默认使用官方当前模型名 `deepseek-flash`（DeepSeek V4.1 Flash）。模型字段仍可手动改为 `deepseek-v4-pro`；旧的 `deepseek-chat` 和 `deepseek-reasoner` 不再作为默认值。
 
 ## 每日顶刊检索
 

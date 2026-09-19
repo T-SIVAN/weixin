@@ -49,7 +49,7 @@ PROVIDERS: dict[str, ProviderConfig] = {
         "https://generativelanguage.googleapis.com/v1beta/openai",
         "gemini-2.5-flash",
     ),
-    "deepseek": ProviderConfig("deepseek", "DeepSeek", "https://api.deepseek.com/v1", "deepseek-chat"),
+    "deepseek": ProviderConfig("deepseek", "DeepSeek", "https://api.deepseek.com/v1", "deepseek-flash"),
     "siliconflow": ProviderConfig("siliconflow", "SiliconFlow", "https://api.siliconflow.cn/v1", "Qwen/Qwen2.5-7B-Instruct"),
     "custom": ProviderConfig("custom", "Custom OpenAI-compatible", "", ""),
 }
