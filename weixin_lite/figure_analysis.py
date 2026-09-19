@@ -306,6 +306,10 @@ def analyze_confirmed_figures(
         return []
 
     config = model_config or {}
+    if pdf is None:
+        configured_pdf = config.get("pdf")
+        if configured_pdf is not None:
+            pdf = configured_pdf
     api_key = str(config.get("api_key") or "")
     base_url = str(config.get("base_url") or "https://api.openai.com/v1")
     model = str(config.get("model") or "gpt-4o-mini")

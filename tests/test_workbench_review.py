@@ -148,13 +148,21 @@ def test_visual_review_cache_invalidates_changed_selected_page_context(monkeypat
         }]})
     monkeypatch.setattr("weixin_lite.figure_analysis.call_openai_compatible_with_images", call)
     figure = FigureAnalysis("Fig. 1", "Treatment compared with control", page="1", selected=True, image_name="figure.png")
-    config = {"provider": "gemini", "api_key": "fake", "model": "gemini-test", "cache": {}, "image_assets": {"figure.png": b"image"}}
+    config = {
+        "provider": "gemini",
+        "api_key": "fake",
+        "model": "gemini-test",
+        "cache": {},
+        "image_assets": {"figure.png": b"image"},
+        "pdf": PdfContent(text="[Page 1]\nFIRST_CONTEXT"),
+    }
     paper = PaperInput(title_en="Study")
 
-    assert analyze_confirmed_figures(paper, None, [figure], config, pdf=PdfContent(text="[Page 1]\nFIRST_CONTEXT"))
-    assert analyze_confirmed_figures(paper, None, [figure], config, pdf=PdfContent(text="[Page 1]\nFIRST_CONTEXT"))
+    assert analyze_confirmed_figures(paper, None, [figure], config)
+    assert analyze_confirmed_figures(paper, None, [figure], config)
     assert len(calls) == 1
-    assert analyze_confirmed_figures(paper, None, [figure], config, pdf=PdfContent(text="[Page 1]\nUPDATED_CONTEXT"))
+    config["pdf"] = PdfContent(text="[Page 1]\nUPDATED_CONTEXT")
+    assert analyze_confirmed_figures(paper, None, [figure], config)
     assert len(calls) == 2
     assert "UPDATED_CONTEXT" in calls[-1]
 

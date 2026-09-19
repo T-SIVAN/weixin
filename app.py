@@ -865,8 +865,14 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
         with st.spinner("正在复核图中曲线、表格、箭头关系与关键数据..."):
             reviewed = analyze_confirmed_figures(
                 paper, analysis, selected_assets,
-                {**vision_config, "image_assets": st.session_state.images, "cache": st.session_state.vision_cache},
-                pdf=pdf,
+                {
+                    **vision_config,
+                    "image_assets": st.session_state.images,
+                    "cache": st.session_state.vision_cache,
+                    # Keep this inside the existing config object so a Streamlit
+                    # hot reload can still call an older imported function.
+                    "pdf": pdf,
+                },
             )
         if reviewed:
             st.success(f"已复核 {len(reviewed)} 项资产。")
