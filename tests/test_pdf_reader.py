@@ -5,6 +5,7 @@ from weixin_lite.pdf_reader import (
     PdfContent,
     adjust_crop_bbox,
     build_figure_crops,
+    build_visual_page_candidates,
     choose_key_figures,
     extract_figure_legends,
     extract_numeric_evidence,
@@ -56,6 +57,39 @@ def test_extract_extended_supplementary_and_scheme_legends():
         "Scheme 1",
     ]
     assert [item.page for item in legends] == ["8", "9", "10"]
+
+
+def test_extract_markdown_decorated_figure_legend():
+    text = "[Page 4]\n- **Fig. 3 | Treatment increased signal by 72%.**"
+
+    legends = extract_figure_legends(text)
+
+    assert len(legends) == 1
+    assert legends[0].figure_id == "Fig. 3"
+    assert legends[0].page == "4"
+
+
+def test_visual_page_candidates_keep_captionless_pdf_selectable():
+    fitz = pytest.importorskip("fitz")
+    document = fitz.open()
+    first = document.new_page(width=300, height=400)
+    first.insert_text((30, 50), "Title page")
+    second = document.new_page(width=300, height=400)
+    for offset in range(6):
+        second.draw_rect(
+            fitz.Rect(30 + offset * 35, 70, 55 + offset * 35, 260),
+            color=(0.1, 0.4, 0.7),
+            fill=(0.7, 0.8, 0.9),
+        )
+    pdf_bytes = document.tobytes()
+
+    candidates, images = build_visual_page_candidates(pdf_bytes, "digest")
+
+    assert len(candidates) == 1
+    assert candidates[0].page == "2"
+    assert candidates[0].selected is False
+    assert candidates[0].needs_manual_crop is True
+    assert candidates[0].image_name in images
 
 
 def test_parse_pdf_auto_falls_back_to_pypdf(monkeypatch):

@@ -10,9 +10,9 @@ from .models import EditableTable, EvidenceItem, FigureAnalysis
 
 
 FIGURE_MARKER_RE = re.compile(
-    r"(?im)^\s*((?:(?:extended\s+data|supplementary)\s+)?"
+    r"(?im)^[ \t]*(?:[-*#>]\s*)?(?:\*\*|__)?\s*((?:(?:extended\s+data|supplementary)\s+)?"
     r"(?:fig(?:ure)?\.?|scheme|table)\s*[A-Za-z]?\d+[A-Za-z]?)"
-    r"\s*[\s:.,;\-\u2013\u2014]+"
+    r"\s*(?:\*\*|__)?\s*[\s:.,;|\-\u2013\u2014]+"
 )
 NUMERIC_RE = re.compile(
     r"(?i)(?:\b\d+(?:\.\d+)?\s*(?:%|bp|nt|kb|Mb|nM|uM|\u00b5M|mM|M|mg/L|g/L|"
@@ -529,6 +529,98 @@ def build_figure_crops(pdf_bytes: bytes, figures: list[FigureAnalysis], digest: 
     return lead, images
 
 
+def build_visual_page_candidates(
+    pdf_bytes: bytes,
+    digest: str,
+    max_figures: int = 4,
+) -> tuple[list[FigureAnalysis], dict[str, bytes]]:
+    """Offer selectable page previews when captions cannot be parsed reliably."""
+    try:
+        import fitz
+    except ImportError:
+        return [], {}
+
+    try:
+        document = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:
+        return [], {}
+    ranked: list[tuple[float, int, str]] = []
+    for page_index in range(1, document.page_count):
+        page = document.load_page(page_index)
+        page_area = max(1.0, page.rect.width * page.rect.height)
+        image_area = 0.0
+        large_images = 0
+        for info in page.get_image_info():
+            rect = fitz.Rect(info.get("bbox"))
+            ratio = max(0.0, rect.width * rect.height / page_area)
+            image_area += min(ratio, 1.0)
+            if ratio >= 0.025:
+                large_images += 1
+
+        drawing_area = 0.0
+        drawing_count = 0
+        for drawing in page.get_drawings():
+            rect = fitz.Rect(drawing.get("rect"))
+            ratio = max(0.0, rect.width * rect.height / page_area)
+            if ratio >= 0.002:
+                drawing_area += min(ratio, 0.35)
+                drawing_count += 1
+
+        page_text = page.get_text("text") or ""
+        caption_hint = bool(
+            re.search(
+                r"(?im)(?:^|\n)\s*(?:fig(?:ure)?\.?|scheme|table)\s*[A-Za-z]?\d+[A-Za-z]?\b",
+                page_text,
+            )
+        )
+        score = min(image_area, 2.5) * 5 + min(large_images, 6) * 1.2
+        score += min(drawing_area, 1.5) * 2 + min(drawing_count, 20) * 0.12
+        score += 5.0 if caption_hint else 0.0
+        if score >= 1.0:
+            ranked.append((score, page_index + 1, page_text))
+
+    candidates: list[FigureAnalysis] = []
+    images: dict[str, bytes] = {}
+    for order, (_score, page_number, page_text) in enumerate(
+        sorted(ranked, key=lambda item: (-item[0], item[1]))[:max_figures],
+        start=1,
+    ):
+        name = f"{digest}-page-candidate-{page_number}.png"
+        try:
+            images[name] = render_pdf_crop(pdf_bytes, page_number, (0.0, 0.0, 1.0, 1.0))
+        except Exception:
+            continue
+        hint = re.search(
+            r"(?im)^\s*((?:fig(?:ure)?\.?|scheme|table)\s*[A-Za-z]?\d+[A-Za-z]?)\s*[:.,;|\-\u2013\u2014]*\s*(.{0,280})",
+            page_text,
+        )
+        label = normalize_figure_id(hint.group(1)) if hint else f"第 {page_number} 页候选"
+        caption = (
+            trim_caption(f"{label} {hint.group(2)}", 420)
+            if hint
+            else f"第 {page_number} 页包含较多图片或矢量元素；未识别到可靠图注，请人工选择并裁剪。"
+        )
+        candidates.append(
+            FigureAnalysis(
+                figure_id=label,
+                caption=caption,
+                page=str(page_number),
+                image_name=name,
+                page_image_name=name,
+                why_selected="自动图注识别失败后，按页面图形密度推荐的整页候选。",
+                needs_manual_check=True,
+                needs_manual_crop=True,
+                crop_bbox=(0.0, 0.0, 1.0, 1.0),
+                confidence=0.35,
+                role=_figure_role(FigureAnalysis(label, caption), order),
+                selected=False,
+                order=order,
+                asset_kind="figure",
+            )
+        )
+    return candidates, images
+
+
 def render_key_pages(pdf_bytes: bytes, figures: list[FigureAnalysis], max_pages: int = 4) -> dict[str, bytes]:
     digest = hashlib.sha1(pdf_bytes).hexdigest()[:10]
     images: dict[str, bytes] = {}
@@ -626,6 +718,14 @@ def parse_pdf(pdf_bytes: bytes, mode: str = "auto") -> PdfContent:
                     figure.crop_bbox = (0.0, 0.0, 1.0, 1.0)
                     figure.confidence = 0.3
                     figure.needs_manual_crop = True
+        if not selected:
+            fallback_assets, fallback_images = build_visual_page_candidates(pdf_bytes, digest[:12])
+            if fallback_assets:
+                selected = fallback_assets
+                rendered.update(fallback_images)
+                warning_parts.append(
+                    "未识别到可靠图注，已按页面图形密度生成整页候选；请选择并裁剪后再复核。"
+                )
     coverage, quality = _coverage_and_quality(text, sections, page_count)
     if quality == "low":
         warning_parts.append("PDF text coverage is low; scanned pages may require OCR or visual review.")

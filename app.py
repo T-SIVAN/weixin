@@ -37,6 +37,7 @@ from weixin_lite.llm import (
 from weixin_lite.models import (
     BatchProject,
     DownloadedPaper,
+    FigureAnalysis,
     PaperInput,
     QuickReadArticle,
     SearchRun,
@@ -93,8 +94,10 @@ def invalidate_asset_review(figure, message: str) -> None:
 
 def pdf_assets(pdf: PdfContent) -> list:
     """Support Streamlit sessions restored from PdfContent versions before assets."""
-    assets = getattr(pdf, "assets", None)
-    return list(assets if assets is not None else getattr(pdf, "legends", []) or [])
+    legends = getattr(pdf, "legends", None)
+    if legends is not None:
+        return list(legends)
+    return list(getattr(pdf, "assets", []) or [])
 
 
 def build_project_zip_download(
@@ -722,6 +725,11 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
 
     st.markdown("##### 2. 确认关键图、表格与线路图")
     assets = pdf_assets(pdf)
+    if not assets:
+        st.warning(
+            "没有识别到可选图表。常见原因是 PDF 为扫描件、图注排版特殊，或本次会话仍保留旧版解析结果。"
+            "请重新上传并解析 PDF，或在下方手动添加截图。"
+        )
     for index, figure in enumerate(assets, start=1):
         with st.expander(f"{figure.figure_id} · p.{figure.page} · {'已复核' if figure.vision_status == 'reviewed' else '待复核'}", expanded=False):
             figure.selected = st.checkbox("选入最终稿", value=figure.selected, key=f"asset-select-{paper_key(paper)}-{index}")
@@ -776,6 +784,63 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
                 st.markdown(figure.interpretation)
             if figure.vision_error:
                 st.warning(figure.vision_error)
+    with st.expander("手动添加图表截图", expanded=not assets):
+        manual_image = st.file_uploader(
+            "上传图、表格或线路图截图",
+            type=["png", "jpg", "jpeg"],
+            key=f"asset-manual-image-{active_key}",
+        )
+        manual_col_a, manual_col_b = st.columns(2)
+        manual_id = manual_col_a.text_input(
+            "图号或名称",
+            value=f"手动图 {len(assets) + 1}",
+            key=f"asset-manual-id-{active_key}",
+        )
+        manual_page = manual_col_b.number_input(
+            "所在页码",
+            min_value=1,
+            max_value=max(1, int(getattr(pdf, "page_count", 1) or 1)),
+            value=1,
+            key=f"asset-manual-page-{active_key}",
+        )
+        manual_caption = st.text_area(
+            "图注或说明（可选）",
+            key=f"asset-manual-caption-{active_key}",
+            height=90,
+        )
+        if st.button(
+            "添加为候选",
+            disabled=manual_image is None or not manual_id.strip(),
+            key=f"asset-manual-add-{active_key}",
+        ):
+            try:
+                manual_data = crop_image_bytes(manual_image.getvalue(), (0, 100), (0, 100))
+                manual_name = (
+                    f"manual-{active_key}-{hashlib.sha256(manual_data).hexdigest()[:12]}.png"
+                )
+                figure = FigureAnalysis(
+                    figure_id=manual_id.strip(),
+                    caption=manual_caption.strip() or "用户手动添加的关键图表截图。",
+                    page=str(manual_page),
+                    image_name=manual_name,
+                    page_image_name=manual_name,
+                    why_selected="用户手动添加。",
+                    needs_manual_check=True,
+                    confidence=1.0,
+                    role="key_result",
+                    selected=True,
+                    order=len(assets) + 1,
+                )
+                if not hasattr(pdf, "legends") or pdf.legends is None:
+                    pdf.legends = []
+                pdf.legends.append(figure)
+                if hasattr(pdf, "all_figures") and pdf.all_figures is not None:
+                    pdf.all_figures.append(figure)
+                st.session_state.images[manual_name] = manual_data
+                st.success("截图已加入候选并勾选，请完成 Gemini 视觉复核。")
+                st.rerun()
+            except Exception:
+                st.error("图片无法读取，请使用有效的 PNG 或 JPEG 图片。")
     selected_assets = sorted(
         [item for item in assets if item.selected],
         key=lambda item: (item.order or 999, item.figure_id),
