@@ -1685,9 +1685,9 @@ def journal_latest_search(
         before_date_check = len(merged)
         merged = filter_records_by_date_range(merged, date_from, date_to)
         removed = before_date_check - len(merged)
-        diag.warnings.append(f"已按发表日期 {date_from} 至 {date_to} 完成月份校验。")
+        diag.warnings.append(f"已按发表日期 {date_from} 至 {date_to} 完成日期范围校验。")
         if removed:
-            diag.warnings.append(f"已排除 {removed} 条日期缺失或不在所选月份内的记录。")
+            diag.warnings.append(f"已排除 {removed} 条日期缺失或不在所选日期范围内的记录。")
     merged.sort(
         key=lambda item: (
             item.journal_impact_factor or 0,

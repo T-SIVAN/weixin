@@ -2,6 +2,7 @@ import io
 import json
 import urllib.error
 import zipfile
+from datetime import date
 
 import pytest
 from streamlit.testing.v1 import AppTest
@@ -152,6 +153,10 @@ def test_chinese_titles_have_distinct_stable_keys():
     assert len(app.merge_papers([first], [second])) == 2
 
 
+def test_selectable_date_range_label_includes_exact_days():
+    assert app.date_range_label(date(2026, 2, 3), date(2026, 9, 18)) == "2026年2月3日 至 2026年9月18日"
+
+
 def test_reuploaded_pdf_replaces_previous_source_without_losing_metadata():
     old = PaperInput(doi="10.1234/paper", title_en="Study", title_zh="已翻译标题", pdf_name="old.pdf")
     new = PaperInput(doi="10.1234/paper", title_en="Study", pdf_name="revised.pdf")
@@ -182,6 +187,7 @@ def test_navigation_renders_only_selected_page_and_needs_no_credentials(monkeypa
     at = AppTest.from_file("app.py", default_timeout=20).run()
     assert not at.exception
     assert any(button.label == "检索文章" and button.disabled for button in at.button)
+    assert [widget.label for widget in at.date_input] == ["开始日期", "结束日期"]
     assert not any(button.label == "解析上传 PDF" for button in at.button)
     at.radio(key="workspace-page").set_value("论文分析").run()
     assert not at.exception

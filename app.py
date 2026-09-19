@@ -52,9 +52,7 @@ from weixin_lite.search import (
     suggest_filter_keywords,
     parse_manual_inputs,
     resolve_doi,
-    recent_year_months,
     run_journal_latest_search,
-    year_month_range,
 )
 from weixin_lite.translate import translate_records
 from weixin_lite.wechat_publish import WechatDraftConfig, export_wechat_payload, publish_draft
@@ -64,6 +62,13 @@ st.set_page_config(page_title="微信文献快读工具", layout="wide")
 
 
 LATEST_PATH = Path("data/latest_papers.json")
+
+
+def date_range_label(date_from: date, date_to: date) -> str:
+    return (
+        f"{date_from.year}年{date_from.month}月{date_from.day}日"
+        f" 至 {date_to.year}年{date_to.month}月{date_to.day}日"
+    )
 
 
 def crop_image_bytes(data: bytes, horizontal: tuple[int, int], vertical: tuple[int, int]) -> bytes:
@@ -428,7 +433,7 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
             st.caption(label + ", ".join(latest.keywords[:12]) + (" ..." if len(latest.keywords) > 12 else ""))
             if latest.period_label:
                 st.caption(
-                    f"抓取月份：{latest.period_label}"
+                    f"检索日期：{latest.period_label}"
                     + (f"（{latest.date_from} 至 {latest.date_to}）" if latest.date_from and latest.date_to else "")
                 )
             st.dataframe(paper_rows(latest.records), use_container_width=True, hide_index=True)
@@ -444,19 +449,34 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
         default_journals = []
         st.error(f"期刊配置读取失败：{type(exc).__name__}: {exc}")
 
-    col_a, col_b, col_c, col_d = st.columns([0.8, 1.0, 1.4, 1.4])
+    col_a, col_b, col_c, col_d, col_e = st.columns([0.7, 0.95, 0.95, 1.4, 1.4])
     limit = col_a.slider("结果数量", 10, 200, 100, step=10)
-    month_choices = recent_year_months(today=date.today())
-    month_labels = [item[0] for item in month_choices]
-    selected_month_label = col_b.selectbox("抓取月份", month_labels, index=0)
-    selected_month = month_choices[month_labels.index(selected_month_label)]
-    date_from, date_to = year_month_range(selected_month[1], selected_month[2], today=date.today())
-    selected_sources = col_c.multiselect(
+    today = date.today()
+    earliest = date(1900, 1, 1)
+    selected_date_from = col_b.date_input(
+        "开始日期",
+        value=today.replace(day=1),
+        min_value=earliest,
+        max_value=today,
+        format="YYYY/MM/DD",
+    )
+    selected_date_to = col_c.date_input(
+        "结束日期",
+        value=today,
+        min_value=earliest,
+        max_value=today,
+        format="YYYY/MM/DD",
+    )
+    invalid_date_range = selected_date_from > selected_date_to
+    date_from = selected_date_from.isoformat()
+    date_to = selected_date_to.isoformat()
+    selected_period_label = date_range_label(selected_date_from, selected_date_to)
+    selected_sources = col_d.multiselect(
         "数据源",
         ["PubMed", "Europe PMC", "Crossref", "OpenAlex"],
         default=["PubMed", "Europe PMC", "Crossref"] + (["OpenAlex"] if os.getenv("OPENALEX_API_KEY") else []),
     )
-    openalex_api_key = col_d.text_input(
+    openalex_api_key = col_e.text_input(
         "OpenAlex API Key",
         value=os.getenv("OPENALEX_API_KEY", ""),
         type="password",
@@ -481,14 +501,20 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
     journals = rows_to_journals(edited_journals)
     enabled_count = len([journal for journal in journals if journal.enabled])
     st.caption(
-        f"已启用 {enabled_count} 本期刊；抓取月份：{selected_month_label}"
-        f"（{date_from} 至 {date_to}）；期刊按 2024 JIF 从高到低排列，进入页面默认全部未选。"
+        f"已启用 {enabled_count} 本期刊；检索日期：{selected_period_label}；"
+        "期刊按 2024 JIF 从高到低排列，进入页面默认全部未选。"
     )
 
+    if invalid_date_range:
+        st.warning("结束日期不能早于开始日期。")
     if not enabled_count:
         st.info("请至少勾选一本期刊后再开始检索。")
-    if st.button("检索文章", type="primary", disabled=not enabled_count or not selected_sources):
-        with st.spinner("正在检索所选月份的文章..."):
+    if st.button(
+        "检索文章",
+        type="primary",
+        disabled=invalid_date_range or not enabled_count or not selected_sources,
+    ):
+        with st.spinner("正在检索所选日期范围内的文章..."):
             run = run_journal_latest_search(
                 journals,
                 limit=limit,
@@ -497,7 +523,7 @@ def search_tab(provider: str, api_key: str, base_url: str, model: str, batch_siz
                 openalex_api_key=openalex_api_key,
                 date_from=date_from,
                 date_to=date_to,
-                period_label=selected_month_label,
+                period_label=selected_period_label,
             )
         st.session_state.papers = merge_papers(st.session_state.papers, run.records) if append_results else list(run.records)
         if run.errors:
