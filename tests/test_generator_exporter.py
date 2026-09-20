@@ -654,7 +654,7 @@ def test_analysis_prompt_uses_expert_deep_reading_guide():
         PdfContent(text="[Page 1]\nAbstract\nKey result.", hash="pdf-hash"),
     )
 
-    assert ANALYSIS_PROMPT_VERSION == "paper-analysis-v5-overview"
+    assert ANALYSIS_PROMPT_VERSION == "paper-analysis-v6-evidence-diversity"
     assert "世界顶级学术专家" in prompt
     assert "### 论文的研究目标是什么？想要解决什么实际问题？" in prompt
     assert "### 这个问题对于产业发展有什么重要意义？" in prompt

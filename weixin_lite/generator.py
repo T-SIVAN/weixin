@@ -4,7 +4,8 @@ import html
 import re
 from typing import Any
 
-from .figure_analysis import FIGURE_ANALYSIS_PROMPT_VERSION, figure_heading
+from .figure_analysis import FIGURE_ANALYSIS_PROMPT_VERSION, SELECTED_REVIEW_VERSION, figure_heading
+from .evidence_context import prose_from_note
 from .llm import LLMError, call_openai_compatible, parse_json_object
 from .models import FigureAnalysis, PaperAnalysis, PaperInput, QuickReadArticle
 from .pdf_reader import PdfContent, compact_text
@@ -273,7 +274,7 @@ def render_markdown(
             {
                 "figure_id": figure.figure_id,
                 "heading": figure.why_selected or figure_heading(figure),
-                "note": figure.interpretation,
+                "note": prose_from_note(figure.interpretation),
             }
             for figure in figures
             if figure.image_name and figure.interpretation
@@ -298,6 +299,10 @@ def render_markdown(
         if note:
             lines.append("")
             lines.append(note)
+        if figure and confirmed_figure_notes:
+            boundary = "；仅据图注与正文解读，未进行图像复核" if figure.vision_status == "text_evidence" else ""
+            quote_page = f"；正文证据 p.{figure.source_page}" if figure.source_page and figure.source_page != figure.page else ""
+            lines.extend(["", f"来源：{figure.figure_id} · p.{figure.page or '未标注'}{quote_page}{boundary}。"])
         if figure and figure.editable_table and figure.editable_table.headers and figure.editable_table.rows and figure.editable_table.confidence >= 0.7:
             lines.extend(["", f"<!-- editable-table:{fig_id} -->"])
     add_section("文章的创新意义", data.get("innovation"), numbered=True)
@@ -386,6 +391,8 @@ def markdown_to_wechat_html(markdown: str, figures: list[FigureAnalysis] | None 
             html_lines.append(f'<p style="{WECHAT_P_STYLE}">{_wechat_inline(line)}</p>')
         elif line.startswith("原文信息："):
             html_lines.append(f'<p style="{WECHAT_META_STYLE}">{_wechat_inline(line)}</p>')
+        elif line.startswith("来源："):
+            html_lines.append(f'<p style="margin:10px 0 24px;font-size:14px;line-height:1.8;color:#666;">{_wechat_inline(line)}</p>')
         else:
             html_lines.append(f'<p style="{WECHAT_P_STYLE}">{_wechat_inline(line)}</p>')
     return "\n".join(html_lines)
@@ -450,7 +457,7 @@ def generate_article(
             for figure in sorted(confirmed_figures or [], key=lambda item: (item.order or 999, item.figure_id))
             if (
                 figure.selected
-                and getattr(figure, "review_version", "") == FIGURE_ANALYSIS_PROMPT_VERSION
+                and getattr(figure, "review_version", "") in {FIGURE_ANALYSIS_PROMPT_VERSION, SELECTED_REVIEW_VERSION}
                 and (
                     figure.vision_status == "reviewed"
                     or (allow_text_evidence_figures and figure.vision_status == "text_evidence")
@@ -536,4 +543,5 @@ def generate_article(
         analysis_version=analysis.version if analysis else "",
         source_hash=(analysis.source_hash if analysis else (pdf.hash if pdf else "")),
         lead_image_name=lead_image.image_name if lead_image else "",
+        sections=data,
     )

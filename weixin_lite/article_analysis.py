@@ -11,7 +11,7 @@ from .models import AnalysisClaim, PaperAnalysis, PaperInput
 from .pdf_reader import PdfContent
 
 
-ANALYSIS_PROMPT_VERSION = "paper-analysis-v5-overview"
+ANALYSIS_PROMPT_VERSION = "paper-analysis-v6-evidence-diversity"
 ANALYSIS_FIELDS = (
     "research_question",
     "background",
@@ -206,7 +206,21 @@ def merge_analyses(analyses: list[PaperAnalysis], *, source_hash: str, model: st
         "limitations": 3,
         "conclusion": 2,
     }
-    values = {name: claims[: limits[name]] for name, claims in values.items()}
+    # Prefer substantive, non-redundant evidence across the paper over first-page order.
+    for name, claims in values.items():
+        ranked = sorted(claims, key=lambda claim: (
+            claim.confidence == "high", bool(claim.evidence_text), len(claim.evidence_text),
+        ), reverse=True)
+        chosen = []
+        pages = set()
+        while ranked and len(chosen) < limits[name]:
+            claim = next((item for item in ranked if item.page not in pages), ranked[0])
+            ranked.remove(claim)
+            if any(re.sub(r"\W", "", item.statement) == re.sub(r"\W", "", claim.statement) for item in chosen):
+                continue
+            chosen.append(claim)
+            pages.add(claim.page)
+        values[name] = chosen
     merged = PaperAnalysis(**values, status="complete", source_hash=source_hash, model=model, version=ANALYSIS_PROMPT_VERSION)
     required = (merged.research_question, merged.background, merged.methods, merged.innovation, merged.limitations, merged.conclusion)
     if not all(required):
@@ -282,6 +296,8 @@ def analyze_paper(
             partials.append(partial)
             if cache_mapping is not None:
                 cache_mapping[chunk_key] = partial.to_dict()
+            if callable(config.get("checkpoint")):
+                config["checkpoint"]()
             if callable(progress):
                 progress(index + 1, len(chunks))
         analysis = merge_analyses(partials, source_hash=source_hash, model=model)

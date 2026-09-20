@@ -307,6 +307,12 @@ def export_article_docx(article: QuickReadArticle, image_assets: dict[str, bytes
         line = raw_line.strip()
         if not line:
             continue
+        table_marker = re.fullmatch(r"<!-- editable-table:(.*?) -->", line)
+        if table_marker:
+            figure = next((item for item in article.figures if item.figure_id == table_marker[1]), None)
+            if figure:
+                _add_editable_table(document, figure.editable_table)
+            continue
         image_reference = _standalone_image_reference(raw_line)
         if image_reference and image_reference.name:
             name = image_reference.name
@@ -314,7 +320,9 @@ def export_article_docx(article: QuickReadArticle, image_assets: dict[str, bytes
             # an accidental duplicate reference.
             if name and not (name == lead and name in inserted_images):
                 _add_image(document, article, name, image_reference.alt, assets)
-                _add_editable_table(document, _editable_table_for_image(article, name))
+                figure = next((item for item in article.figures if item.image_name == name), None)
+                if figure is None or f"<!-- editable-table:{figure.figure_id} -->" not in article.body_markdown:
+                    _add_editable_table(document, _editable_table_for_image(article, name))
                 inserted_images.add(name)
             continue
         heading_match = _HEADING_RE.match(line)
@@ -353,7 +361,12 @@ def export_article_docx(article: QuickReadArticle, image_assets: dict[str, bytes
             _add_rich_text(paragraph, line, size=15)
             continue
         paragraph = document.add_paragraph()
-        _add_rich_text(paragraph, line)
+        if line.startswith(("来源：", "原文信息：")):
+            _add_rich_text(paragraph, line, size=10.5)
+            for run in paragraph.runs:
+                run.font.color.rgb = RGBColor.from_string("666666")
+        else:
+            _add_rich_text(paragraph, line)
 
     buffer = BytesIO()
     document.save(buffer)

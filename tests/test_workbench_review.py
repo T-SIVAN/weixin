@@ -237,7 +237,7 @@ def test_paper_workspace_without_key_blocks_model_actions():
     at.session_state["workspace-page"] = "论文分析"
     at.run()
     assert not at.exception
-    for label in ("分析论文概览", "复核选中图表", "生成公众号稿"):
+    for label in ("分析论文概览", "生成稿件"):
         assert next(button for button in at.button if button.label == label).disabled
 
 
@@ -320,7 +320,7 @@ def test_editor_saves_before_preparing_word(simulated_article):
     at.run()
     assert not at.exception
     next(item for item in at.text_input if item.label == "标题").set_value("编辑后的测试稿")
-    next(item for item in at.button if item.label == "保存修改").click().run()
+    next(item for item in at.button if item.label == "保存全文").click().run()
     assert not at.exception
     assert at.session_state["articles"][0].title == "编辑后的测试稿"
     next(item for item in at.button if item.label == "准备下载文件").click().run()

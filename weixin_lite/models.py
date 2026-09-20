@@ -269,6 +269,10 @@ class FigureAnalysis:
     vision_error: str = ""
     visual_evidence: str = ""
     editable_table: "EditableTable | None" = None
+    review_key: str = ""
+    source_excerpt: str = ""
+    source_page: str = ""
+    review_mode: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -431,6 +435,7 @@ class QuickReadArticle:
     analysis_version: str = ""
     source_hash: str = ""
     lead_image_name: str = ""
+    sections: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -438,6 +443,15 @@ class QuickReadArticle:
         data["figures"] = [item.to_dict() for item in self.figures]
         data["evidence"] = [item.to_dict() for item in self.evidence]
         return data
+
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "QuickReadArticle":
+        values = {key: value for key, value in data.items() if key in cls.__dataclass_fields__}
+        values["paper"] = PaperInput.from_dict(data["paper"])
+        values["figures"] = [FigureAnalysis.from_dict(item) for item in data.get("figures", [])]
+        values["evidence"] = [EvidenceItem.from_dict(item) for item in data.get("evidence", [])]
+        return cls(**values)
 
 
 @dataclass

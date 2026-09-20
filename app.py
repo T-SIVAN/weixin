@@ -24,9 +24,13 @@ from weixin_lite.exporter import (
 )
 from weixin_lite.figure_analysis import (
     FIGURE_ANALYSIS_PROMPT_VERSION,
-    analyze_confirmed_figures,
-    prepare_text_evidence_figures,
+    analyze_selected_figures,
+    SELECTED_REVIEW_VERSION,
 )
+from weixin_lite.workspace_ui import checkpoint, initialize_workspace, render_workspace_sidebar
+from weixin_lite.workspace_store import preserve_article
+from weixin_lite.editor import article_blocks, block_editor_parts, replace_block, rewrite_block, replace_figure_note
+from weixin_lite.evidence_context import figure_context, prose_from_note
 from weixin_lite.generator import ArticleGenerationError, chineseish_len, generate_article, markdown_to_wechat_html
 from weixin_lite.llm import (
     PROVIDERS,
@@ -95,6 +99,8 @@ def invalidate_asset_review(figure, message: str) -> None:
     figure.vision_error = message
     figure.visual_evidence = ""
     figure.interpretation = ""
+    figure.review_key = ""
+    figure.source_excerpt = ""
 
 
 def pdf_assets(pdf: PdfContent) -> list:
@@ -103,6 +109,17 @@ def pdf_assets(pdf: PdfContent) -> list:
     if legends is not None:
         return list(legends)
     return list(getattr(pdf, "assets", []) or [])
+
+
+def move_selected_asset(assets, figure_id, direction):
+    selected = sorted([item for item in assets if item.selected], key=lambda item: (item.order or 999, item.figure_id))
+    position = next(i for i, item in enumerate(selected) if item.figure_id == figure_id)
+    target = position + direction
+    if 0 <= target < len(selected):
+        selected[position], selected[target] = selected[target], selected[position]
+    for index, item in enumerate(selected, 1):
+        item.order = index
+    checkpoint()
 
 
 def build_project_zip_download(
@@ -129,6 +146,9 @@ def init_state() -> None:
     st.session_state.setdefault("selected_download_keys", [])
     st.session_state.setdefault("analysis_cache", {})
     st.session_state.setdefault("vision_cache", {})
+    st.session_state.setdefault("article_versions", [])
+    st.session_state.setdefault("article_cache", {})
+    st.session_state.setdefault("editor_drafts", {})
 
 
 def paper_key(paper: PaperInput) -> str:
@@ -635,6 +655,10 @@ def render_paper_inputs() -> None:
                 record = infer_paper_from_pdf(file.name, pdf)
                 record.pdf_name = storage_name
                 parsed_papers.append(record)
+                st.session_state.downloads = merge_download_records(st.session_state.downloads, [
+                    DownloadedPaper(paper_key=record.paper_key, file_name=storage_name,
+                                    content_type="application/pdf", status="open", content_bytes=content)
+                ])
             except Exception as exc:
                 st.error(f"{file.name} 解析失败：{type(exc).__name__}，请确认文件是有效且未加密的 PDF。")
             progress.progress(idx / len(uploaded), text=f"已解析 {idx}/{len(uploaded)}")
@@ -718,7 +742,8 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
                 paper,
                 pdf,
                 {"api_key": api_key, "base_url": base_url, "model": model, "cache": st.session_state.analysis_cache,
-                 "progress_callback": lambda done, total: progress.progress(done / total, text=f"已分析 {done}/{total} 段")},
+                 "progress_callback": lambda done, total: progress.progress(done / total, text=f"已分析 {done}/{total} 段"),
+                 "checkpoint": checkpoint},
                 analysis,
             )
             analyses[active_key] = analysis
@@ -739,7 +764,7 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
     assets = pdf_assets(pdf)
     stale_reviews = False
     for figure in assets:
-        if figure.vision_status == "reviewed" and getattr(figure, "review_version", "") != FIGURE_ANALYSIS_PROMPT_VERSION:
+        if figure.vision_status == "reviewed" and getattr(figure, "review_version", "") not in {FIGURE_ANALYSIS_PROMPT_VERSION, SELECTED_REVIEW_VERSION}:
             invalidate_asset_review(figure, "图解规则已更新，请按三段式重新执行 Gemini 视觉复核。")
             stale_reviews = True
     if stale_reviews:
@@ -749,14 +774,25 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
             "没有识别到可选图表。常见原因是 PDF 为扫描件、图注排版特殊，或本次会话仍保留旧版解析结果。"
             "请重新上传并解析 PDF，或在下方手动添加截图。"
         )
+    thumbnails = st.container(key="asset-gallery").columns(3)
     for index, figure in enumerate(assets, start=1):
+        with thumbnails[(index - 1) % 3]:
+            if figure.image_name in st.session_state.images:
+                st.image(st.session_state.images[figure.image_name], width="stretch")
+            figure.selected = st.checkbox(f"{figure.figure_id} · p.{figure.page}", value=figure.selected,
+                                          key=f"asset-select-{active_key}-{index}")
+            with st.popover("查看大图", icon=":material/zoom_in:"):
+                if figure.image_name in st.session_state.images:
+                    st.image(st.session_state.images[figure.image_name], width="stretch")
+                st.write(figure.caption)
+    for index, figure in enumerate(assets, start=1):
+        if not figure.selected:
+            continue
         review_label = {
             "reviewed": "已复核",
             "text_evidence": "文本证据直出",
         }.get(figure.vision_status, "待复核")
         with st.expander(f"{figure.figure_id} · p.{figure.page} · {review_label}", expanded=False):
-            figure.selected = st.checkbox("选入最终稿", value=figure.selected, key=f"asset-select-{paper_key(paper)}-{index}")
-            figure.order = st.number_input("顺序", 1, max(4, len(assets)), min(max(1, int(figure.order or index)), max(4, len(assets))), key=f"asset-order-{paper_key(paper)}-{index}")
             st.caption(figure.caption[:900])
             if figure.image_name in st.session_state.images:
                 st.image(st.session_state.images[figure.image_name], use_container_width=True)
@@ -785,6 +821,7 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
                         figure.crop_bbox = (horizontal[0] / 100, vertical[0] / 100, horizontal[1] / 100, vertical[1] / 100)
                         figure.needs_manual_crop = False
                         invalidate_asset_review(figure, "截图已裁剪，请重新执行 Gemini 视觉复核后再生成。")
+                        checkpoint()
                         st.rerun()
             replacement = st.file_uploader("替换截图", type=["png", "jpg", "jpeg"], key=f"asset-replace-{active_key}-{index}")
             if replacement and st.button("应用替换", key=f"asset-replace-apply-{active_key}-{index}"):
@@ -797,6 +834,7 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
                         figure.image_name = replacement_name
                         figure.page_image_name = replacement_name
                         invalidate_asset_review(figure, "截图已替换，请重新复核。")
+                        checkpoint()
                         st.rerun()
                     except Exception:
                         st.error("图片无法读取，请使用有效的 PNG 或 JPEG 图片。")
@@ -810,6 +848,17 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
                 st.markdown(figure.interpretation)
             if figure.vision_error:
                 st.warning(figure.vision_error)
+            with st.popover("原文证据", icon=":material/menu_book:"):
+                st.write(figure_context(pdf, figure) or figure.caption)
+                if figure.source_excerpt:
+                    st.info(figure.source_excerpt)
+            caption = st.text_area("图注", figure.caption, key=f"asset-caption-{active_key}-{index}")
+            if st.button("保存图注", key=f"asset-caption-save-{active_key}-{index}"):
+                if caption.strip() != figure.caption:
+                    figure.caption = caption.strip()
+                    invalidate_asset_review(figure, "图注已更新，生成时将重新解读。")
+                    checkpoint()
+                    st.rerun()
     with st.expander("手动添加图表截图", expanded=not assets):
         manual_image = st.file_uploader(
             "上传图、表格或线路图截图",
@@ -863,7 +912,8 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
                 if hasattr(pdf, "all_figures") and pdf.all_figures is not None:
                     pdf.all_figures.append(figure)
                 st.session_state.images[manual_name] = manual_data
-                st.success("截图已加入候选并勾选，请完成 Gemini 视觉复核。")
+                checkpoint()
+                st.success("截图已加入候选并勾选。")
                 st.rerun()
             except Exception:
                 st.error("图片无法读取，请使用有效的 PNG 或 JPEG 图片。")
@@ -872,139 +922,168 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
         key=lambda item: (item.order or 999, item.figure_id),
     )
     st.caption(f"已选 {len(selected_assets)} 个图表，建议 2–4 个。")
+    for position, item in enumerate(selected_assets):
+        label_col, up_col, down_col = st.columns([6, 1, 1])
+        label_col.write(f"{position + 1}. {item.figure_id}")
+        up_col.button("", icon=":material/arrow_upward:", help="上移", disabled=position == 0,
+                      key=f"selected-order-up-{active_key}-{position}",
+                      on_click=move_selected_asset, args=(assets, item.figure_id, -1))
+        down_col.button("", icon=":material/arrow_downward:", help="下移", disabled=position == len(selected_assets) - 1,
+                        key=f"selected-order-down-{active_key}-{position}",
+                        on_click=move_selected_asset, args=(assets, item.figure_id, 1))
     if len(selected_assets) > 4:
         st.warning("每篇最多确认 4 个关键图表，请取消多余选择。")
-    vision_config = st.session_state.get("vision_config", {})
-    review_col, direct_col = st.columns(2)
-    if review_col.button("复核选中图表", disabled=not analysis or not analysis.complete or not 1 <= len(selected_assets) <= 4 or not vision_config.get("api_key")):
-        with st.spinner("正在复核图中曲线、表格、箭头关系与关键数据..."):
-            reviewed = analyze_confirmed_figures(
-                paper, analysis, selected_assets,
-                {
-                    **vision_config,
-                    "image_assets": st.session_state.images,
-                    "cache": st.session_state.vision_cache,
-                    # Keep this inside the existing config object so a Streamlit
-                    # hot reload can still call an older imported function.
-                    "pdf": pdf,
-                },
-            )
-        if reviewed:
-            st.success(f"已复核 {len(reviewed)} 项资产。")
-        else:
-            st.error("没有资产完成 Gemini 视觉复核；未复核资产不会进入最终稿。")
-
-    direct_ready = bool(
-        api_key.strip()
-        and analysis
-        and analysis.complete
-        and 1 <= len(selected_assets) <= 4
-    )
-    if direct_col.button(
-        "跳过复核，直接生成",
-        type="primary",
-        disabled=not direct_ready,
-        help="不调用 Gemini 视觉模型，仅依据图注、对应页正文和论文概览生成图解。",
-    ):
-        prepared = prepare_text_evidence_figures(analysis, selected_assets)
-        if len(prepared) != len(selected_assets):
-            missing = "、".join(item.figure_id for item in selected_assets if item not in prepared)
-            st.error(f"以下图片缺少图注或正文证据，无法直接生成：{missing}。")
-        else:
-            try:
-                article = generate_article(
-                    paper,
-                    pdf,
-                    api_key,
-                    base_url,
-                    model,
-                    analysis=analysis,
-                    confirmed_figures=prepared,
-                    image_assets=st.session_state.images,
-                    provider=provider,
-                    allow_text_evidence_figures=True,
-                )
-                article = deepcopy(article)
-                st.session_state.articles = [article] + [
-                    item for item in st.session_state.articles
-                    if paper_key(item.paper) != active_key
-                ]
-                st.success("已跳过 Gemini 视觉复核并生成稿件；发布前请人工核对图片细节。")
-            except ArticleGenerationError as exc:
-                st.error(str(exc))
-    st.caption("Gemini 不可用时可直接生成；直出图解只使用图注和正文证据，不会推测图片中的曲线、坐标或数值。")
-
     st.markdown("#### 3. 生成稿件")
-    can_generate = bool(
-        api_key.strip()
-        and analysis
-        and analysis.complete
-        and 1 <= len(selected_assets) <= 4
-        and all(
-            item.vision_status == "reviewed"
-            and getattr(item, "review_version", "") == FIGURE_ANALYSIS_PROMPT_VERSION
-            for item in selected_assets
-        )
-    )
-    if st.button("生成公众号稿", type="primary", disabled=not can_generate):
-        if not analysis or not analysis.complete:
-            st.error("请先完成论文概览分析。")
-        elif not selected_assets:
-            st.error("请至少选择 1 张关键图、表格或线路图，并完成 Gemini 视觉复核。")
-        elif any(
-            item.vision_status != "reviewed"
-            or getattr(item, "review_version", "") != FIGURE_ANALYSIS_PROMPT_VERSION
-            for item in selected_assets
-        ):
-            pending = "、".join(
-                item.figure_id
-                for item in selected_assets
-                if item.vision_status != "reviewed"
-                or getattr(item, "review_version", "") != FIGURE_ANALYSIS_PROMPT_VERSION
-            )
-            st.error(f"以下已选资产尚未完成 Gemini 视觉复核：{pending}。请先执行第 3 步。")
-        else:
-            try:
-                article = generate_article(paper, pdf, api_key, base_url, model, analysis=analysis, confirmed_figures=selected_assets, image_assets=st.session_state.images, provider=provider)
-                article = deepcopy(article)
-                st.session_state.articles = [article] + [item for item in st.session_state.articles if paper_key(item.paper) != active_key]
-                st.success("深度稿已生成。")
-            except ArticleGenerationError as exc:
-                st.error(str(exc))
+    mode_label = st.radio("图解方式", ["文字证据", "文字 + 视觉"], horizontal=True, key="generation-mode")
+    mode = "vision" if mode_label == "文字 + 视觉" else "text"
+    text_config = {"api_key": api_key, "base_url": base_url, "model": model, "provider": provider}
+    review_config = dict(st.session_state.get("vision_config", {})) if mode == "vision" else text_config.copy()
+    review_config.update(image_assets=st.session_state.images, cache=st.session_state.vision_cache,
+                         checkpoint=checkpoint)
+    if mode == "vision" and not review_config.get("api_key"):
+        st.info("请配置 Gemini，或选择文字证据模式。")
+    ready = bool(analysis and analysis.complete and api_key.strip()
+                 and review_config.get("api_key") and 1 <= len(selected_assets) <= 4)
+    if st.button("生成稿件", type="primary", disabled=not ready):
+        try:
+            checkpoint()
+            with st.spinner("正在解读已选图片，已成功的步骤将自动保存…"):
+                confirmed = analyze_selected_figures(paper, analysis, selected_assets, review_config, pdf=pdf, mode=mode)
+            if len(confirmed) != len(selected_assets):
+                failed = next((item for item in selected_assets if item not in confirmed), None)
+                st.error((failed.vision_error if failed else "") or "部分图表未完成，已保存成功结果。")
+                if mode == "vision":
+                    st.info("可以切换为文字证据模式后再次生成。")
+            else:
+                fingerprint = hashlib.sha256(json.dumps({
+                    "version": "article-prose-v1", "paper": paper.to_dict(), "analysis": analysis.to_dict(),
+                    "figures": [item.to_dict() for item in confirmed], "model": model, "base_url": base_url,
+                }, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+                cached = st.session_state.article_cache.get(fingerprint)
+                with st.spinner("正在组织公众号稿件…"):
+                    article = QuickReadArticle.from_dict(cached) if cached else generate_article(
+                        paper, pdf, api_key, base_url, model, analysis=analysis,
+                        confirmed_figures=confirmed, image_assets=st.session_state.images,
+                        provider=provider, allow_text_evidence_figures=mode == "text")
+                    export_article_html(article, st.session_state.images)
+                st.session_state.article_cache[fingerprint] = article.to_dict()
+                preserve_article(st.session_state, deepcopy(article))
+                checkpoint()
+                st.success("稿件已生成，可在成稿导出中修改；上一版已保留。")
+        except (ArticleGenerationError, ValueError) as exc:
+            st.error(str(exc))
+            checkpoint()
 
     if st.session_state.articles:
         st.caption(f"已有 {len(st.session_state.articles)} 篇稿件，可在“成稿导出”中编辑和下载。")
 
 
 def edit_article(article: QuickReadArticle) -> None:
-    key = paper_key(article.paper) + "-" + article.source_hash[:12]
-    with st.expander("编辑稿件"):
+    revision = hashlib.sha256(article.body_markdown.encode()).hexdigest()[:12]
+    key = paper_key(article.paper) + "-" + revision
+    blocks = article_blocks(article.body_markdown)
+    targets = [("section", index, label) for index, (label, _) in enumerate(blocks)
+               if label != "关键图证据解读"]
+    targets += [("figure", index, figure.figure_id) for index, figure in enumerate(article.figures)]
+    with st.expander("编辑稿件", expanded=True):
+        left, right = st.columns(2)
+        with left:
+            choice = st.selectbox("编辑位置", range(len(targets)), format_func=lambda i: targets[i][2], key=f"editor-target-{key}")
+            kind, index, label = targets[choice]
+            prefix, original = block_editor_parts(blocks[index][1]) if kind == "section" else ("", prose_from_note(article.figures[index].interpretation))
+            draft_key = f"{key}-{kind}-{index}"
+            initial = st.session_state.editor_drafts.get(draft_key, original)
+            if prefix and initial.startswith(prefix):
+                initial = initial[len(prefix):]
+            if kind == "figure" and article.figures[index].image_name in st.session_state.images:
+                st.image(st.session_state.images[article.figures[index].image_name], width="stretch")
+            text = st.text_area("正文", initial, height=320, key=f"block-plain-{draft_key}")
+            st.session_state.editor_drafts[draft_key] = text
+            try:
+                if kind == "section":
+                    candidate = replace_block(article, index, prefix + text)
+                else:
+                    figure = deepcopy(article.figures[index])
+                    figure.interpretation = text
+                    candidate = replace_figure_note(article, index, figure)
+            except ValueError as exc:
+                st.warning(str(exc))
+                candidate = None
+            if st.button("保存本节", icon=":material/save:", key=f"editor-save-{draft_key}", disabled=candidate is None):
+                try:
+                    export_article_html(candidate, st.session_state.images)
+                    preserve_article(st.session_state, candidate)
+                    checkpoint()
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+            request = st.text_input("改写要求", value="更自然流畅，保留关键证据，减少重复。", key=f"editor-request-{draft_key}")
+            config = st.session_state.get("text_config", {})
+            if st.button("仅重写本节" if kind == "section" else "仅重写这张图", icon=":material/refresh:",
+                         disabled=not config.get("api_key"), key=f"editor-rewrite-{draft_key}"):
+                try:
+                    paper_id = paper_key(article.paper)
+                    analysis = st.session_state.paper_analyses.get(paper_id)
+                    pdf = st.session_state.pdfs.get(article.paper.pdf_name)
+                    if analysis is None or pdf is None:
+                        raise ValueError("请先恢复此论文的分析项目。")
+                    with st.spinner("正在重写所选内容…"):
+                        if kind == "section":
+                            revised = rewrite_block(candidate or article, index, request, analysis, pdf, config)
+                        else:
+                            figure = deepcopy(article.figures[index])
+                            review_config = dict(st.session_state.get("vision_config", {})) if figure.review_mode == "vision" else dict(config)
+                            review_config.update(image_assets=st.session_state.images, cache=st.session_state.vision_cache,
+                                                 instruction=request, checkpoint=checkpoint)
+                            result = analyze_selected_figures(article.paper, analysis, [figure], review_config,
+                                                              pdf=pdf, mode=figure.review_mode or "text", force=True)
+                            if not result:
+                                raise ValueError(figure.vision_error)
+                            revised = replace_figure_note(article, index, result[0])
+                        export_article_html(revised, st.session_state.images)
+                    preserve_article(st.session_state, revised)
+                    checkpoint()
+                    st.rerun()
+                except (ValueError, RuntimeError) as exc:
+                    st.error(friendly_llm_error(exc) if not isinstance(exc, ValueError) else str(exc))
+        with right:
+            st.markdown("##### 当前修改预览")
+            render_article_preview(candidate or article)
+
+        versions = [(i, item) for i, item in enumerate(st.session_state.article_versions)
+                    if item["paper"].get("doi") == article.paper.doi and
+                    PaperInput.from_dict(item["paper"]).paper_key == article.paper.paper_key]
+        if versions:
+            selected = st.selectbox("历史版本", range(len(versions)),
+                                   format_func=lambda i: f"版本 {i + 1} · {versions[i][1]['title']}", key=f"editor-history-{key}")
+            historical = QuickReadArticle.from_dict(versions[selected][1])
+            with st.popover("查看历史版本", icon=":material/history:"):
+                st.markdown(historical.body_markdown)
+            if st.button("恢复此版本", icon=":material/restore:", key=f"editor-restore-{key}"):
+                preserve_article(st.session_state, historical)
+                checkpoint()
+                st.rerun()
+    with st.expander("标题与全文编辑"):
         with st.form(f"editor-{key}"):
             title = st.text_input("标题", value=article.title, max_chars=32)
             digest = st.text_area("摘要", value=article.digest, max_chars=120, height=90)
-            body = st.text_area("正文（Markdown）", value=article.body_markdown, height=400)
-            submitted = st.form_submit_button("保存修改")
+            body = st.text_area("全文（Markdown）", value=article.body_markdown, height=400)
+            submitted = st.form_submit_button("保存全文")
         if submitted:
             if not title.strip() or not body.strip():
                 st.error("标题和正文不能为空。")
             else:
                 candidate = deepcopy(article)
-                candidate.title = title.strip()
-                candidate.digest = digest.strip()
-                candidate.body_markdown = body
+                candidate.title, candidate.digest, candidate.body_markdown = title.strip(), digest.strip(), body
                 candidate.body_html = markdown_to_wechat_html(body, candidate.figures)
                 candidate.word_count = chineseish_len(body)
                 try:
                     export_article_html(candidate, st.session_state.images)
+                    preserve_article(st.session_state, candidate)
+                    checkpoint()
+                    st.rerun()
                 except ValueError as exc:
                     st.error(f"修改未保存：{exc}")
-                else:
-                    article.title = candidate.title
-                    article.digest = candidate.digest
-                    article.body_markdown = candidate.body_markdown
-                    article.body_html = candidate.body_html
-                    article.word_count = candidate.word_count
-                    st.success("修改已保存。")
 
 
 def export_fingerprint(article: QuickReadArticle, images: dict[str, bytes]) -> str:
@@ -1096,6 +1175,7 @@ def render_publish_settings(article: QuickReadArticle) -> None:
 
 
 def main() -> None:
+    initialize_workspace()
     init_state()
     st.markdown("""<style>
     .block-container {max-width:1200px;padding-top:2rem;padding-bottom:3rem;}
@@ -1104,19 +1184,26 @@ def main() -> None:
     [data-testid='stMetricValue'] {font-size:1.4rem;}
     [data-testid='stSidebar'] {border-right:1px solid #dedee3;}
     button p {white-space:normal;overflow-wrap:anywhere;}
+    .st-key-asset-gallery [data-testid='stImage'] {height:200px;}
+    .st-key-asset-gallery [data-testid='stImage'] img {height:200px;object-fit:contain;width:100%;}
     </style>""", unsafe_allow_html=True)
     st.sidebar.title("文献工作台")
+    render_workspace_sidebar()
     page = st.sidebar.radio("工作区", ["文献检索", "论文分析", "成稿导出"], key="workspace-page")
     st.sidebar.divider()
     provider, api_key, base_url, model, batch_size, delay_seconds = sidebar_settings()
     st.title("微信文献快读工具")
     st.caption(f"候选文献 {len(st.session_state.papers)} · 已解析全文 {len(st.session_state.pdfs)} · 稿件 {len(st.session_state.articles)}")
-    if page == "文献检索":
-        search_tab(provider, api_key, base_url, model, batch_size, delay_seconds)
-    elif page == "论文分析":
-        ingest_and_generate_tab(provider, api_key, base_url, model)
-    else:
-        export_and_publish_tab()
+    st.session_state.text_config = {"provider": provider, "api_key": api_key, "base_url": base_url, "model": model}
+    try:
+        if page == "文献检索":
+            search_tab(provider, api_key, base_url, model, batch_size, delay_seconds)
+        elif page == "论文分析":
+            ingest_and_generate_tab(provider, api_key, base_url, model)
+        else:
+            export_and_publish_tab()
+    finally:
+        checkpoint()
 
 
 if __name__ == "__main__":

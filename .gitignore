@@ -4,3 +4,4 @@ __pycache__/
 .venv/
 .streamlit/secrets.toml
 data/translation_cache.json
+.weixin/
