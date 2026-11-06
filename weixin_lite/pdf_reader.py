@@ -38,6 +38,34 @@ SECTION_ALIASES = {
 PROMPT_SECTION_ORDER = ("abstract", "introduction", "methods", "results", "discussion", "conclusion")
 
 
+def extract_first_page_metadata(text: str) -> tuple[list[str], list[str]]:
+    """Extract conservative author and affiliation hints from the PDF title page."""
+    first_page = re.split(r"(?im)\[Page\s+2\]", text or "", maxsplit=1)[0]
+    lines = [re.sub(r"\s+", " ", line).strip() for line in first_page.splitlines()]
+    lines = [line for line in lines if line]
+    stop = next((index for index, line in enumerate(lines) if re.match(r"(?i)abstract\b|摘要", line)), len(lines))
+    title_area = lines[:stop]
+    affiliations = []
+    for line in title_area:
+        if re.search(r"(?i)\b(university|institute|department|school|college|hospital|laboratory|centre|center|academy|inc\.|ltd\.)\b|大学|学院|研究所|研究院|医院|实验室|中心|科学院", line):
+            if len(line) <= 240:
+                affiliations.append(re.sub(r"^[\d\s,*†‡]+", "", line).strip())
+    affiliations = list(dict.fromkeys(affiliations))[:8]
+    author_candidates = []
+    for line in title_area[1:]:
+        if line in affiliations or len(line) > 180:
+            continue
+        if re.search(r"(?i)doi:|nature|science|journal|received|accepted|copyright|www\.|https?://", line):
+            continue
+        if re.search(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,8}", line) or re.search(r"[\u4e00-\u9fff]{2,4}", line):
+            author_candidates.append(line)
+    authors = []
+    for line in author_candidates[:3]:
+        parts = re.split(r"[,;]|\s+and\s+|\s+以及\s+|\s+与\s+", line, flags=re.I)
+        authors.extend(part.strip(" *†‡") for part in parts if 2 <= len(part.strip(" *†‡")) <= 80)
+    return list(dict.fromkeys(authors))[:12], affiliations
+
+
 @dataclass
 class PdfContent:
     text: str = ""

@@ -25,7 +25,7 @@ SYSTEM_PROMPT = """你是一个严谨、克制、面向中文读者的公众号�
 5. 详细实验数据、趋势和结果只由系统针对用户确认配图另行插入；不要生成独立实验设计或全量数据章节，也不要自行增加未确认图片或虚构图中细节。
 6. 标题不超过 32 个中文字符，digest 不超过 120 字。
 7. 为完整解释证据而写，不设置正文或分析字数上限；每个章节都要使用提供材料中可追溯的细节，避免重复。
-8. 不得写入公众号名称、运营作者、编辑姓名、发布日期、阅读量、联系方式等平台个人或运营信息；论文作者也不作为正文介绍内容。
+8. 开头必须简要介绍论文作者、作者单位、发表期刊和发表时间；只能使用题录或 PDF 首页证据，缺失字段要明确写“未从当前材料识别到”。不得写入公众号名称、运营作者、编辑姓名、阅读量或联系方式。
 只返回 JSON，不要返回 Markdown 代码块。"""
 
 
@@ -76,6 +76,8 @@ PMID：{paper.pmid}
 中文摘要：{paper.abstract_zh}
 文章类型：{paper.article_type}
 全文状态：{paper.access_status}
+作者：{'、'.join(paper.authors)}
+作者单位：{'；'.join(paper.affiliations)}
 """.strip()
     pdf_text = pdf.prompt_text() if pdf else ""
     manual_text = _source_material(source_text, extra_text)
@@ -93,7 +95,7 @@ PMID：{paper.pmid}
 请为下面这篇文章生成可直接发布到微信公众号的中文单篇解读。
 生成层级：{depth}
 篇幅：完整覆盖可用证据，不设置人为字数上限。
-隐私：不得写入公众号名称、运营作者、编辑姓名、发布日期、阅读量或联系方式，也不生成论文作者介绍。
+开头介绍：必须在正文最前面交代作者、作者单位、期刊和发表时间；缺失信息明确标注未识别。
 
 输出 JSON Schema：
 {{
@@ -152,7 +154,7 @@ def build_analysis_article_prompt(
 请根据已经审核为可追溯的结构化分析，生成一篇可直接排版为微信公众号正文的中文深度解读稿。
 篇幅：完整覆盖结构化证据，不设置人为字数上限。
 不得加入结构化分析之外的事实、数字或结论。用户确认配图及其图解由系统按给定顺序插入，不要在 JSON 中生成图下注释。
-不得写入公众号名称、运营作者、编辑姓名、发布日期、阅读量或联系方式；不要生成论文作者介绍。
+开头介绍由系统固定插入，模型不要重复作者、单位、期刊和日期信息。
 
 输出 JSON Schema：
 {{
@@ -187,6 +189,14 @@ def short_title(paper: PaperInput) -> str:
     base = re.sub(r"[:：|].*$", "", base)
     base = re.sub(r"\s+", "", base)
     return f"{journal}|{base[:20]}"[:32]
+
+
+def paper_intro(paper: PaperInput) -> str:
+    author = "、".join(item for item in paper.authors if item.strip()) or "未从当前材料识别到"
+    affiliation = "；".join(item for item in paper.affiliations if item.strip()) or "未从当前材料识别到"
+    journal = paper.journal or "未从当前材料识别到"
+    date = paper.publication_date or paper.year or "未从当前材料识别到"
+    return f"论文介绍：本文由{author}撰写，作者单位为{affiliation}，发表于{journal}，发表时间为{date}。"
 
 
 def fallback_article(
@@ -244,7 +254,7 @@ def render_markdown(
     *,
     confirmed_figure_notes: bool = False,
 ) -> str:
-    lines: list[str] = [f"# {data.get('title') or short_title(paper)}", ""]
+    lines: list[str] = [f"# {data.get('title') or short_title(paper)}", "", paper_intro(paper), ""]
     if lead_image and lead_image.image_name:
         lines.extend([f"![论文首页](images/{lead_image.image_name})", ""])
     intro = str(data.get("intro") or "").strip()
@@ -295,7 +305,7 @@ def render_markdown(
             lines.append(f"![{fig_id}](images/{figure.image_name})")
         elif fig_id and not confirmed_figure_notes:
             lines.append(f"> {fig_id} 需要上传原图截图后发布。")
-        lines.append(f"**{heading}**")
+        lines.append(f"**{heading} · {fig_id or '图示'}**")
         if note:
             lines.append("")
             lines.append(note)

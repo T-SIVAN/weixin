@@ -20,6 +20,7 @@ class PaperInput:
     doi: str = ""
     pmid: str = ""
     authors: list[str] = field(default_factory=list)
+    affiliations: list[str] = field(default_factory=list)
     journal: str = ""
     year: str = ""
     publication_date: str = ""

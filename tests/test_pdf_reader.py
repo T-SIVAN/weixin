@@ -9,9 +9,26 @@ from weixin_lite.pdf_reader import (
     choose_key_figures,
     extract_figure_legends,
     extract_numeric_evidence,
+    extract_first_page_metadata,
     parse_pdf,
     render_pdf_crop,
 )
+
+
+def test_extract_first_page_metadata_reads_authors_and_affiliations():
+    text = """[Page 1]
+Title of the paper
+Alice Smith, Bob Chen
+Department of Biology, Example University
+Example Institute
+Abstract
+This is the abstract.
+[Page 2]
+Results
+"""
+    authors, affiliations = extract_first_page_metadata(text)
+    assert "Alice Smith" in authors and "Bob Chen" in authors
+    assert "Department of Biology, Example University" in affiliations
 
 
 def test_extract_figure_legends_and_numeric_evidence():

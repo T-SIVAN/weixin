@@ -52,7 +52,7 @@ from weixin_lite.models import (
     generation_ready_papers,
     unavailable_papers,
 )
-from weixin_lite.pdf_reader import PdfContent, parse_pdf
+from weixin_lite.pdf_reader import PdfContent, extract_first_page_metadata, parse_pdf
 from weixin_lite.search import (
     DEFAULT_JOURNALS_PATH,
     JournalFilter,
@@ -193,6 +193,8 @@ def merge_papers(existing: list[PaperInput], incoming: list[PaperInput]) -> list
             old.pdf_name = item.pdf_name
         if len(item.authors) > len(old.authors):
             old.authors = item.authors
+        if len(item.affiliations) > len(old.affiliations):
+            old.affiliations = item.affiliations
     return list(merged.values())
 
 
@@ -214,15 +216,29 @@ def infer_paper_from_pdf(name: str, pdf: PdfContent) -> PaperInput:
         if 30 <= len(clean) <= 220 and not clean.lower().startswith(("abstract", "introduction")):
             title = clean
             break
+    authors, affiliations = extract_first_page_metadata(pdf.text)
     return PaperInput(
         title=title,
         title_en=title,
+        authors=authors,
+        affiliations=affiliations,
         doi=doi_match.group(0).lower() if doi_match else "",
         pdf_name=name,
         source="PDF upload",
         access_status="open",
         is_open_access=True,
     )
+
+
+def enrich_paper_from_pdf(paper: PaperInput, pdf: PdfContent | None) -> PaperInput:
+    if not pdf:
+        return paper
+    authors, affiliations = extract_first_page_metadata(pdf.text)
+    if not paper.authors and authors:
+        paper.authors = authors
+    if not paper.affiliations and affiliations:
+        paper.affiliations = affiliations
+    return paper
 
 
 def is_distinct_text(primary: str, secondary: str) -> bool:
@@ -626,6 +642,7 @@ def render_paper_inputs() -> None:
                         pdf_name = downloaded.file_name or f"{paper_key(paper)}.pdf"
                         pdfs[pdf_name] = pdf
                         st.session_state.images.update(pdf.rendered_images)
+                        enrich_paper_from_pdf(paper, pdf)
                         paper.pdf_name = pdf_name
                         paper.access_status = "open"
                         paper.download_error = ""

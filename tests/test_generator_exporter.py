@@ -370,6 +370,31 @@ def test_fallback_article_has_required_chinese_sections():
     assert article.evidence
 
 
+def test_article_starts_with_paper_introduction_and_binds_each_figure_to_its_note():
+    paper = PaperInput(
+        title_zh="TdT 催化非模板 DNA 合成",
+        authors=["Alice Smith", "Bob Chen"],
+        affiliations=["Example University", "Example Institute"],
+        journal="Nature Communications",
+        publication_date="2026-02-14",
+    )
+    figures = [
+        FigureAnalysis("Fig. 2", "Fig. 2 kinetic comparison.", page="4", image_name="fig2.png", selected=True,
+                       order=1, vision_status="reviewed", review_version="figure-analysis-v4-selected-three-part",
+                       interpretation="图2说明动力学差异。"),
+        FigureAnalysis("Fig. 4", "Fig. 4 activation barrier.", page="5", image_name="fig4.png", selected=True,
+                       order=2, vision_status="reviewed", review_version="figure-analysis-v4-selected-three-part",
+                       interpretation="图4说明活化能关系。"),
+    ]
+    article = generate_article(paper, confirmed_figures=figures)
+    intro = "论文介绍：本文由Alice Smith、Bob Chen撰写，作者单位为Example University；Example Institute，发表于Nature Communications，发表时间为2026-02-14。"
+    assert article.body_markdown.startswith("# ")
+    assert intro in article.body_markdown
+    assert article.body_markdown.index("![Fig. 2]") < article.body_markdown.index("图2说明动力学差异")
+    assert article.body_markdown.index("![Fig. 4]") < article.body_markdown.index("图4说明活化能关系")
+    assert "**Fig. 2" in article.body_markdown and "**Fig. 4" in article.body_markdown
+
+
 def test_article_does_not_render_unconfirmed_screenshot():
     paper = PaperInput(title_en="A test paper", journal="Nature", year="2025")
     figure = FigureAnalysis(

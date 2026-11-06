@@ -33,8 +33,8 @@ def test_deep_prompts_use_full_evidence_without_a_product_length_cap():
     assert "论文采用了什么方法" in analysis_prompt
     assert "不要整理完整实验清单" in analysis_prompt
     assert "局限性" in analysis_prompt
-    assert "Personal Author" not in basic_prompt
-    assert "公众号名称、运营作者" in basic_prompt
+    assert "作者：Personal Author" in basic_prompt
+    assert "公众号名称、运营作者" not in basic_prompt
 
 
 def test_rendered_deep_article_has_all_distinct_evidence_sections():
