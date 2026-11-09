@@ -751,7 +751,8 @@ def test_quality_generation_uses_one_call_without_hidden_length_repair(monkeypat
     assert "研究方法概述" in article.body_markdown
     assert "实验设计与验证" not in article.body_markdown
     assert "关键数据与结果" not in article.body_markdown
-    assert "局限性与解读边界" in article.body_markdown
+    assert "局限性与解读边界" not in article.body_markdown
+    assert "样本有限" not in article.body_markdown
     assert not any("显式补写/精简" in warning for warning in article.warnings)
 
 

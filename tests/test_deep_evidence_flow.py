@@ -27,6 +27,7 @@ def test_deep_prompts_use_full_evidence_without_a_product_length_cap():
     analysis_prompt = build_analysis_prompt(paper, PdfContent(text="[Page 1] evidence"))
 
     assert "不设置人为字数上限" in basic_prompt
+    assert '"limitations"' not in basic_prompt
     assert "2800-4200" not in basic_prompt
     assert "500-1500" not in basic_prompt
     assert "产业发展有什么重要意义" in analysis_prompt
@@ -46,7 +47,7 @@ def test_rendered_deep_article_has_all_distinct_evidence_sections():
             "research_question": "研究目标与产业意义均有页码证据。",
             "method_overview": ["方法概述来自 p.3。"],
             "innovation": ["创新点来自讨论部分。"],
-            "limitations": ["样本范围有限。"],
+            "limitations": ["旧缓存中的局限性不应进入成稿。"],
             "take_home": "结论只限定于原文证据。",
         },
         [],
@@ -56,12 +57,13 @@ def test_rendered_deep_article_has_all_distinct_evidence_sections():
         "研究问题与现实意义",
         "研究方法概述",
         "文章的创新意义",
-        "局限性与解读边界",
         "总结",
     ):
         assert f"## {heading}" in markdown
     assert "实验设计与验证" not in markdown
     assert "关键数据与结果" not in markdown
+    assert "局限性与解读边界" not in markdown
+    assert "旧缓存中的局限性不应进入成稿" not in markdown
 
 
 def test_method_overview_is_limited_to_three_items():

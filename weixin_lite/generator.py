@@ -20,7 +20,7 @@ SYSTEM_PROMPT = """你是一个严谨、克制、面向中文读者的公众号�
 写作要求：
 1. 正文只写中文，不做中英对照，不输出 Markdown 代码块。
 2. 按证据强度写作：有全文时可做深度解读；只有题录、摘要或粘贴材料时，只做摘要级/材料级解读，并明确边界。
-3. 必须形成清晰结构：文章核心要点简述、研究问题与现实意义、研究方法概述、用户选中图片的关键图解读、文章的创新意义、局限性与解读边界、总结。
+3. 必须形成清晰结构：文章核心要点简述、研究问题与现实意义、研究方法概述、用户选中图片的关键图解读、文章的创新意义、总结。
 4. 数字、结论、机构、作者和技术细节只能来自题录、摘要、全文、图注、证据或用户提供材料，不得编造。
 5. 详细实验数据、趋势和结果只由系统针对用户确认配图另行插入；不要生成独立实验设计或全量数据章节，也不要自行增加未确认图片或虚构图中细节。
 6. 标题不超过 32 个中文字符，digest 不超过 120 字。
@@ -106,7 +106,6 @@ PMID：{paper.pmid}
   "research_question": "研究目标、现实问题和产业/应用意义",
   "method_overview": ["简述方法核心原理、主要流程及相对优势，合计1至3条"],
   "innovation": ["创新意义、启发或价值"],
-  "limitations": ["局限性与证据边界"],
   "take_home": "一句话总结"
 }}
 
@@ -124,7 +123,6 @@ def _analysis_claims(analysis: PaperAnalysis) -> str:
         "background": "背景",
         "methods": "方法",
         "innovation": "创新点",
-        "limitations": "局限性",
         "conclusion": "结论",
     }
     lines: list[str] = []
@@ -165,7 +163,6 @@ def build_analysis_article_prompt(
   "research_question": "完整说明研究问题、现实痛点与产业/转化意义，必须关联结构化分析证据",
   "method_overview": ["用1至3条简述方法、模型或机制的核心原理、主要流程及相对优势"],
   "innovation": ["创新意义"],
-  "limitations": ["论文局限性和解读边界"],
   "take_home": "总结"
 }}
 
@@ -241,7 +238,6 @@ def fallback_article(
         "method_overview": ["当前材料仅支持概括研究方法的基本思路，不能展开实验步骤、对照和参数。"],
         "figure_notes": [],
         "innovation": innovation[:3],
-        "limitations": [f"证据边界：当前仅基于{level}，未获得或未完整解析全文时，不应延伸为全文级判断。"],
         "take_home": "这是一篇可开放生成的中文解读稿；材料越完整，结论和图文分析越可靠。",
     }
 
@@ -316,7 +312,6 @@ def render_markdown(
         if figure and figure.editable_table and figure.editable_table.headers and figure.editable_table.rows and figure.editable_table.confidence >= 0.7:
             lines.extend(["", f"<!-- editable-table:{fig_id} -->"])
     add_section("文章的创新意义", data.get("innovation"), numbered=True)
-    add_section("局限性与解读边界", data.get("limitations"), numbered=True)
     if data.get("take_home"):
         lines.extend(["", "## 总结", "", str(data["take_home"]).strip()])
     meta = " / ".join(bit for bit in [paper.journal, paper.publication_date or paper.year, f"DOI: {paper.doi}" if paper.doi else "", paper.url] if bit)
@@ -513,7 +508,6 @@ def generate_article(
                     "research_question",
                     "method_overview",
                     "innovation",
-                    "limitations",
                     "take_home",
                 )
             ):

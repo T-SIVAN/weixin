@@ -65,7 +65,7 @@ def rewrite_block(article, index, instruction, analysis, pdf, config):
     if label == "关键图证据解读":
         raise ValueError("请在逐图编辑中修改图解，以保留图片和来源。")
     field = {"研究问题与现实意义": "research_question", "研究方法概述": "methods",
-             "文章的创新意义": "innovation", "局限性与解读边界": "limitations", "总结": "conclusion"}.get(label)
+             "文章的创新意义": "innovation", "总结": "conclusion"}.get(label)
     claims = getattr(analysis, field, []) if field else (analysis.claims if analysis else [])
     evidence = "\n".join(f"p.{claim.page} {claim.evidence_text}" for claim in claims)
     if not evidence.strip():
