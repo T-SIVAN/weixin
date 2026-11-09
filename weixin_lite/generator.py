@@ -26,7 +26,18 @@ SYSTEM_PROMPT = """你是一个严谨、克制、面向中文读者的公众号�
 6. 标题不超过 32 个中文字符，digest 不超过 120 字。
 7. 为完整解释证据而写，不设置正文或分析字数上限；每个章节都要使用提供材料中可追溯的细节，避免重复。
 8. 开头必须简要介绍论文作者、作者单位、发表期刊和发表时间；只能使用题录或 PDF 首页证据，缺失字段要明确写“未从当前材料识别到”。不得写入公众号名称、运营作者、编辑姓名、阅读量或联系方式。
+9. 图号和逐图数据仅出现在关键图证据解读版块；其他章节不要添加（图1）、(Fig. 2) 等括号图号引用。保持原文的证据强度：“提示”不写成“证明”，未报告的内容不作推断。
 只返回 JSON，不要返回 Markdown 代码块。"""
+
+
+PARENTHETICAL_FIGURE_REF = re.compile(
+    r"[ \t]*[（(][ \t]*(?:图[ \t]*\d+[A-Za-z]?|Fig(?:ure)?\.?[ \t]*\d+[A-Za-z]?)[ \t]*[）)]",
+    re.I,
+)
+
+
+def _without_parenthetical_figure_refs(value: Any) -> str:
+    return PARENTHETICAL_FIGURE_REF.sub("", str(value).strip())
 
 
 def chineseish_len(text: str) -> int:
@@ -109,6 +120,8 @@ PMID：{paper.pmid}
   "take_home": "一句话总结"
 }}
 
+证据规则：研究问题、方法、创新与总结只概括可追溯的正文或摘要；未报告的细节不要推测。具体图表的数值与趋势留给已确认图片的图解，不在概览章节添加括号图号引用。
+
 文章信息：
 {metadata}
 
@@ -167,6 +180,7 @@ def build_analysis_article_prompt(
 }}
 
 写作要求：每一节都要写成面向读者的完整段落。方法只做简要概述，不展开实验设计、对照、样本和参数。可用“p.X”标记已有证据位置；没有证据的章节必须说明边界。关键数据、趋势和结果只在系统插入的用户确认图片图解中出现，你无需另行编造图解。
+研究主线只依据可追溯的正文证据。逐图数据、图号和图解只属于关键图证据解读版块；导语、核心要点、研究问题、方法、创新与总结不得加入（图1）、(Fig. 2) 等括号图号引用，也不得借未选图支撑论断。区分作者观察、推测与已验证结论，保留原文的谨慎措辞；首次出现的专业术语给出简明解释，不把未报告内容补成事实。
 
 论文：{paper.title_zh or paper.title_en or paper.title}
 期刊：{paper.journal}
@@ -250,15 +264,15 @@ def render_markdown(
     *,
     confirmed_figure_notes: bool = False,
 ) -> str:
-    lines: list[str] = [f"# {data.get('title') or short_title(paper)}", "", paper_intro(paper), ""]
+    lines: list[str] = [f"# {_without_parenthetical_figure_refs(data.get('title') or short_title(paper))}", "", paper_intro(paper), ""]
     if lead_image and lead_image.image_name:
         lines.extend([f"![论文首页](images/{lead_image.image_name})", ""])
     intro = str(data.get("intro") or "").strip()
     if intro:
-        lines.extend([intro, ""])
+        lines.extend([_without_parenthetical_figure_refs(intro), ""])
     def add_section(heading: str, value: Any, *, numbered: bool = False) -> None:
         values = value if isinstance(value, list) else [value]
-        cleaned = [str(item).strip() for item in values if item is not None and str(item).strip()]
+        cleaned = [_without_parenthetical_figure_refs(item) for item in values if item is not None and str(item).strip()]
         if not cleaned:
             return
         lines.extend([f"## {heading}", ""])
@@ -313,7 +327,7 @@ def render_markdown(
             lines.extend(["", f"<!-- editable-table:{fig_id} -->"])
     add_section("文章的创新意义", data.get("innovation"), numbered=True)
     if data.get("take_home"):
-        lines.extend(["", "## 总结", "", str(data["take_home"]).strip()])
+        lines.extend(["", "## 总结", "", _without_parenthetical_figure_refs(data["take_home"])])
     meta = " / ".join(bit for bit in [paper.journal, paper.publication_date or paper.year, f"DOI: {paper.doi}" if paper.doi else "", paper.url] if bit)
     if meta:
         lines.append("")
@@ -536,7 +550,7 @@ def generate_article(
         warnings.append(f"内容来源：{level}；未获得可靠图注，图例分析需开放全文或上传 PDF 后补充。")
     return QuickReadArticle(
         paper=paper,
-        title=str(data.get("title") or short_title(paper))[:32],
+        title=_without_parenthetical_figure_refs(data.get("title") or short_title(paper))[:32],
         digest=str(data.get("digest") or "")[:120],
         body_markdown=markdown,
         body_html=markdown_to_wechat_html(markdown, figures),

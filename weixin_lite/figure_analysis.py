@@ -14,8 +14,8 @@ from .models import AnalysisClaim, FigureAnalysis, PaperAnalysis, PaperInput
 from .pdf_reader import PdfContent, compact_text, figure_key
 
 
-FIGURE_ANALYSIS_PROMPT_VERSION = "figure-analysis-v4-selected-three-part"
-SELECTED_REVIEW_VERSION = "selected-evidence-v1-prose"
+FIGURE_ANALYSIS_PROMPT_VERSION = "figure-analysis-v5-claim-evidence"
+SELECTED_REVIEW_VERSION = "selected-evidence-v2-claim-evidence"
 ROLE_LABELS = {
     "lead": "论文首页",
     "mechanism": "机制图",
@@ -30,6 +30,7 @@ FIGURE_ANALYSIS_SYSTEM_PROMPT = """你是严谨的科研论文配图解读助手
 每张图只返回三个内容部分：overview 说明图展示什么并可用一句话交代必要的方法背景；key_findings 提炼图中可核对的关键数据或趋势；conclusion_boundary 说明图支持的结论和证据边界。不要单列或展开实验设计。
 没有提供图像时，绝不声称看到了曲线、坐标轴、显著性标记或多面板细节；必须标明为“图注/文本证据级解读（未完成视觉复核）”。
 提供图像且完成视觉复核时，也只能描述可见内容和给定证据共同支持的结论，不得补造数值。
+先核对图号、图注与实际图像是否对应；每个关键比较写清对象、指标及单位，仅在图像或原文清晰可核对时给出数值。区分图中直接可见的观察与作者的解释，保留原文“可能”“提示”等限定语；若图注、正文与图像不一致，明确指出而不要自行调和。
 每张图必须返回 figure_id、heading、overview、key_findings、conclusion_boundary、evidence_text、page、visible_elements、visual_evidence。没有证据的图不要编造。
 当 asset_kind 为 table 时，额外返回 table_headers、table_rows、table_confidence；只能转录确实看得清的单元格，不能猜测缺失数字。
 当 asset_kind 为 scheme 或 flowchart 时，overview 必须明确流程步骤、箭头关系、输入和输出；看不清时写明证据边界。
@@ -178,6 +179,7 @@ DOI：{paper.doi}
 3. 不要添加图注和证据中没有的数字或实验细节。
 4. 当前视觉复核状态：{'已提供确认图像，可结合图像复核' if visual_review_available else '未提供或不可使用图像；只能基于图注和文本证据，必须明确未完成视觉复核'}。
 5. confidence 低或 needs_manual_crop=true 时，提醒发布前人工核对截图。
+6. 逐图论断只绑定当前 figure_id 的图像、图注和所在页证据；不要引用未选图片，也不要把看不清的细节推断为确定结果。首次出现的专业术语给出简短通俗解释。
 
 confirmed_figures：
 {json.dumps(items, ensure_ascii=False, indent=2)}

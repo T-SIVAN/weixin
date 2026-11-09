@@ -9,8 +9,8 @@ from weixin_lite import llm as llm_module
 from weixin_lite.article_analysis import ANALYSIS_PROMPT_VERSION, analysis_cache_key, analyze_paper, build_analysis_prompt
 from weixin_lite.downloader import download_open_access
 from weixin_lite.exporter import article_html, project_zip, unavailable_dois_csv
-from weixin_lite.figure_analysis import analyze_confirmed_figures
-from weixin_lite.generator import ArticleGenerationError, build_prompt, generate_article, markdown_to_wechat_html
+from weixin_lite.figure_analysis import FIGURE_ANALYSIS_PROMPT_VERSION, analyze_confirmed_figures
+from weixin_lite.generator import ArticleGenerationError, build_analysis_article_prompt, build_prompt, generate_article, markdown_to_wechat_html
 from weixin_lite.llm import _parse_retry_after, call_openai_compatible, default_api_key, default_base_url, default_model
 from weixin_lite.models import AnalysisClaim, BatchProject, FigureAnalysis, PaperAnalysis, PaperInput, generation_candidate_papers, generation_ready_papers, unavailable_papers
 from weixin_lite.pdf_reader import PdfContent, extract_figure_legends, extract_numeric_evidence
@@ -380,10 +380,10 @@ def test_article_starts_with_paper_introduction_and_binds_each_figure_to_its_not
     )
     figures = [
         FigureAnalysis("Fig. 2", "Fig. 2 kinetic comparison.", page="4", image_name="fig2.png", selected=True,
-                       order=1, vision_status="reviewed", review_version="figure-analysis-v4-selected-three-part",
+                       order=1, vision_status="reviewed", review_version=FIGURE_ANALYSIS_PROMPT_VERSION,
                        interpretation="图2说明动力学差异。"),
         FigureAnalysis("Fig. 4", "Fig. 4 activation barrier.", page="5", image_name="fig4.png", selected=True,
-                       order=2, vision_status="reviewed", review_version="figure-analysis-v4-selected-three-part",
+                       order=2, vision_status="reviewed", review_version=FIGURE_ANALYSIS_PROMPT_VERSION,
                        interpretation="图4说明活化能关系。"),
     ]
     article = generate_article(paper, confirmed_figures=figures)
@@ -393,6 +393,52 @@ def test_article_starts_with_paper_introduction_and_binds_each_figure_to_its_not
     assert article.body_markdown.index("![Fig. 2]") < article.body_markdown.index("图2说明动力学差异")
     assert article.body_markdown.index("![Fig. 4]") < article.body_markdown.index("图4说明活化能关系")
     assert "**Fig. 2" in article.body_markdown and "**Fig. 4" in article.body_markdown
+
+
+def test_parenthetical_figure_references_only_remain_in_figure_analysis(monkeypatch):
+    from docx import Document
+    from PIL import Image
+
+    from weixin_lite.exporter import export_article_docx_bytes, export_article_html
+
+    payload = {
+        "title": "论文解读（图1）",
+        "digest": "摘要",
+        "intro": "研究提出新方法（图1），证据见（p.3），是在体外实验（对照组）中获得的。",
+        "core_points": ["观察到差异 (Fig. 2)，但仍需核对。"],
+        "research_question": "解决了一个问题（Figure 3）。",
+        "method_overview": ["方法包含两步（图 4A），第一步见 p.4。"],
+        "innovation": ["该设计具有新意 (Fig. 5)。"],
+        "take_home": "结论成立（图6）。",
+    }
+    monkeypatch.setattr("weixin_lite.generator.call_openai_compatible", lambda **_: json.dumps(payload, ensure_ascii=False))
+    figure = FigureAnalysis(
+        "Fig. 2", "Fig. 2 comparison.", page="4", image_name="fig2.png", selected=True,
+        vision_status="reviewed", review_version=FIGURE_ANALYSIS_PROMPT_VERSION,
+        interpretation="图中显示两组差异（Fig. 2），仅限当前条件。",
+    )
+    article = generate_article(PaperInput(title_en="Test paper"), api_key="key", confirmed_figures=[figure])
+    image = BytesIO()
+    Image.new("RGB", (24, 24), "white").save(image, format="PNG")
+    assets = {"fig2.png": image.getvalue()}
+    html = export_article_html(article, assets).decode("utf-8")
+    word = Document(BytesIO(export_article_docx_bytes(article, assets)))
+    word_text = "\n".join(paragraph.text for paragraph in word.paragraphs)
+
+    for content in (article.body_markdown, html, word_text):
+        assert "（图1）" not in content
+        assert "(Fig. 5)" not in content
+        assert "（p.3）" in content
+        assert "（对照组）" in content
+        assert "图中显示两组差异（Fig. 2）" in content
+    assert article.title == "论文解读"
+    assert article.body_markdown.index("![Fig. 2]") < article.body_markdown.index("图中显示两组差异")
+
+
+def test_parenthetical_figure_reference_removal_preserves_line_breaks():
+    from weixin_lite.generator import _without_parenthetical_figure_refs
+
+    assert _without_parenthetical_figure_refs("第一段（图1）\n第二段 (Fig. 2)，见（p.3）。") == "第一段\n第二段，见（p.3）。"
 
 
 def test_article_does_not_render_unconfirmed_screenshot():
@@ -467,7 +513,7 @@ def test_confirmed_figures_ignore_unconfirmed_model_figure_notes(monkeypatch):
         selected=True,
         order=1,
         vision_status="reviewed",
-        review_version="figure-analysis-v4-selected-three-part",
+        review_version=FIGURE_ANALYSIS_PROMPT_VERSION,
         interpretation="确认图解。",
     )
     pdf = PdfContent(
@@ -528,7 +574,7 @@ def test_text_evidence_figure_is_rendered_only_with_explicit_opt_in():
         image_name="fig2.png",
         selected=True,
         vision_status="text_evidence",
-        review_version="figure-analysis-v4-selected-three-part",
+        review_version=FIGURE_ANALYSIS_PROMPT_VERSION,
         interpretation="图注/文本证据级解读（未完成视觉复核）。",
     )
 
@@ -679,15 +725,26 @@ def test_analysis_prompt_uses_expert_deep_reading_guide():
         PdfContent(text="[Page 1]\nAbstract\nKey result.", hash="pdf-hash"),
     )
 
-    assert ANALYSIS_PROMPT_VERSION == "paper-analysis-v6-evidence-diversity"
+    assert ANALYSIS_PROMPT_VERSION == "paper-analysis-v7-source-grounded-overview"
     assert "世界顶级学术专家" in prompt
     assert "### 论文的研究目标是什么？想要解决什么实际问题？" in prompt
     assert "### 这个问题对于产业发展有什么重要意义？" in prompt
     assert "### 论文采用了什么方法？" in prompt
     assert "不要整理完整实验清单" in prompt
+    assert "不要把某张图的结论外推到全文" in prompt
+    assert "保持原文的谨慎程度" in prompt
     assert "blockquote" in prompt
     assert '"research_question"' in prompt
     assert "只返回符合要求的 JSON" in prompt
+
+
+def test_article_prompt_keeps_figure_citations_outside_overview():
+    analysis = _complete_analysis()
+    prompt = build_analysis_article_prompt(PaperInput(title_en="Paper"), analysis, [])
+
+    assert "逐图数据、图号和图解只属于关键图证据解读版块" in prompt
+    assert "不得借未选图支撑论断" in prompt
+    assert "保留原文的谨慎措辞" in prompt
 
 
 def test_analysis_failure_preserves_previous_complete_analysis(monkeypatch):

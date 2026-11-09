@@ -11,7 +11,7 @@ from .models import AnalysisClaim, PaperAnalysis, PaperInput
 from .pdf_reader import PdfContent
 
 
-ANALYSIS_PROMPT_VERSION = "paper-analysis-v6-evidence-diversity"
+ANALYSIS_PROMPT_VERSION = "paper-analysis-v7-source-grounded-overview"
 ANALYSIS_FIELDS = (
     "research_question",
     "background",
@@ -50,6 +50,7 @@ ANALYSIS_SYSTEM_PROMPT = """你是该领域的世界顶级学术专家，正在�
 每一条分析都必须给出原文页码 page 或图号 figure_id，并在 evidence_text 中放入可核对的原文短引文或原文细节；可引用时使用 blockquote 风格的 `> 原文`。
 没有可追溯来源的判断不得输出；材料不足时返回空数组，不得补写常识或生成占位结论。
 概览必须覆盖研究目标、现实或产业意义、方法原理与主要流程、创新点、局限性和总体结论。methods 只保留 1 至 3 条简要方法概述；key_results 最多保留 1 至 2 条支撑论文总体结论的概括性结果，不展开具体实验和数据，详细结果留给用户选中的图片分析。
+区分论文报告的观察、作者提出的解释和已验证的结论，保持原文的谨慎程度。未报告的机制、比较或数值不能凭领域常识补全；不要把某张图的结论外推到全文。概览的 statement 不写括号图号引用，图号只保留在内部 figure_id 字段用于证据定位。
 只返回符合要求的 JSON，不要输出 Markdown 代码块。"""
 
 
@@ -58,6 +59,7 @@ ANALYSIS_READING_GUIDE = """
 你现在作为该领域的世界顶级学术专家，想详细阅读并深入这篇论文。
 充分阅读当前证据，但输出只保留论文主线。当前分段没有的证据返回空数组，由后续分段合并。
 如果技术概念相对新颖，请给出通俗解释。不要整理完整实验清单，也不要逐项罗列关键数据。
+不要把某张图的结论外推到全文；保持原文的谨慎程度，未报告的比较、机制或数值不得补全。
 
 请围绕以下问题组织概览，但仍按下方 JSON Schema 输出：
 ### 论文的研究目标是什么？想要解决什么实际问题？
