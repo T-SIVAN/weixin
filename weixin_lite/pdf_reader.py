@@ -36,6 +36,8 @@ SECTION_ALIASES = {
     "supplementary materials": "supplementary",
 }
 PROMPT_SECTION_ORDER = ("abstract", "introduction", "methods", "results", "discussion", "conclusion")
+MAX_RENDER_PIXELS = 4_000_000
+COMPLEX_DRAWING_THRESHOLD = 12_000
 
 
 def extract_first_page_metadata(text: str) -> tuple[list[str], list[str]]:
@@ -432,7 +434,7 @@ def render_pdf_crop(
     pdf_bytes: bytes,
     page_number: int,
     crop_bbox: tuple[float, float, float, float] | list[float],
-    scale: float = 2.0,
+    scale: float = 1.0,
 ) -> bytes:
     import fitz
 
@@ -442,9 +444,48 @@ def render_pdf_crop(
         raise ValueError(f"page number {page_number} is outside 1-{document.page_count}")
     page = document.load_page(page_number - 1)
     rect = page.rect
+    # Highly vectorized publisher PDFs can contain tens of thousands of paths.
+    # Keep preview rendering bounded; confirmed exports can still use the same
+    # crop with a larger scale through an explicit caller choice.
+    try:
+        drawing_count = len(page.get_drawings())
+    except Exception:
+        drawing_count = 0
+    if drawing_count > COMPLEX_DRAWING_THRESHOLD:
+        scale = min(scale, 0.75)
     clip = fitz.Rect(rect.x0 + normalized[0] * rect.width, rect.y0 + normalized[1] * rect.height, rect.x0 + normalized[2] * rect.width, rect.y0 + normalized[3] * rect.height)
+    width = max(1.0, clip.width * scale)
+    height = max(1.0, clip.height * scale)
+    if width * height > MAX_RENDER_PIXELS:
+        scale *= (MAX_RENDER_PIXELS / (width * height)) ** 0.5
     pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip, alpha=False)
     return pixmap.tobytes("png")
+
+
+def resolve_figure_source_pages(pdf_bytes: bytes, caption_page: str) -> tuple[int, ...]:
+    """Find nearby pages containing the visual asset for a caption page."""
+    try:
+        import fitz
+        document = fitz.open(stream=pdf_bytes, filetype="pdf")
+        page = int(caption_page)
+    except (ImportError, TypeError, ValueError, RuntimeError):
+        return ()
+    candidates: list[tuple[float, int]] = []
+    for number in range(max(1, page - 1), min(document.page_count, page + 1) + 1):
+        current = document.load_page(number - 1)
+        score = min(len(current.get_images(full=True)), 8) * 4.0
+        try:
+            score += min(len(current.get_drawings()), COMPLEX_DRAWING_THRESHOLD) / 1500.0
+        except Exception:
+            pass
+        if number == page:
+            score += 1.0
+        candidates.append((score, number))
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    if not candidates or candidates[0][0] <= 1.0:
+        return (page,)
+    selected = [number for score, number in candidates[:2] if score >= max(1.0, candidates[0][0] * 0.35)]
+    return tuple(sorted(set(selected)))
 
 
 def adjust_and_render_crop(
@@ -542,8 +583,16 @@ def build_figure_crops(pdf_bytes: bytes, figures: list[FigureAnalysis], digest: 
             figure.needs_manual_crop = True
             continue
         bbox, confidence = _candidate_crop(document.load_page(page_number - 1), figure)
+        source_pages = resolve_figure_source_pages(pdf_bytes, str(page_number))
+        source_page = source_pages[0] if source_pages else page_number
+        if source_page != page_number:
+            bbox, confidence = _candidate_crop(document.load_page(source_page - 1), figure)
+        figure.caption_page = str(page_number)
+        figure.image_page = str(source_page)
+        figure.page_span = source_pages or (page_number,)
         figure.crop_bbox = bbox
         figure.confidence = confidence
+        figure.crop_confidence = confidence
         figure.needs_manual_crop = confidence < 0.65
         if figure.needs_manual_crop:
             figure.selected = False
@@ -551,7 +600,8 @@ def build_figure_crops(pdf_bytes: bytes, figures: list[FigureAnalysis], digest: 
         figure.image_name = f"{digest}-{safe_id}.png"
         figure.page_image_name = figure.image_name
         try:
-            images[figure.image_name] = render_pdf_crop(pdf_bytes, page_number, bbox)
+            images[figure.image_name] = render_pdf_crop(pdf_bytes, source_page, bbox)
+            figure.image_hash = hashlib.sha256(images[figure.image_name]).hexdigest()
         except Exception:
             figure.image_name = ""
             figure.page_image_name = ""

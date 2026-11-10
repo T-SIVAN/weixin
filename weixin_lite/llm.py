@@ -41,6 +41,13 @@ class ProviderConfig:
     default_model: str
 
 
+@dataclass(frozen=True)
+class ModelOption:
+    id: str
+    provider: str
+    supports_vision: bool = False
+
+
 PROVIDERS: dict[str, ProviderConfig] = {
     "openai": ProviderConfig("openai", "OpenAI", "https://api.openai.com/v1", "gpt-4o-mini"),
     "gemini": ProviderConfig(
@@ -87,6 +94,35 @@ def default_model(provider: str = "") -> str:
 
 def provider_defaults(provider: str = "") -> ProviderConfig:
     return PROVIDERS[normalize_provider(provider)]
+
+
+def model_supports_vision(model: str) -> bool:
+    name = str(model or "").lower()
+    return any(token in name for token in ("vision", "-vl", "vl-", "gemini", "gpt-4o", "gpt-4.1", "qwen2.5-vl", "qwen-vl"))
+
+
+def list_provider_models(provider: str, api_key: str, base_url: str, *, timeout: int = 20) -> list[ModelOption]:
+    """List models from an OpenAI-compatible provider; return [] on unsupported APIs."""
+    if not str(api_key or "").strip() or not str(base_url or "").strip():
+        return []
+    url = str(base_url).rstrip("/") + "/models"
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError, urllib.error.HTTPError, urllib.error.URLError):
+        return []
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return []
+    key = normalize_provider(provider)
+    values = []
+    for row in rows:
+        model_id = row.get("id") if isinstance(row, dict) else row
+        if model_id:
+            model_id = str(model_id)
+            values.append(ModelOption(model_id, key, model_supports_vision(model_id)))
+    return sorted({item.id: item for item in values}.values(), key=lambda item: item.id.lower())
 
 
 def call_openai_compatible(

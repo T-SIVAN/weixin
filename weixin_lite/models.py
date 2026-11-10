@@ -274,6 +274,11 @@ class FigureAnalysis:
     source_excerpt: str = ""
     source_page: str = ""
     review_mode: str = ""
+    caption_page: str = ""
+    image_page: str = ""
+    page_span: tuple[int, ...] = field(default_factory=tuple)
+    crop_confidence: float = 0.0
+    image_hash: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -294,6 +299,9 @@ class FigureAnalysis:
         bbox = data.get("crop_bbox")
         if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
             values["crop_bbox"] = tuple(float(value) for value in bbox)
+        span = data.get("page_span")
+        if isinstance(span, (list, tuple)):
+            values["page_span"] = tuple(int(value) for value in span if str(value).isdigit())
         if isinstance(data.get("editable_table"), dict):
             values["editable_table"] = EditableTable.from_dict(data["editable_table"])
         return cls(**values)

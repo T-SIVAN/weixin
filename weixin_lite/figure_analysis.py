@@ -212,7 +212,7 @@ def selected_review_key(paper, analysis, figure, config, pdf, mode):
 
 def selected_figure_source(analysis, figure, pdf) -> str:
     return "\n\n".join(part for part in (
-        f"{figure.figure_id} p.{figure.page}\n{figure.caption}",
+        f"{figure.figure_id} 图注页 p.{figure.page}，图像页 p.{figure.image_page or figure.page}\n{figure.caption}",
         _evidence_text(figure, _claims_for_figure(analysis, figure)),
         figure_context(pdf, figure),
     ) if part.strip())

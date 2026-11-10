@@ -39,6 +39,7 @@ from weixin_lite.llm import (
     default_model,
     default_provider,
     friendly_llm_error,
+    list_provider_models,
     provider_defaults,
     test_llm_connection,
 )
@@ -443,7 +444,24 @@ def sidebar_settings() -> tuple[str, str, str, str, int, float]:
     )
     defaults = provider_defaults(provider)
     api_key = st.sidebar.text_input("API Key", value=default_api_key(provider), type="password", key=f"api-key-{provider}")
-    model = st.sidebar.text_input("模型", value=default_model(provider) or defaults.default_model, key=f"model-{provider}")
+    model_cache_key = f"models-{provider}"
+    if st.sidebar.button("刷新模型列表", key=f"refresh-models-{provider}", disabled=not api_key.strip()):
+        with st.sidebar.spinner("获取模型列表…"):
+            models = list_provider_models(provider, api_key, default_base_url(provider) or defaults.base_url)
+        st.session_state[model_cache_key] = [item.__dict__ for item in models]
+        if not models:
+            st.sidebar.warning("当前接口不支持模型列表或暂时无法连接，保留手动输入。")
+    available = [str(item.get("id")) for item in st.session_state.get(model_cache_key, []) if item.get("id")]
+    configured_model = default_model(provider) or defaults.default_model
+    if available:
+        choices = list(dict.fromkeys([configured_model] + available))
+        model = st.sidebar.selectbox("模型", choices, index=0, key=f"model-choice-{provider}")
+        st.sidebar.caption("也可在下方输入未列出的模型")
+        manual_model = st.sidebar.text_input("自定义模型名（可选）", value="", key=f"model-manual-{provider}")
+        if manual_model.strip():
+            model = manual_model.strip()
+    else:
+        model = st.sidebar.text_input("模型", value=configured_model, key=f"model-{provider}")
     with st.sidebar.expander("高级连接与翻译设置"):
         base_url = st.text_input("Base URL", value=default_base_url(provider) or defaults.base_url, key=f"base-url-{provider}")
         batch_size = st.number_input("每批翻译标题数", 1, 8, 5)
@@ -457,10 +475,26 @@ def sidebar_settings() -> tuple[str, str, str, str, int, float]:
     vision = {"provider": provider, "api_key": api_key, "base_url": base_url, "model": model}
     if provider != "gemini":
         with st.sidebar.expander("图表复核 · Gemini"):
+            vision_key = st.text_input("Gemini API Key", value=default_api_key("gemini"), type="password", key="vision-api-key")
+            if st.button("刷新 Gemini 模型列表", key="refresh-models-gemini", disabled=not vision_key.strip()):
+                with st.sidebar.spinner("获取 Gemini 模型列表…"):
+                    models = list_provider_models("gemini", vision_key, PROVIDERS["gemini"].base_url)
+                st.session_state["models-gemini"] = [item.__dict__ for item in models if item.supports_vision]
+                if not models:
+                    st.warning("Gemini 接口暂时无法返回模型列表，保留手动输入。")
+            vision_models = [str(item.get("id")) for item in st.session_state.get("models-gemini", []) if item.get("id")]
+            default_vision_model = PROVIDERS["gemini"].default_model
+            if vision_models:
+                vision_model = st.selectbox("视觉模型", list(dict.fromkeys([default_vision_model] + vision_models)), key="vision-model-choice")
+                manual_vision_model = st.text_input("自定义视觉模型名（可选）", value="", key="vision-model-manual")
+                if manual_vision_model.strip():
+                    vision_model = manual_vision_model.strip()
+            else:
+                vision_model = st.text_input("视觉模型", value=default_vision_model, key="vision-model")
             vision = {
                 "provider": "gemini",
-                "api_key": st.text_input("Gemini API Key", value=default_api_key("gemini"), type="password", key="vision-api-key"),
-                "model": st.text_input("视觉模型", value=PROVIDERS["gemini"].default_model, key="vision-model"),
+                "api_key": vision_key,
+                "model": vision_model,
                 "base_url": st.text_input("Gemini Base URL", value=PROVIDERS["gemini"].base_url, key="vision-base-url"),
             }
     st.session_state.vision_config = vision
