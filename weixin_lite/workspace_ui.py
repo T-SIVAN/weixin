@@ -13,6 +13,7 @@ def checkpoint():
         return
     try:
         save_workspace(st.session_state)
+        st.session_state.pop("prepared_workspace_backup", None)
         st.session_state.pop("save_error", None)
     except (OSError, ValueError) as exc:
         st.session_state.save_error = f"本地保存失败：{exc}"
@@ -27,6 +28,7 @@ def switch_project(values, project_id):
     st.session_state.pop("project-name-widget", None)
     st.session_state.pop("_saved_digest", None)
     st.session_state.pop("prepared_exports", None)
+    st.session_state.pop("prepared_workspace_backup", None)
     st.session_state.single_analysis = None
     st.session_state.selected_download_keys = []
     st.query_params["project"] = project_id
@@ -71,8 +73,12 @@ def render_workspace_sidebar():
                 except (OSError, ValueError) as exc:
                     st.error(str(exc))
         if st.session_state.get("papers") or st.session_state.get("articles"):
-            data, _ = snapshot_bytes(st.session_state)
-            st.download_button("备份项目", data, "weixin-workspace.zip", "application/zip", icon=":material/download:")
+            if st.button("准备项目备份", icon=":material/archive:"):
+                data, _ = snapshot_bytes(st.session_state)
+                st.session_state["prepared_workspace_backup"] = data
+            if st.session_state.get("prepared_workspace_backup"):
+                st.download_button("下载项目备份", st.session_state["prepared_workspace_backup"],
+                                   "weixin-workspace.zip", "application/zip", icon=":material/download:")
         upload = st.file_uploader("恢复项目备份", type=["zip"], key="workspace-import")
         if st.button("导入备份", disabled=upload is None):
             try:
