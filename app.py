@@ -1007,7 +1007,7 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
                     st.info("可以切换为文字证据模式后再次生成。")
             else:
                 fingerprint = hashlib.sha256(json.dumps({
-                    "version": "article-prose-v3-figure-refs", "paper": paper.to_dict(), "analysis": analysis.to_dict(),
+                    "version": "article-prose-v4-no-page-citations", "paper": paper.to_dict(), "analysis": analysis.to_dict(),
                     "figures": [item.to_dict() for item in confirmed], "model": model, "base_url": base_url,
                 }, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
                 cached = st.session_state.article_cache.get(fingerprint)

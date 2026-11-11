@@ -34,10 +34,18 @@ PARENTHETICAL_FIGURE_REF = re.compile(
     r"[ \t]*[（(][ \t]*(?:图[ \t]*\d+[A-Za-z]?|Fig(?:ure)?\.?[ \t]*\d+[A-Za-z]?)[ \t]*[）)]",
     re.I,
 )
+PARENTHETICAL_PAGE_REF = re.compile(
+    r"[ \t]*[（(][ \t]*(?:p(?:age)?\.?[ \t]*\d+(?:[ \t]*[-–][ \t]*\d+)?|第[ \t]*\d+[ \t]*页)[ \t]*[）)]",
+    re.I,
+)
 
 
 def _without_parenthetical_figure_refs(value: Any) -> str:
     return PARENTHETICAL_FIGURE_REF.sub("", str(value).strip())
+
+
+def _without_parenthetical_page_refs(value: Any) -> str:
+    return PARENTHETICAL_PAGE_REF.sub("", str(value).strip())
 
 
 def chineseish_len(text: str) -> int:
@@ -264,15 +272,18 @@ def render_markdown(
     *,
     confirmed_figure_notes: bool = False,
 ) -> str:
-    lines: list[str] = [f"# {_without_parenthetical_figure_refs(data.get('title') or short_title(paper))}", "", paper_intro(paper), ""]
+    lines: list[str] = [f"# {_without_parenthetical_page_refs(_without_parenthetical_figure_refs(data.get('title') or short_title(paper)))}", "", paper_intro(paper), ""]
     if lead_image and lead_image.image_name:
         lines.extend([f"![论文首页](images/{lead_image.image_name})", ""])
     intro = str(data.get("intro") or "").strip()
     if intro:
-        lines.extend([_without_parenthetical_figure_refs(intro), ""])
+        lines.extend([_without_parenthetical_page_refs(_without_parenthetical_figure_refs(intro)), ""])
     def add_section(heading: str, value: Any, *, numbered: bool = False) -> None:
         values = value if isinstance(value, list) else [value]
-        cleaned = [_without_parenthetical_figure_refs(item) for item in values if item is not None and str(item).strip()]
+        cleaned = [
+            _without_parenthetical_page_refs(_without_parenthetical_figure_refs(item))
+            for item in values if item is not None and str(item).strip()
+        ]
         if not cleaned:
             return
         lines.extend([f"## {heading}", ""])
@@ -294,7 +305,7 @@ def render_markdown(
             {
                 "figure_id": figure.figure_id,
                 "heading": figure.why_selected or figure_heading(figure),
-                "note": prose_from_note(figure.interpretation),
+                "note": _without_parenthetical_page_refs(prose_from_note(figure.interpretation)),
             }
             for figure in figures
             if figure.image_name and figure.interpretation
@@ -306,7 +317,7 @@ def render_markdown(
     for figure_index, item in enumerate(figure_items, start=1):
         fig_id = str(item.get("figure_id") or "").strip()
         heading = str(item.get("heading") or f"{figure_index}. {fig_id or '原文截图'}").strip()
-        note = str(item.get("note") or item.get("interpretation") or "").strip()
+        note = _without_parenthetical_page_refs(str(item.get("note") or item.get("interpretation") or "").strip())
         figure = figure_map.get(fig_id.lower())
         lines.append("")
         if confirmed_figure_notes and not (figure and figure.image_name and note):
@@ -321,13 +332,12 @@ def render_markdown(
             lines.append(note)
         if figure and confirmed_figure_notes:
             boundary = "；仅据图注与正文解读，未进行图像复核" if figure.vision_status == "text_evidence" else ""
-            quote_page = f"；正文证据 p.{figure.source_page}" if figure.source_page and figure.source_page != figure.page else ""
-            lines.extend(["", f"来源：{figure.figure_id} · p.{figure.page or '未标注'}{quote_page}{boundary}。"])
+            lines.extend(["", f"来源：{figure.figure_id}{boundary}。"])
         if figure and figure.editable_table and figure.editable_table.headers and figure.editable_table.rows and figure.editable_table.confidence >= 0.7:
             lines.extend(["", f"<!-- editable-table:{fig_id} -->"])
     add_section("文章的创新意义", data.get("innovation"), numbered=True)
     if data.get("take_home"):
-        lines.extend(["", "## 总结", "", _without_parenthetical_figure_refs(data["take_home"])])
+        lines.extend(["", "## 总结", "", _without_parenthetical_page_refs(_without_parenthetical_figure_refs(data["take_home"]))])
     meta = " / ".join(bit for bit in [paper.journal, paper.publication_date or paper.year, f"DOI: {paper.doi}" if paper.doi else "", paper.url] if bit)
     if meta:
         lines.append("")

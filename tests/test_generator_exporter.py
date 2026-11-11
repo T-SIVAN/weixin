@@ -428,7 +428,7 @@ def test_parenthetical_figure_references_only_remain_in_figure_analysis(monkeypa
     for content in (article.body_markdown, html, word_text):
         assert "（图1）" not in content
         assert "(Fig. 5)" not in content
-        assert "（p.3）" in content
+        assert "（p.3）" not in content
         assert "（对照组）" in content
         assert "图中显示两组差异（Fig. 2）" in content
     assert article.title == "论文解读"
@@ -439,6 +439,43 @@ def test_parenthetical_figure_reference_removal_preserves_line_breaks():
     from weixin_lite.generator import _without_parenthetical_figure_refs
 
     assert _without_parenthetical_figure_refs("第一段（图1）\n第二段 (Fig. 2)，见（p.3）。") == "第一段\n第二段，见（p.3）。"
+
+
+def test_generated_article_hides_page_citations_but_keeps_internal_evidence(monkeypatch):
+    from weixin_lite.exporter import export_article_docx_bytes, export_article_html
+    from docx import Document
+    from PIL import Image
+
+    payload = {
+        "title": "研究解读",
+        "intro": "研究显示了重要趋势（p13），进一步数据见（p.5）。",
+        "core_points": ["主要结论（Page 8）"] ,
+        "research_question": ["该问题具有现实意义（第13页）。"],
+        "method_overview": ["作者采用新方法（p.13）。"],
+        "innovation": ["创新点明确（p.5-7）。"],
+        "take_home": "结论仍需后续验证（P.2）",
+    }
+    monkeypatch.setattr("weixin_lite.generator.call_openai_compatible", lambda **_: json.dumps(payload, ensure_ascii=False))
+    figure = FigureAnalysis(
+        "Fig. 1", "Fig. 1 caption with source evidence.", page="13", image_name="fig1.png", selected=True,
+        vision_status="reviewed", review_version=FIGURE_ANALYSIS_PROMPT_VERSION,
+        source_page="13", interpretation="图显示趋势（p.13），证据来自当前页面。",
+    )
+    article = generate_article(PaperInput(title_en="Test paper"), api_key="key", confirmed_figures=[figure])
+    buffer = BytesIO()
+    Image.new("RGB", (24, 24), "white").save(buffer, format="PNG")
+    assets = {"fig1.png": buffer.getvalue()}
+    html = export_article_html(article, assets).decode("utf-8")
+    document = Document(BytesIO(export_article_docx_bytes(article, assets)))
+    word_text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+
+    for content in (article.body_markdown, html, word_text):
+        assert "p13" not in content.lower()
+        assert "p.13" not in content.lower()
+        assert "page 8" not in content.lower()
+        assert "第13页" not in content
+    assert article.figures[0].source_page == "13"
+    assert article.figures[0].interpretation.startswith("图显示趋势（p.13）")
 
 
 def test_article_does_not_render_unconfirmed_screenshot():
