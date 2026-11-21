@@ -25,6 +25,8 @@ from weixin_lite.exporter import (
 from weixin_lite.figure_analysis import (
     FIGURE_ANALYSIS_PROMPT_VERSION,
     analyze_selected_figures,
+    confirm_figure_manually,
+    MANUAL_REVIEW_VERSION,
     SELECTED_REVIEW_VERSION,
 )
 from weixin_lite.workspace_ui import checkpoint, initialize_workspace, render_workspace_sidebar
@@ -102,6 +104,8 @@ def invalidate_asset_review(figure, message: str) -> None:
     figure.interpretation = ""
     figure.review_key = ""
     figure.source_excerpt = ""
+    figure.manual_candidate_note = ""
+    figure.manual_candidate_excerpt = ""
 
 
 def pdf_assets(pdf: PdfContent) -> list:
@@ -842,6 +846,7 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
         review_label = {
             "reviewed": "已复核",
             "text_evidence": "文本证据直出",
+            "manual_verified": "人工核实",
         }.get(figure.vision_status, "待复核")
         with st.expander(f"{figure.figure_id} · p.{figure.page} · {review_label}", expanded=False):
             st.caption(figure.caption[:900])
@@ -899,6 +904,28 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
                 st.markdown(figure.interpretation)
             if figure.vision_error:
                 st.warning(figure.vision_error)
+            if figure.manual_candidate_note and figure.vision_error:
+                st.caption(f"未匹配图：{figure.figure_id} · 图注页 {figure.page or '未标注'} · 图像页 {figure.image_page or figure.page or '未标注'}")
+                st.write("模型返回的引文（未在原文中匹配）：")
+                st.code(figure.manual_candidate_excerpt or "模型未提供引文")
+                st.caption("请对照上方截图、图注和下方原文证据核实，并修改不可靠的数据或结论。")
+                manual_note = st.text_area("人工核实后的图解", value=figure.manual_candidate_note,
+                                           key=f"manual-note-{active_key}-{index}", height=180)
+                acknowledged = st.checkbox("我已核对该图与原文，并确认这段图解可用于稿件",
+                                           key=f"manual-ack-{active_key}-{index}")
+                if st.button("人工核实并继续生成", disabled=not acknowledged or not manual_note.strip(),
+                             key=f"manual-confirm-{active_key}-{index}"):
+                    try:
+                        manual_mode = st.session_state.get("generation-mode", "文字证据")
+                        manual_config = (dict(st.session_state.get("vision_config", {})) if manual_mode == "文字 + 视觉"
+                                         else {"model": model, "base_url": base_url})
+                        manual_config["image_assets"] = st.session_state.images
+                        confirm_figure_manually(paper, analysis, figure, manual_config, pdf, manual_note)
+                        checkpoint()
+                        st.session_state[f"resume-generation-{active_key}"] = True
+                        st.rerun()
+                    except ValueError as exc:
+                        st.error(str(exc))
             with st.popover("原文证据", icon=":material/menu_book:"):
                 st.write(figure_context(pdf, figure) or figure.caption)
                 if figure.source_excerpt:
@@ -995,7 +1022,8 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
         st.info("请配置 Gemini，或选择文字证据模式。")
     ready = bool(analysis and analysis.complete and api_key.strip()
                  and review_config.get("api_key") and 1 <= len(selected_assets) <= 4)
-    if st.button("生成稿件", type="primary", disabled=not ready):
+    resume_generation = bool(st.session_state.pop(f"resume-generation-{active_key}", False))
+    if st.button("生成稿件", type="primary", disabled=not ready) or (resume_generation and ready):
         try:
             checkpoint()
             with st.spinner("正在解读已选图片，已成功的步骤将自动保存…"):
@@ -1003,6 +1031,7 @@ def ingest_and_generate_tab(provider: str, api_key: str, base_url: str, model: s
             if len(confirmed) != len(selected_assets):
                 failed = next((item for item in selected_assets if item not in confirmed), None)
                 st.error((failed.vision_error if failed else "") or "部分图表未完成，已保存成功结果。")
+                checkpoint()
                 if mode == "vision":
                     st.info("可以切换为文字证据模式后再次生成。")
             else:

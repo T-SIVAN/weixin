@@ -11,7 +11,7 @@ from app import paper_key as record_key
 
 from weixin_lite.article_analysis import ANALYSIS_PROMPT_VERSION
 from weixin_lite.evidence_context import figure_context
-from weixin_lite.figure_analysis import analyze_selected_figures
+from weixin_lite.figure_analysis import analyze_selected_figures, confirm_figure_manually
 from weixin_lite.generator import generate_article
 from weixin_lite.editor import article_blocks, replace_block, replace_figure_note, rewrite_block
 from weixin_lite.exporter import export_article_docx_bytes, export_article_html
@@ -118,6 +118,43 @@ def test_invalid_model_evidence_preserves_previous_note(workspace, monkeypatch, 
     assert not run_figures(workspace)
     assert figure.interpretation == "旧稿需保留"
     assert figure.vision_error
+
+
+def test_manual_confirmation_after_unmatched_quote_resumes_generation(workspace, monkeypatch):
+    monkeypatch.setattr(
+        "weixin_lite.figure_analysis.call_openai_compatible",
+        lambda **kwargs: json.dumps({
+            **json.loads(response_for(kwargs["user_prompt"])),
+            "source_excerpt": ("Invented quote absent from the source."
+                               if "只分析 Fig. 1。" in kwargs["user_prompt"]
+                               else json.loads(response_for(kwargs["user_prompt"]))["source_excerpt"]),
+        }),
+    )
+    figure = workspace["pdfs"]["study.pdf"].legends[0]
+    config = config_for(workspace)
+    assert run_figures(workspace, config) == []
+    assert "Fig. 1" in figure.vision_error
+    assert figure.manual_candidate_excerpt == "Invented quote absent from the source."
+    with pytest.raises(ValueError):
+        confirm_figure_manually(workspace["papers"][0], workspace["paper_analyses"][record_key(workspace["papers"][0])],
+                                figure, config, workspace["pdfs"]["study.pdf"], "")
+    confirm_figure_manually(workspace["papers"][0], workspace["paper_analyses"][record_key(workspace["papers"][0])],
+                            figure, config, workspace["pdfs"]["study.pdf"], "人工核对过的图解。")
+    assert figure.vision_status == "manual_verified"
+    assert figure.source_excerpt == ""
+    assert len(run_figures(workspace, config)) == 2
+    payload = {"title": "测试研究", "intro": "概览", "core_points": ["要点"],
+               "research_question": "问题", "method_overview": ["方法"],
+               "innovation": ["创新"], "take_home": "结论"}
+    monkeypatch.setattr("weixin_lite.generator.call_openai_compatible", lambda **_: json.dumps(payload))
+    article = generate_article(workspace["papers"][0], workspace["pdfs"]["study.pdf"], api_key="fake",
+                               analysis=workspace["paper_analyses"][record_key(workspace["papers"][0])],
+                               confirmed_figures=[figure], image_assets=workspace["images"])
+    assert "人工核对过的图解" in article.body_markdown
+    assert "人工核实，未通过自动引文匹配" in article.body_markdown
+    workspace["images"]["fig1.png"] += b"changed"
+    run_figures(workspace, config)
+    assert figure.vision_status == "pending"
 
 
 def test_snapshot_keeps_assets_versions_and_no_credentials(workspace):

@@ -4,7 +4,7 @@ import html
 import re
 from typing import Any
 
-from .figure_analysis import FIGURE_ANALYSIS_PROMPT_VERSION, SELECTED_REVIEW_VERSION, figure_heading
+from .figure_analysis import FIGURE_ANALYSIS_PROMPT_VERSION, MANUAL_REVIEW_VERSION, SELECTED_REVIEW_VERSION, figure_heading
 from .evidence_context import prose_from_note
 from .llm import LLMError, call_openai_compatible, parse_json_object
 from .models import FigureAnalysis, PaperAnalysis, PaperInput, QuickReadArticle
@@ -332,6 +332,8 @@ def render_markdown(
             lines.append(note)
         if figure and confirmed_figure_notes:
             boundary = "；仅据图注与正文解读，未进行图像复核" if figure.vision_status == "text_evidence" else ""
+            if figure.vision_status == "manual_verified":
+                boundary = "；人工核实，未通过自动引文匹配"
             lines.extend(["", f"来源：{figure.figure_id}{boundary}。"])
         if figure and figure.editable_table and figure.editable_table.headers and figure.editable_table.rows and figure.editable_table.confidence >= 0.7:
             lines.extend(["", f"<!-- editable-table:{fig_id} -->"])
@@ -486,10 +488,11 @@ def generate_article(
             for figure in sorted(confirmed_figures or [], key=lambda item: (item.order or 999, item.figure_id))
             if (
                 figure.selected
-                and getattr(figure, "review_version", "") in {FIGURE_ANALYSIS_PROMPT_VERSION, SELECTED_REVIEW_VERSION}
+                and getattr(figure, "review_version", "") in {FIGURE_ANALYSIS_PROMPT_VERSION, SELECTED_REVIEW_VERSION, MANUAL_REVIEW_VERSION}
                 and (
                     figure.vision_status == "reviewed"
                     or (allow_text_evidence_figures and figure.vision_status == "text_evidence")
+                    or figure.vision_status == "manual_verified"
                 )
             )
         ][:4]

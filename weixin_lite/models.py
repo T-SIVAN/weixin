@@ -279,6 +279,8 @@ class FigureAnalysis:
     page_span: tuple[int, ...] = field(default_factory=tuple)
     crop_confidence: float = 0.0
     image_hash: str = ""
+    manual_candidate_note: str = ""
+    manual_candidate_excerpt: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

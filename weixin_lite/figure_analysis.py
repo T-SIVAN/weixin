@@ -16,6 +16,7 @@ from .pdf_reader import PdfContent, compact_text, figure_key
 
 FIGURE_ANALYSIS_PROMPT_VERSION = "figure-analysis-v5-claim-evidence"
 SELECTED_REVIEW_VERSION = "selected-evidence-v2-claim-evidence"
+MANUAL_REVIEW_VERSION = "selected-evidence-v1-manual-check"
 ROLE_LABELS = {
     "lead": "论文首页",
     "mechanism": "机制图",
@@ -218,6 +219,29 @@ def selected_figure_source(analysis, figure, pdf) -> str:
     ) if part.strip())
 
 
+def confirm_figure_manually(paper, analysis, figure, config, pdf, note: str) -> None:
+    """Accept a reviewed correction without claiming that its quote was machine-verified."""
+    if not figure.selected or not figure.vision_error or not figure.manual_candidate_note:
+        raise ValueError("只有引文匹配失败的已选图可以人工核实。")
+    if not (config.get("image_assets") or {}).get(figure.image_name):
+        raise ValueError(f"{figure.figure_id} 的截图缺失，请重新上传。")
+    if not (_has_figure_evidence(figure, analysis) or figure_context(pdf, figure)):
+        raise ValueError(f"{figure.figure_id} 缺少图注或原文证据，不能人工确认。")
+    if not note.strip():
+        raise ValueError("人工核实后的图解不能为空。")
+    figure.interpretation = note.strip()
+    figure.source_excerpt = ""
+    figure.source_page = ""
+    figure.review_mode = "manual"
+    figure.review_key = selected_review_key(paper, analysis, figure, config, pdf, "manual")
+    figure.review_version = MANUAL_REVIEW_VERSION
+    figure.vision_status = "manual_verified"
+    figure.needs_manual_check = True
+    figure.vision_error = ""
+    figure.manual_candidate_note = ""
+    figure.manual_candidate_excerpt = ""
+
+
 def analyze_selected_figures(paper, analysis, figures, config, *, pdf, mode="text", force=False):
     """One request per figure; successful work can resume independently after failure."""
     if mode not in {"text", "vision"}:
@@ -237,6 +261,15 @@ def analyze_selected_figures(paper, analysis, figures, config, *, pdf, mode="tex
             figure.vision_error = "请配置当前模式的模型 API Key。"
             break
         key = selected_review_key(paper, analysis, figure, config, pdf, mode)
+        if figure.vision_status == "manual_verified" and figure.interpretation:
+            manual_key = selected_review_key(paper, analysis, figure, config, pdf, "manual")
+            if figure.review_key == manual_key:
+                completed.append(figure)
+                continue
+            figure.vision_status = "pending"
+            figure.interpretation = ""
+            figure.review_version = ""
+            figure.review_key = ""
         if not force and figure.review_key == key and figure.interpretation:
             completed.append(figure)
             continue
@@ -272,6 +305,8 @@ def analyze_selected_figures(paper, analysis, figures, config, *, pdf, mode="tex
                 raise ValueError("模型未返回有依据的图解段落。")
             original_source = figure.caption + "\n" + figure_context(pdf, figure)
             if not excerpt_matches(excerpt, original_source):
+                figure.manual_candidate_note = "\n\n".join(p.strip() for p in paragraphs)
+                figure.manual_candidate_excerpt = excerpt
                 raise ValueError("图解引文无法在提供的原文中匹配，请重试或补充图注。")
             quoted_page = str(data.get("source_page") or figure.page).strip()
             if quoted_page.isdigit() and pdf and re.search(r"\[Page\s+\d+\]", pdf.text):
@@ -280,6 +315,8 @@ def analyze_selected_figures(paper, analysis, figures, config, *, pdf, mode="tex
                 if quoted_page == figure.page:
                     page_source += "\n" + figure.caption
                 if not excerpt_matches(excerpt, page_source):
+                    figure.manual_candidate_note = "\n\n".join(p.strip() for p in paragraphs)
+                    figure.manual_candidate_excerpt = excerpt
                     raise ValueError("图解引文与所标页码不匹配，请重试。")
             note = "\n\n".join(p.strip() for p in paragraphs)
             if mode == "text":
@@ -297,13 +334,16 @@ def analyze_selected_figures(paper, analysis, figures, config, *, pdf, mode="tex
             figure.needs_manual_check = mode == "text"
             figure.visual_evidence = ""  # No model-provided visual claims are used as original text.
             figure.vision_error = ""
+            figure.manual_candidate_note = ""
+            figure.manual_candidate_excerpt = ""
             cache[key] = deepcopy(data)
             completed.append(figure)
             checkpoint = config.get("checkpoint")
             if callable(checkpoint):
                 checkpoint()
         except Exception as exc:
-            figure.vision_error = str(exc) if isinstance(exc, ValueError) else friendly_llm_error(exc)
+            detail = str(exc) if isinstance(exc, ValueError) else friendly_llm_error(exc)
+            figure.vision_error = f"{figure.figure_id}（图注页 {figure.page or '未标注'}）: {detail}"
             # Keep the previous note and key; the caller cannot publish stale data.
             break
     return completed
